@@ -1,0 +1,76 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1795425656712,
+      "tag": "0001_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1795425656712,
+      "tag": "0002_chara_chat_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1795428315849,
+      "tag": "0003_add_drafts_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1795430316960,
+      "tag": "0004_add_reviews_and_setting_revisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1795432691774,
+      "tag": "0005_add_last_read_seq_for_unread_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1795432725680,
+      "tag": "0006_initialize_last_read_seq_to_current_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1795467822109,
+      "tag": "0007_add_categories_and_character_category_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1795486189044,
+      "tag": "0008_add_roleplay_to_groups",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1795511129094,
+      "tag": "0009_add_guest_and_mob_flags_to_groups",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1795513515378,
+      "tag": "0010_add_character_categories_multi",
+      "breakpoints": true
+    }
+  ]
+}
