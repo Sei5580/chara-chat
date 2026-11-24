@@ -663,6 +663,87 @@ async function categoryIdsByCharacter(db: Db): Promise<Map<number, number[]>> {
   return map;
 }
 
+type CategoryRow = typeof schema.categories.$inferSelect;
+
+/** 全カテゴリ行を返す（登録順）。 */
+async function allCategoryRows(db: Db): Promise<CategoryRow[]> {
+  return await db.select().from(schema.categories).orderBy(asc(schema.categories.id));
+}
+
+/**
+ * カテゴリ id の子孫ID集合（自分自身を含む）を返す（v1.26・階層化）。
+ * 親子関係が壊れて循環していても無限ループしないよう訪問済みで打ち切る。
+ */
+function categoryDescendantIds(rows: CategoryRow[], id: number): Set<number> {
+  const childrenByParent = new Map<number, number[]>();
+  for (const r of rows) {
+    if (r.parentId != null) {
+      const arr = childrenByParent.get(r.parentId) ?? [];
+      arr.push(r.id);
+      childrenByParent.set(r.parentId, arr);
+    }
+  }
+  const out = new Set<number>([id]);
+  const stack = [id];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const child of childrenByParent.get(cur) ?? []) {
+      if (!out.has(child)) {
+        out.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * カテゴリ id の祖先ID集合（親・祖父…。自分自身は含まない）を返す（v1.27・設計書 v1.7.1）。
+ * 親子関係が壊れて循環していても訪問済みで打ち切る。
+ */
+function categoryAncestorIds(rows: CategoryRow[], id: number): Set<number> {
+  const parentById = new Map(rows.map((r) => [r.id, r.parentId ?? null]));
+  const out = new Set<number>();
+  let cur = parentById.get(id) ?? null;
+  while (cur != null && !out.has(cur)) {
+    out.add(cur);
+    cur = parentById.get(cur) ?? null;
+  }
+  out.delete(id);
+  return out;
+}
+
+/**
+ * 割り当て集合の祖先除外（v1.27・設計書 v1.7.1）: 集合内に自分の子孫が存在する
+ * カテゴリ（祖先側）を落とし、より深い側（子）だけを残す。子カテゴリとその
+ * 祖先カテゴリは同時に付けられない、という規則の実体。
+ */
+function pruneAncestorCategoryIds(rows: CategoryRow[], ids: number[]): number[] {
+  const set = new Set(ids);
+  return ids.filter((id) => {
+    for (const other of set) {
+      if (other !== id && categoryAncestorIds(rows, other).has(id)) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * 全キャラの割り当てへ祖先除外ルールを適用し直す（v1.27・設計書 v1.7.1）。
+ * カテゴリの親子関係が変わった時に呼び、親子で重なった割り当てを子だけに整理する。
+ * 変更があったキャラだけ書き直す。
+ */
+async function normalizeAllCharacterCategories(db: Db): Promise<void> {
+  const rows = await allCategoryRows(db);
+  const map = await categoryIdsByCharacter(db);
+  for (const [characterId, ids] of map) {
+    const pruned = pruneAncestorCategoryIds(rows, ids);
+    if (pruned.length !== ids.length) {
+      await replaceCharacterCategories(db, characterId, pruned);
+    }
+  }
+}
+
 /** 1キャラのカテゴリID一覧を返す。 */
 async function categoryIdsForCharacter(db: Db, characterId: number): Promise<number[]> {
   const map = await categoryIdsByCharacter(db);
@@ -887,7 +968,7 @@ export const Actions = {
       char_sort: z.enum(["added", "gojuon", "recent"]),
       char_compact: z.boolean(),
       char_group_categories: z.boolean(),
-      categories: z.array(z.object({ id: z.number(), name: z.string() })),
+      categories: z.array(z.object({ id: z.number(), name: z.string(), parent_id: z.number().nullable() })),
       characters: z.array(characterOut),
       groups: z.array(
         z.object({
@@ -960,7 +1041,7 @@ export const Actions = {
         char_compact: (await getMeta(db, "pref_char_compact")) === "1",
         // カテゴリ分け（フォルダ表示）のON/OFF。未保存時はON（従来のフォルダ表示）。
         char_group_categories: (await getMeta(db, "pref_char_group_categories")) !== "0",
-        categories: categoryRows.map((c) => ({ id: c.id, name: c.name })),
+        categories: categoryRows.map((c) => ({ id: c.id, name: c.name, parent_id: c.parentId ?? null })),
         characters: charList,
         groups: groupList,
       };
@@ -988,27 +1069,74 @@ export const Actions = {
   }),
 
   createCategory: defineAction({
-    description: "キャラ分類用のカテゴリを追加します。カテゴリ名は重複できません。",
-    request: z.object({ name: z.string().trim().min(1).max(50) }),
-    response: z.object({ id: z.number(), name: z.string() }),
+    description: "キャラ分類用のカテゴリを追加します。カテゴリ名は重複できません。parent_id を渡すとそのカテゴリの子（サブカテゴリ）として作成します。省略・null は最上位です。",
+    request: z.object({
+      name: z.string().trim().min(1).max(50),
+      parent_id: z.number().int().positive().nullable().optional(),
+    }),
+    response: z.object({ id: z.number(), name: z.string(), parent_id: z.number().nullable() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.categories).orderBy(asc(schema.categories.id));
+      const rows = await allCategoryRows(db);
       if (rows.some((r) => r.name === args.name)) throw new Error("同じ名前のカテゴリが既にあります");
-      const ins = await db.insert(schema.categories).values({ name: args.name }).returning({ id: schema.categories.id });
+      const parentId = args.parent_id ?? null;
+      if (parentId !== null && !rows.some((r) => r.id === parentId)) throw new Error("親カテゴリが見つかりません");
+      const ins = await db.insert(schema.categories).values({ name: args.name, parentId }).returning({ id: schema.categories.id });
+      // 親を指定して作った場合も、既存の全割り当てへ祖先除外ルールを適用し直す（v1.27）。
+      if (parentId !== null) await normalizeAllCharacterCategories(db);
       ctx.invalidateQueries();
-      return { id: ins[0]!.id, name: args.name };
+      return { id: ins[0]!.id, name: args.name, parent_id: parentId };
+    },
+  }),
+
+  updateCategory: defineAction({
+    description: "カテゴリの名前と親カテゴリを変更します。parent_id に null を渡すと最上位へ移動します。自分自身や自分の子孫を親にはできません（循環防止）。親子関係が変わった場合は、既存の全キャラの割り当てにも祖先除外ルール（子と祖先が重なったら子だけ残す）を適用し直します（設計書 v1.7.1）。",
+    request: z.object({
+      category_id: z.number().int().positive(),
+      name: z.string().trim().min(1).max(50).optional(),
+      parent_id: z.number().int().positive().nullable().optional(),
+    }),
+    response: z.object({ id: z.number(), name: z.string(), parent_id: z.number().nullable() }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      const rows = await allCategoryRows(db);
+      const target = rows.find((r) => r.id === args.category_id);
+      if (!target) throw new Error("カテゴリが見つかりません");
+      const nextName = args.name ?? target.name;
+      if (args.name !== undefined && rows.some((r) => r.id !== target.id && r.name === args.name)) {
+        throw new Error("同じ名前のカテゴリが既にあります");
+      }
+      let nextParent = target.parentId ?? null;
+      if (args.parent_id !== undefined) {
+        if (args.parent_id !== null) {
+          if (!rows.some((r) => r.id === args.parent_id)) throw new Error("親カテゴリが見つかりません");
+          // 循環防止: 自分自身と自分の子孫は親にできない。
+          if (categoryDescendantIds(rows, target.id).has(args.parent_id)) {
+            throw new Error("自分自身や自分の子カテゴリを親にはできません");
+          }
+        }
+        nextParent = args.parent_id;
+      }
+      const parentChanged = nextParent !== (target.parentId ?? null);
+      await db.update(schema.categories).set({ name: nextName, parentId: nextParent }).where(eq(schema.categories.id, target.id));
+      // 親子関係が変わったら、既存の全割り当てを子だけに整理し直す（v1.27）。
+      if (parentChanged) await normalizeAllCharacterCategories(db);
+      ctx.invalidateQueries();
+      return { id: target.id, name: nextName, parent_id: nextParent };
     },
   }),
 
   deleteCategory: defineAction({
-    description: "カテゴリを削除します。そのカテゴリだけが各キャラから外れます（他のカテゴリは残ります。キャラ自体は消えません）。",
+    description: "カテゴリを削除します。子カテゴリは削除したカテゴリの親の下へ付け替えます（親が無ければ最上位）。そのカテゴリだけが各キャラから外れます（他のカテゴリは残ります。キャラ自体は消えません）。",
     request: z.object({ category_id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       const rows = await db.select().from(schema.categories).where(eq(schema.categories.id, args.category_id));
-      if (!rows[0]) throw new Error("カテゴリが見つかりません");
+      const target = rows[0];
+      if (!target) throw new Error("カテゴリが見つかりません");
+      // 子カテゴリは、削除するカテゴリの親の下へ付け替える（親が無ければ最上位）。
+      await db.update(schema.categories).set({ parentId: target.parentId ?? null }).where(eq(schema.categories.parentId, args.category_id));
       await db.delete(schema.characterCategories).where(eq(schema.characterCategories.categoryId, args.category_id));
       // 旧カラムがこのカテゴリを指していたキャラは、先頭カテゴリを新しい割り当てで同期し直す。
       const affected = await db.select().from(schema.characters).where(eq(schema.characters.categoryId, args.category_id));
@@ -1017,6 +1145,8 @@ export const Actions = {
         await db.update(schema.characters).set({ categoryId: rest[0]?.categoryId ?? null }).where(eq(schema.characters.id, ch.id));
       }
       await db.delete(schema.categories).where(eq(schema.categories.id, args.category_id));
+      // 子の付け替えで親子関係が変わるため、残った割り当ても子だけに整理し直す（v1.27）。
+      await normalizeAllCharacterCategories(db);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1044,7 +1174,7 @@ export const Actions = {
   }),
 
   setCharacterCategories: defineAction({
-    description: "キャラのカテゴリを複数設定します。渡したカテゴリIDの一覧で丸ごと差し替えます（空配列で全て外して未分類にします）。同じカテゴリは複数のキャラに設定でき、1キャラが複数カテゴリに属せます。",
+    description: "キャラのカテゴリを複数設定します。渡したカテゴリIDの一覧で丸ごと差し替えます（空配列で全て外して未分類にします）。同じカテゴリは複数のキャラに設定でき、1キャラが複数カテゴリに属せます。ただし子カテゴリとその祖先カテゴリ（親・祖父…）は同時には付けられません: 両方が含まれる場合は祖先側を落として子（より深い方）だけを保存します（設計書 v1.7.1）。",
     request: z.object({
       character_id: z.number().int().positive(),
       category_ids: z.array(z.number().int().positive()).max(100),
@@ -1055,11 +1185,13 @@ export const Actions = {
       const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
       if (!rows[0]) throw new Error("キャラクターが見つかりません");
       const uniq = [...new Set(args.category_ids)];
-      if (uniq.length > 0) {
-        const cats = await db.select().from(schema.categories).where(inArray(schema.categories.id, uniq));
-        if (cats.length !== uniq.length) throw new Error("カテゴリが見つかりません");
+      const catRows = await allCategoryRows(db);
+      if (uniq.length > 0 && uniq.some((id) => !catRows.some((c) => c.id === id))) {
+        throw new Error("カテゴリが見つかりません");
       }
-      await replaceCharacterCategories(db, args.character_id, uniq);
+      // 祖先除外（v1.27）: 子と祖先が両方含まれていたら祖先側を落としてから保存する。
+      const pruned = pruneAncestorCategoryIds(catRows, uniq);
+      await replaceCharacterCategories(db, args.character_id, pruned);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1342,6 +1474,238 @@ export const Actions = {
     },
   }),
 
+  getCharacterSettingsForm: defineAction({
+    description: "キャラクターの設定を項目ごとの編集フォーム用に返します（avatar-profile v1.0 の構造に対応: 名前・概要・挨拶・背景・話し方・関係と呼び方・見た目の要素・フレーバー特性）。元JSONが無い/読めない場合は editable=false を返します。",
+    request: z.object({ character_id: z.number().int().positive() }),
+    response: z.object({
+      id: z.number(),
+      display_name: z.string(),
+      editable: z.boolean(),
+      name: z.string(),
+      summary: z.string(),
+      greeting: z.string(),
+      background_text: z.string(),
+      background_links: z.array(z.string()),
+      link_summary: z.string(),
+      user_relationship: z.string(),
+      call_user_as: z.string(),
+      speech_style: z.string(),
+      speech_first_person: z.string(),
+      speech_second_person: z.string(),
+      speech_catchphrase: z.string(),
+      speech_memo: z.string(),
+      avatar_memory: z.string(),
+      elements: z.array(z.object({ key: z.string(), value: z.string() })),
+      traits: z.array(
+        z.object({
+          id: z.string(),
+          label: z.string(),
+          examples: z.array(z.string()),
+          enabled: z.boolean(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
+      const c = rows[0];
+      if (!c) throw new Error("キャラクターが見つかりません");
+      const base = {
+        id: c.id,
+        display_name: c.displayName,
+        editable: false,
+        name: c.name,
+        summary: "",
+        greeting: "",
+        background_text: "",
+        background_links: [] as string[],
+        link_summary: "",
+        user_relationship: "",
+        call_user_as: "",
+        speech_style: "",
+        speech_first_person: "",
+        speech_second_person: "",
+        speech_catchphrase: "",
+        speech_memo: "",
+        avatar_memory: "",
+        elements: [] as { key: string; value: string }[],
+        traits: [] as { id: string; label: string; examples: string[]; enabled: boolean }[],
+      };
+      let profile: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(c.sourceJson) as unknown;
+        if (parsed && typeof parsed === "object") profile = parsed as Record<string, unknown>;
+      } catch {
+        profile = null;
+      }
+      if (!profile || profile["format"] !== "avatar-profile") return base;
+      const str = (v: unknown): string => (typeof v === "string" ? v : "");
+      const obj = (v: unknown): Record<string, unknown> =>
+        v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+      const bg = obj(profile["background"]);
+      const speech = obj(profile["speech"]);
+      const st = obj(speech["structured"]);
+      const imageBase = obj(profile["image_base"]);
+      const elementsObj = obj(imageBase["elements"]);
+      const flavor = obj(profile["flavor"]);
+      const traitsRaw = Array.isArray(flavor["traits"]) ? flavor["traits"] : [];
+      return {
+        ...base,
+        editable: true,
+        name: str(profile["name"]) || c.name,
+        summary: str(profile["summary"]),
+        greeting: str(profile["greeting"]),
+        background_text: str(bg["text"]),
+        background_links: (Array.isArray(bg["links"]) ? bg["links"] : []).filter(
+          (l): l is string => typeof l === "string",
+        ),
+        link_summary: str(bg["link_summary"]),
+        user_relationship: str(bg["user_relationship"]),
+        call_user_as: str(profile["call_user_as"]),
+        speech_style: str(speech["style"]),
+        speech_first_person: str(st["first_person"]),
+        speech_second_person: str(st["second_person"]),
+        speech_catchphrase: str(st["catchphrase"]),
+        speech_memo: str(st["memo"]),
+        avatar_memory: str(profile["avatar_memory"]),
+        elements: Object.entries(elementsObj)
+          .filter(([, v]) => typeof v === "string")
+          .map(([key, value]) => ({ key, value: value as string })),
+        traits: traitsRaw.map((t, i) => {
+          const to = obj(t);
+          return {
+            id: str(to["id"]) || `trait-${i}`,
+            label: str(to["label"]),
+            examples: (Array.isArray(to["examples"]) ? to["examples"] : []).filter(
+              (e): e is string => typeof e === "string",
+            ),
+            enabled: to["enabled"] !== false,
+          };
+        }),
+      };
+    },
+  }),
+
+  updateCharacterSettings: defineAction({
+    description: "キャラクターの設定を項目ごとのフォーム入力から保存します。元の設定JSONを土台に、フォームの項目だけを書き換えて再構築し（テーマカラーなどフォームに無い項目は既存値を保持）、レビュー適用と同じ経路で設定本文へ反映します。表示名は変更しません。アバター管理ツールの正本には触れません。",
+    request: z.object({
+      character_id: z.number().int().positive(),
+      name: z.string().trim().min(1).max(200),
+      summary: z.string().max(5000),
+      greeting: z.string().max(5000),
+      background_text: z.string().max(20000),
+      background_links: z.array(z.string().max(2000)).max(20),
+      link_summary: z.string().max(5000),
+      user_relationship: z.string().max(2000),
+      call_user_as: z.string().max(200),
+      speech_style: z.string().max(5000),
+      speech_first_person: z.string().max(100),
+      speech_second_person: z.string().max(100),
+      speech_catchphrase: z.string().max(1000),
+      speech_memo: z.string().max(2000),
+      avatar_memory: z.string().max(5000),
+      elements: z.array(z.object({ key: z.string().max(100), value: z.string().max(1000) })).max(50),
+      traits: z
+        .array(
+          z.object({
+            id: z.string().max(100),
+            label: z.string().max(200),
+            examples: z.array(z.string().max(1000)).max(10),
+            enabled: z.boolean(),
+          }),
+        )
+        .max(50),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
+      const c = rows[0];
+      if (!c) throw new Error("キャラクターが見つかりません");
+      let profile: Record<string, unknown>;
+      try {
+        profile = JSON.parse(c.sourceJson) as Record<string, unknown>;
+      } catch {
+        throw new Error("保存されている設定JSONを読み取れなかったため、編集できません");
+      }
+      if (!profile || typeof profile !== "object" || profile["format"] !== "avatar-profile") {
+        throw new Error("保存されている設定が avatar-profile 形式ではないため、編集できません");
+      }
+      const obj = (v: unknown): Record<string, unknown> =>
+        v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+      const orNull = (s: string): string | null => (s.trim() ? s : null);
+
+      profile["name"] = args.name;
+      profile["summary"] = args.summary;
+      profile["greeting"] = args.greeting;
+      profile["avatar_memory"] = args.avatar_memory;
+      profile["call_user_as"] = orNull(args.call_user_as);
+
+      const bg = obj(profile["background"]);
+      bg["text"] = args.background_text;
+      bg["links"] = args.background_links.map((l) => l.trim()).filter(Boolean);
+      bg["link_summary"] = orNull(args.link_summary);
+      bg["user_relationship"] = orNull(args.user_relationship);
+      profile["background"] = bg;
+
+      const speech = obj(profile["speech"]);
+      speech["style"] = orNull(args.speech_style);
+      const st = obj(speech["structured"]);
+      st["first_person"] = orNull(args.speech_first_person);
+      st["second_person"] = orNull(args.speech_second_person);
+      st["catchphrase"] = orNull(args.speech_catchphrase);
+      st["memo"] = orNull(args.speech_memo);
+      speech["structured"] = st;
+      profile["speech"] = speech;
+
+      const imageBase = obj(profile["image_base"]);
+      const elements: Record<string, string> = {};
+      for (const e of args.elements) {
+        const k = e.key.trim();
+        if (k) elements[k] = e.value;
+      }
+      imageBase["elements"] = elements;
+      profile["image_base"] = imageBase;
+
+      const flavor = obj(profile["flavor"]);
+      const existingTraits = new Map<string, Record<string, unknown>>();
+      for (const t of Array.isArray(flavor["traits"]) ? flavor["traits"] : []) {
+        const to = obj(t);
+        if (typeof to["id"] === "string" && to["id"]) existingTraits.set(to["id"], to);
+      }
+      flavor["traits"] = args.traits
+        .filter((t) => t.label.trim())
+        .map((t, i) => {
+          const prev = existingTraits.get(t.id) ?? {};
+          return {
+            ...prev,
+            id: t.id || `manual-${Date.now()}-${i}`,
+            label: t.label.trim(),
+            examples: t.examples.map((e) => e.trim()).filter(Boolean),
+            scenes: Array.isArray(prev["scenes"]) ? prev["scenes"] : [],
+            enabled: t.enabled,
+            frequency: typeof prev["frequency"] === "number" ? prev["frequency"] : null,
+            auto_examples: prev["auto_examples"] === true,
+            source: typeof prev["source"] === "string" && prev["source"] ? prev["source"] : "manual",
+          };
+        });
+      profile["flavor"] = flavor;
+
+      const jsonStr = JSON.stringify(profile, null, 2);
+      // 妥当性検証を兼ねて、レビュー適用と同じ経路で設定本文へ反映する。
+      // applyProfileToCharacter は表示名も名前に合わせて付け直すため、
+      // この編集では表示名を扱わない設計に従い、保存前の表示名へ戻す。
+      const prevDisplayName = c.displayName;
+      await applyProfileToCharacter(db, c, profile, jsonStr);
+      await db
+        .update(schema.characters)
+        .set({ displayName: prevDisplayName })
+        .where(eq(schema.characters.id, c.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
   importCharacter: defineAction({
     description: "avatar-profile v1.0 の書き出しJSON（＋任意で画像base64）からキャラクターを取り込みます。同じプロファイルIDの再取り込みは設定と画像を上書きし、会話履歴は保持します。",
     request: z.object({
@@ -1426,10 +1790,10 @@ export const Actions = {
   }),
 
   createGroup: defineAction({
-    description: "1〜5人のキャラクターでグループチャットを作成します（なりきり機能で利用者自身も参加できるため、1人から作成できます）。ゲスト・モブの許可（allow_guests / allow_mobs）も作成時に指定できます。",
+    description: "1〜8人のキャラクターでグループチャットを作成します（なりきり機能で利用者自身も参加できるため、1人から作成できます）。ゲスト・モブの許可（allow_guests / allow_mobs）も作成時に指定できます。",
     request: z.object({
       name: z.string().trim().max(60).default(""),
-      character_ids: z.array(z.number().int().positive()).min(1).max(5),
+      character_ids: z.array(z.number().int().positive()).min(1).max(8),
       allow_guests: z.boolean().default(false),
       allow_mobs: z.boolean().default(false),
     }),
@@ -1644,10 +2008,10 @@ export const Actions = {
   }),
 
   updateGroupMembers: defineAction({
-    description: "グループチャットの参加キャラクターを変更します（2〜5人）。会話履歴は保持されます。なりきり中のキャラクターが参加者から外れた場合は、なりきり設定を未選択（解除）にします。返信待ち・生成中は変更できません。",
+    description: "グループチャットの参加キャラクターを変更します（1〜8人）。会話履歴は保持されます。なりきり中のキャラクターが参加者から外れた場合は、なりきり設定を未選択（解除）にします。返信待ち・生成中は変更できません。",
     request: z.object({
       group_id: z.number().int().positive(),
-      character_ids: z.array(z.number().int().positive()).min(2).max(5),
+      character_ids: z.array(z.number().int().positive()).min(1).max(8),
     }),
     response: z.object({ ok: z.literal(true), roleplay_cleared: z.boolean() }),
     async handler(ctx, args): Promise<{ ok: true; roleplay_cleared: boolean }> {
@@ -1658,7 +2022,7 @@ export const Actions = {
       if (!g) throw new Error("グループが見つかりません");
       if (g.status !== "active") throw new Error("解散したグループの参加者は変更できません");
       const ids = [...new Set(args.character_ids)];
-      if (ids.length < 2 || ids.length > 5) throw new Error("参加者は2〜5人で選んでください");
+      if (ids.length < 1 || ids.length > 8) throw new Error("参加者は1〜8人で選んでください");
       for (const id of ids) {
         const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, id));
         if (!crows[0]) throw new Error("キャラクターが見つかりません");

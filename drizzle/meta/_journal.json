@@ -71,6 +71,20 @@
       "when": 1795513515378,
       "tag": "0010_add_character_categories_multi",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1795529711785,
+      "tag": "0011_add_category_parent_hierarchy",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1795530636047,
+      "tag": "0012_prune_ancestor_category_assignments",
+      "breakpoints": true
     }
   ]
 }

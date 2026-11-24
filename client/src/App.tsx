@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim, setFailureNoticeText } from "@hatch/space-sdk/client";
 import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
@@ -570,6 +570,7 @@ function CharacterMenuSheet({
   character,
   onClose,
   onViewSettings,
+  onEditSettings,
   onEditImage,
   onRename,
   onSetCategory,
@@ -577,12 +578,14 @@ function CharacterMenuSheet({
   character: CharacterItem;
   onClose: () => void;
   onViewSettings: () => void;
+  onEditSettings: () => void;
   onEditImage: () => void;
   onRename: () => void;
   onSetCategory: () => void;
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
-    { label: "キャラ設定を見る", description: "生成に使われている設定本文と、関係・呼び方を確認します", onSelect: onViewSettings },
+    { label: "概要を確認する", description: "生成に使われている設定本文と、関係・呼び方を確認します", onSelect: onViewSettings },
+    { label: "設定を編集する", description: "設定を項目ごとの入力欄で書き換えます（次の返信から反映されます）", onSelect: onEditSettings },
     { label: "画像を変更", description: "画像ファイルを選んで正方形にトリミングして差し替えます", onSelect: onEditImage },
     { label: "表示名を変更", description: "一覧やチャットで表示される名前だけを変えます（設定には影響しません）", onSelect: onRename },
     { label: "カテゴリを設定", description: "登録済みカテゴリから選んで分類します（複数選択できます。同じカテゴリは複数のキャラにも設定できます）", onSelect: onSetCategory },
@@ -689,8 +692,366 @@ function CharacterSettingsSheet({ characterId, onClose }: { characterId: number;
               </div>
             )}
             <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-              設定の見直しは、チャット画面のレビューモードから行えます。
+              設定を書き換える時は、設定メニューの「設定を編集する」から行えます。発言への指摘による見直しは、チャット画面のレビューモードから行えます。
             </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type SettingsFormData = ApiResponse<typeof api, "getCharacterSettingsForm">;
+
+const editInputStyle = {
+  background: "var(--surface-alt)",
+  color: "var(--text)",
+  border: "1px solid var(--border)",
+} as const;
+
+function EditTextField({
+  label,
+  fieldProps,
+  value,
+  onChange,
+}: {
+  label: string;
+  fieldProps?: Record<string, unknown>;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      <label className="block text-sm font-bold" style={{ color: "var(--text)" }}>
+        {label}
+        <input
+          {...fieldProps}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="mt-1 w-full rounded-2xl px-3 py-2.5 font-normal"
+          style={editInputStyle}
+        />
+      </label>
+    </div>
+  );
+}
+
+function EditAreaField({
+  label,
+  fieldProps,
+  value,
+  onChange,
+  rows = 4,
+  hint,
+}: {
+  label: string;
+  fieldProps?: Record<string, unknown>;
+  value: string;
+  onChange: (v: string) => void;
+  rows?: number;
+  hint?: string;
+}) {
+  return (
+    <div>
+      <label className="block text-sm font-bold" style={{ color: "var(--text)" }}>
+        {label}
+        <textarea
+          {...fieldProps}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          rows={rows}
+          className="mt-1 w-full rounded-2xl px-3 py-2.5 font-normal"
+          style={editInputStyle}
+        />
+      </label>
+      {hint && (
+        <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>{hint}</p>
+      )}
+    </div>
+  );
+}
+
+function EditSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section>
+      <h3 className="font-display text-base font-bold" style={{ color: "var(--text)" }}>{title}</h3>
+      <div className="mt-2 flex flex-col gap-3">{children}</div>
+    </section>
+  );
+}
+
+type TraitDraft = { id: string; label: string; examplesText: string; enabled: boolean };
+type ElementDraft = { key: string; value: string };
+
+/** 設定の編集フォーム本体。初期値は取得済みのフォームデータから作る。 */
+function CharacterSettingsEditForm({
+  character,
+  initial,
+  onClose,
+}: {
+  character: CharacterItem;
+  initial: SettingsFormData;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const F = FIELDS.updateCharacterSettings;
+  const [name, setName] = useState(initial.name);
+  const [summary, setSummary] = useState(initial.summary);
+  const [greeting, setGreeting] = useState(initial.greeting);
+  const [backgroundText, setBackgroundText] = useState(initial.background_text);
+  const [linksText, setLinksText] = useState(initial.background_links.join("\n"));
+  const [linkSummary, setLinkSummary] = useState(initial.link_summary);
+  const [userRelationship, setUserRelationship] = useState(initial.user_relationship);
+  const [callUserAs, setCallUserAs] = useState(initial.call_user_as);
+  const [speechStyle, setSpeechStyle] = useState(initial.speech_style);
+  const [firstPerson, setFirstPerson] = useState(initial.speech_first_person);
+  const [secondPerson, setSecondPerson] = useState(initial.speech_second_person);
+  const [catchphrase, setCatchphrase] = useState(initial.speech_catchphrase);
+  const [speechMemo, setSpeechMemo] = useState(initial.speech_memo);
+  const [avatarMemory, setAvatarMemory] = useState(initial.avatar_memory);
+  const [elements, setElements] = useState<ElementDraft[]>(initial.elements);
+  const [traits, setTraits] = useState<TraitDraft[]>(
+    initial.traits.map((t) => ({ id: t.id, label: t.label, examplesText: t.examples.join("\n"), enabled: t.enabled })),
+  );
+  const [error, setError] = useState("");
+
+  const save = useMutation({
+    mutationFn: async () =>
+      await api.updateCharacterSettings({
+        character_id: character.id,
+        name: name.trim(),
+        summary,
+        greeting,
+        background_text: backgroundText,
+        background_links: linksText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+        link_summary: linkSummary,
+        user_relationship: userRelationship,
+        call_user_as: callUserAs,
+        speech_style: speechStyle,
+        speech_first_person: firstPerson,
+        speech_second_person: secondPerson,
+        speech_catchphrase: catchphrase,
+        speech_memo: speechMemo,
+        avatar_memory: avatarMemory,
+        elements,
+        traits: traits.map((t) => ({
+          id: t.id,
+          label: t.label,
+          examples: t.examplesText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+          enabled: t.enabled,
+        })),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: ["chat", character.id] });
+      queryClient.invalidateQueries({ queryKey: ["group"] });
+      queryClient.invalidateQueries({ queryKey: ["character-settings", character.id] });
+      queryClient.invalidateQueries({ queryKey: ["character-settings-form", character.id] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+  });
+
+  const submit = () => {
+    if (!name.trim()) {
+      setError("名前を入力してください。");
+      return;
+    }
+    setError("");
+    save.mutate();
+  };
+
+  const updateTrait = (idx: number, patch: Partial<TraitDraft>) =>
+    setTraits((prev) => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)));
+  const updateElement = (idx: number, patch: Partial<ElementDraft>) =>
+    setElements((prev) => prev.map((e, i) => (i === idx ? { ...e, ...patch } : e)));
+
+  return (
+    <div className="flex flex-col gap-5">
+      <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+        保存すると、このアプリ内の設定が書き換わり、次の返信から新しい設定で生成されます。アバター管理ツールの設定は変わりません。一覧の表示名はここでは変わりません（表示名の変更は別の項目です）。
+      </p>
+
+      <EditSection title="基本">
+        <EditTextField label="名前" fieldProps={F.name} value={name} onChange={setName} />
+        <EditAreaField label="概要" fieldProps={F.summary} value={summary} onChange={setSummary} rows={3} />
+        <EditAreaField label="挨拶の例" fieldProps={F.greeting} value={greeting} onChange={setGreeting} rows={3} />
+        <EditAreaField label="固有の記憶" fieldProps={F.avatar_memory} value={avatarMemory} onChange={setAvatarMemory} rows={3} />
+      </EditSection>
+
+      <EditSection title="背景">
+        <EditAreaField label="背景（本文）" fieldProps={F.background_text} value={backgroundText} onChange={setBackgroundText} rows={8} />
+        <EditAreaField label="関連リンク" value={linksText} onChange={setLinksText} rows={3} hint="1行に1件ずつ入力してください。" />
+        <EditAreaField label="つながりの要約" fieldProps={F.link_summary} value={linkSummary} onChange={setLinkSummary} rows={4} />
+      </EditSection>
+
+      <EditSection title="話し方">
+        <EditAreaField label="話し方の説明" fieldProps={F.speech_style} value={speechStyle} onChange={setSpeechStyle} rows={4} />
+        <EditTextField label="一人称" fieldProps={F.speech_first_person} value={firstPerson} onChange={setFirstPerson} />
+        <EditTextField label="二人称" fieldProps={F.speech_second_person} value={secondPerson} onChange={setSecondPerson} />
+        <EditAreaField label="口癖" fieldProps={F.speech_catchphrase} value={catchphrase} onChange={setCatchphrase} rows={2} />
+        <EditAreaField label="話し方のメモ" fieldProps={F.speech_memo} value={speechMemo} onChange={setSpeechMemo} rows={3} />
+      </EditSection>
+
+      <EditSection title="相手との関係">
+        <EditAreaField label="相手との関係" fieldProps={F.user_relationship} value={userRelationship} onChange={setUserRelationship} rows={3} />
+        <EditTextField label="相手の呼び方" fieldProps={F.call_user_as} value={callUserAs} onChange={setCallUserAs} />
+      </EditSection>
+
+      <EditSection title="見た目の要素">
+        <div className="flex flex-col gap-2">
+          {elements.map((el, i) => (
+            <div key={i} className="flex items-start gap-2">
+              <input
+                aria-label={`見た目の要素${i + 1}の項目名`}
+                value={el.key}
+                onChange={(e) => updateElement(i, { key: e.target.value })}
+                placeholder="項目名（例: 髪）"
+                className="w-28 shrink-0 rounded-2xl px-3 py-2.5 text-sm"
+                style={editInputStyle}
+              />
+              <input
+                aria-label={`見た目の要素${i + 1}の内容`}
+                value={el.value}
+                onChange={(e) => updateElement(i, { value: e.target.value })}
+                placeholder="内容"
+                className="min-w-0 flex-1 rounded-2xl px-3 py-2.5 text-sm"
+                style={editInputStyle}
+              />
+              <button
+                type="button"
+                aria-label={`見た目の要素${i + 1}を削除`}
+                onClick={() => setElements((prev) => prev.filter((_, j) => j !== i))}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base"
+                style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setElements((prev) => [...prev, { key: "", value: "" }])}
+            className="self-start rounded-full px-4 py-2 text-sm font-bold"
+            style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+          >
+            ＋ 要素を追加
+          </button>
+        </div>
+      </EditSection>
+
+      <EditSection title="フレーバー特性">
+        <div className="flex flex-col gap-3">
+          {traits.map((t, i) => (
+            <div key={i} className="rounded-2xl p-3" style={{ background: "var(--surface-alt)" }}>
+              <div className="flex items-center gap-2">
+                <input
+                  aria-label={`フレーバー特性${i + 1}の名前`}
+                  value={t.label}
+                  onChange={(e) => updateTrait(i, { label: e.target.value })}
+                  placeholder="特性の名前"
+                  className="min-w-0 flex-1 rounded-xl px-3 py-2 text-sm font-bold"
+                  style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                />
+                <button
+                  type="button"
+                  aria-label={`フレーバー特性${i + 1}を削除`}
+                  onClick={() => setTraits((prev) => prev.filter((_, j) => j !== i))}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
+                  style={{ background: "var(--surface)", color: "var(--danger)" }}
+                >
+                  ×
+                </button>
+              </div>
+              <label className="mt-2 block text-xs font-bold" style={{ color: "var(--dim)" }}>
+                例（1行に1件）
+                <textarea
+                  value={t.examplesText}
+                  onChange={(e) => updateTrait(i, { examplesText: e.target.value })}
+                  rows={2}
+                  className="mt-1 w-full rounded-xl px-3 py-2 text-sm font-normal"
+                  style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                />
+              </label>
+              <label className="mt-2 flex items-center gap-2 text-sm" style={{ color: "var(--text)" }}>
+                <input
+                  type="checkbox"
+                  checked={t.enabled}
+                  onChange={(e) => updateTrait(i, { enabled: e.target.checked })}
+                  className="h-5 w-5"
+                />
+                この特性を有効にする
+              </label>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setTraits((prev) => [...prev, { id: "", label: "", examplesText: "", enabled: true }])}
+            className="self-start rounded-full px-4 py-2 text-sm font-bold"
+            style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+          >
+            ＋ 特性を追加
+          </button>
+        </div>
+      </EditSection>
+
+      {error && <p className="text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+      <div className="flex gap-3">
+        <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+          キャンセル
+        </button>
+        <button
+          type="button"
+          onClick={submit}
+          disabled={save.isPending}
+          className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+          style={{ background: "var(--accent)" }}
+        >
+          {save.isPending ? "保存中…" : "保存する"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 設定を編集するシート（設定メニューから開く）。フォームデータを取得してから編集フォームを表示する。 */
+function CharacterSettingsEditSheet({ character, onClose }: { character: CharacterItem; onClose: () => void }) {
+  const q = useQuery({
+    queryKey: ["character-settings-form", character.id],
+    queryFn: () => api.getCharacterSettingsForm({ character_id: character.id }),
+  });
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${character.display_name}の設定を編集する`}>
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>設定を編集する</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="閉じる"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
+            style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
+          >
+            ×
+          </button>
+        </div>
+        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+        {q.error && (
+          <div className="mt-3">
+            <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+            <button type="button" onClick={() => q.refetch()} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+              再読み込み
+            </button>
+          </div>
+        )}
+        {q.data && !q.data.editable && (
+          <p className="mt-3 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+            このキャラクターは設定データ（avatar-profile形式）を保持していないため、ここからは編集できません。
+          </p>
+        )}
+        {q.data && q.data.editable && (
+          <div className="mt-3">
+            <CharacterSettingsEditForm character={character} initial={q.data} onClose={onClose} />
           </div>
         )}
       </div>
@@ -768,20 +1129,133 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
 
 type CategoryItem = Home["categories"][number];
 
-/** カテゴリの管理シート（一覧側の全体メニューから開く）。追加と削除を行う。 */
+type CategoryTreeEntry = { cat: CategoryItem; depth: number };
+
+/**
+ * カテゴリを階層（ツリー）順に並べた一覧を返す（v1.26・階層化）。
+ * 親→子の順に辿り、各項目に深さ（最上位=0）を持たせる。兄弟の並びは登録順。
+ * 親が存在しないカテゴリは最上位として扱い、循環などで辿れなかったものも
+ * 表示から消えないよう最上位として末尾に置く。
+ */
+function categoryTreeEntries(categories: CategoryItem[]): CategoryTreeEntry[] {
+  const byId = new Map(categories.map((c) => [c.id, c]));
+  const childrenByParent = new Map<number | null, CategoryItem[]>();
+  for (const c of categories) {
+    const key = c.parent_id != null && byId.has(c.parent_id) ? c.parent_id : null;
+    const arr = childrenByParent.get(key) ?? [];
+    arr.push(c);
+    childrenByParent.set(key, arr);
+  }
+  const out: CategoryTreeEntry[] = [];
+  const visited = new Set<number>();
+  const walk = (parentKey: number | null, depth: number) => {
+    for (const c of childrenByParent.get(parentKey) ?? []) {
+      if (visited.has(c.id)) continue;
+      visited.add(c.id);
+      out.push({ cat: c, depth });
+      walk(c.id, depth + 1);
+    }
+  };
+  walk(null, 0);
+  for (const c of categories) {
+    if (!visited.has(c.id)) out.push({ cat: c, depth: 0 });
+  }
+  return out;
+}
+
+/** カテゴリ id の子孫ID集合（自分自身を含む）。絞り込みの共通判定に使う（v1.26）。 */
+function categoryDescendantIdSet(categories: CategoryItem[], id: number): Set<number> {
+  const childrenByParent = new Map<number, number[]>();
+  for (const c of categories) {
+    if (c.parent_id != null) {
+      const arr = childrenByParent.get(c.parent_id) ?? [];
+      arr.push(c.id);
+      childrenByParent.set(c.parent_id, arr);
+    }
+  }
+  const out = new Set<number>([id]);
+  const stack = [id];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const child of childrenByParent.get(cur) ?? []) {
+      if (!out.has(child)) {
+        out.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  return out;
+}
+
+/** カテゴリ id の祖先ID集合（親・祖父…。自分自身は含まない）（v1.27・設計書 v1.7.1）。 */
+function categoryAncestorIdSet(categories: CategoryItem[], id: number): Set<number> {
+  const parentById = new Map(categories.map((c) => [c.id, c.parent_id ?? null]));
+  const out = new Set<number>();
+  let cur = parentById.get(id) ?? null;
+  while (cur != null && !out.has(cur)) {
+    out.add(cur);
+    cur = parentById.get(cur) ?? null;
+  }
+  out.delete(id);
+  return out;
+}
+
+/**
+ * 割り当て集合から祖先側を落として子だけを残す（v1.27・設計書 v1.7.1）。
+ * サーバ側の強制と同じ規則を、割り当てシートの初期表示・操作にも適用する。
+ */
+function pruneAncestorCategoryIds(categories: CategoryItem[], ids: number[]): number[] {
+  const set = new Set(ids);
+  return ids.filter((id) => {
+    for (const other of set) {
+      if (other !== id && categoryAncestorIdSet(categories, other).has(id)) return false;
+    }
+    return true;
+  });
+}
+
+/** キャラがカテゴリ filterId（その子孫カテゴリを含む）に属するか（v1.26）。 */
+function charMatchesCategory(c: CharacterItem, categories: CategoryItem[], filterId: number): boolean {
+  const set = categoryDescendantIdSet(categories, filterId);
+  return charCategoryIds(c).some((cid) => set.has(cid));
+}
+
+/** セレクトの選択肢表示用の階段式ラベル（深さぶん全角スペースで字下げする）。 */
+function categoryOptionLabel(cat: CategoryItem, depth: number): string {
+  return depth > 0 ? `${"　".repeat(depth)}└ ${cat.name}` : cat.name;
+}
+
+/** カテゴリの管理シート（一覧側の全体メニューから開く）。追加・編集（名前と親カテゴリ）・削除を行う。 */
 function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem[]; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
+  const [parentId, setParentId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<CategoryItem | null>(null);
+  const [editing, setEditing] = useState<CategoryItem | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editParentId, setEditParentId] = useState<number | null>(null);
+  const tree = categoryTreeEntries(categories);
+  const nameById = new Map(categories.map((c) => [c.id, c.name]));
   const create = useMutation({
-    mutationFn: async (n: string) => await api.createCategory({ name: n }),
+    mutationFn: async (v: { name: string; parent_id: number | null }) => await api.createCategory({ name: v.name, parent_id: v.parent_id }),
     onSuccess: () => {
       setName("");
+      setParentId(null);
       setError("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
     onError: (e) => setError(e instanceof Error ? e.message : "追加に失敗しました"),
+  });
+  const update = useMutation({
+    mutationFn: async (v: { category_id: number; name: string; parent_id: number | null }) =>
+      await api.updateCategory({ category_id: v.category_id, name: v.name, parent_id: v.parent_id }),
+    onSuccess: () => {
+      setEditing(null);
+      setError("");
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
   });
   const del = useMutation({
     mutationFn: async (id: number) => await api.deleteCategory({ category_id: id }),
@@ -795,8 +1269,25 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
     const v = name.trim();
     if (!v) { setError("カテゴリ名を入力してください。"); return; }
     setError("");
-    create.mutate(v);
+    create.mutate({ name: v, parent_id: parentId });
   };
+  const startEdit = (cat: CategoryItem) => {
+    setEditing(cat);
+    setEditName(cat.name);
+    setEditParentId(cat.parent_id ?? null);
+    setConfirmDelete(null);
+    setError("");
+  };
+  const submitEdit = () => {
+    if (!editing) return;
+    const v = editName.trim();
+    if (!v) { setError("カテゴリ名を入力してください。"); return; }
+    setError("");
+    update.mutate({ category_id: editing.id, name: v, parent_id: editParentId });
+  };
+  // 編集中カテゴリの親の選択肢: 自分自身と自分の子孫は選べない（循環防止）。
+  const editBlockedIds = editing ? categoryDescendantIdSet(categories, editing.id) : new Set<number>();
+  const childCountOf = (id: number) => categories.filter((c) => c.parent_id === id).length;
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="カテゴリ管理">
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
@@ -813,75 +1304,162 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
           </button>
         </div>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-          カテゴリはキャラ一覧の絞り込みに使います。1キャラに複数のカテゴリを設定でき、複数に登録したキャラはどのカテゴリで絞り込んでも表示されます。同じカテゴリは複数のキャラにも設定できます。各キャラへの割り当ては、キャラの設定メニュー「カテゴリを設定」から行います。カテゴリを削除すると、各キャラからそのカテゴリだけが外れます（他のカテゴリは残ります）。
+          カテゴリはキャラ一覧の絞り込みに使います。カテゴリには親カテゴリを設定でき、子カテゴリ（サブカテゴリ）を作れます。親カテゴリで絞り込むと、その子・孫カテゴリのキャラもまとめて表示されます。1キャラに複数のカテゴリを設定でき、複数に登録したキャラはどのカテゴリで絞り込んでも表示されます。各キャラへの割り当ては、キャラの設定メニュー「カテゴリを設定」から行います。子カテゴリとその親カテゴリは同時には付けられず、両方が付いた状態になると子カテゴリだけが残ります（親子関係を後から変えた時も、既存の割り当ては自動で子だけに整理されます）。カテゴリを削除すると、その子カテゴリは削除したカテゴリの親の下へ移動し、各キャラからはそのカテゴリだけが外れます（他のカテゴリは残ります）。
         </p>
 
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="category-name">
           新しいカテゴリ名
         </label>
-        <div className="mt-1 flex gap-2">
-          <input
-            id="category-name"
-            {...FIELDS.createCategory.name}
-            value={name}
-            onChange={(e) => { setName(e.target.value); setError(""); }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); }
-            }}
-            placeholder="例: ゲーム"
-            className="min-w-0 flex-1 rounded-2xl px-3 py-2.5"
-            style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
-          />
-          <button
-            type="button"
-            onClick={submit}
-            disabled={create.isPending}
-            className="shrink-0 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
-            style={{ background: "var(--accent)" }}
-          >
-            {create.isPending ? "追加中…" : "追加"}
-          </button>
-        </div>
+        <input
+          id="category-name"
+          {...FIELDS.createCategory.name}
+          value={name}
+          onChange={(e) => { setName(e.target.value); setError(""); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); }
+          }}
+          placeholder="例: ゲーム"
+          className="mt-1 w-full rounded-2xl px-3 py-2.5"
+          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
+        />
+        <label className="mt-3 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="category-parent">
+          親カテゴリ
+        </label>
+        <select
+          id="category-parent"
+          value={parentId === null ? "" : String(parentId)}
+          onChange={(e) => setParentId(e.target.value === "" ? null : Number(e.target.value))}
+          className="mt-1 w-full rounded-2xl px-3 py-2.5"
+          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
+        >
+          <option value="">最上位（親なし）</option>
+          {tree.map(({ cat, depth }) => (
+            <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={submit}
+          disabled={create.isPending}
+          className="mt-3 w-full rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+          style={{ background: "var(--accent)" }}
+        >
+          {create.isPending ? "追加中…" : "追加"}
+        </button>
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
 
         <div className="mt-4 flex flex-col gap-2">
           {categories.length === 0 && (
             <p className="text-sm" style={{ color: "var(--dim)" }}>まだカテゴリがありません。</p>
           )}
-          {categories.map((cat) => (
-            <div key={cat.id} className="flex items-center gap-3 rounded-2xl px-3 py-2" style={{ background: "var(--surface-alt)" }}>
-              <span className="min-w-0 flex-1 truncate font-bold" style={{ color: "var(--text)" }}>{cat.name}</span>
-              {confirmDelete?.id === cat.id ? (
-                <>
-                  <span className="shrink-0 text-xs" style={{ color: "var(--danger)" }}>削除しますか？</span>
-                  <button
-                    type="button"
-                    disabled={del.isPending}
-                    onClick={() => del.mutate(cat.id)}
-                    className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50"
-                    style={{ background: "var(--danger)" }}
+          {tree.map(({ cat, depth }) => (
+            <div key={cat.id} style={{ marginLeft: depth * 20 }}>
+              {editing?.id === cat.id ? (
+                <div className="rounded-2xl px-3 py-3" style={{ background: "var(--surface-alt)" }}>
+                  <label className="block text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor={`category-edit-name-${cat.id}`}>
+                    カテゴリ名
+                  </label>
+                  <input
+                    id={`category-edit-name-${cat.id}`}
+                    {...FIELDS.updateCategory.name}
+                    value={editName}
+                    onChange={(e) => { setEditName(e.target.value); setError(""); }}
+                    className="mt-1 w-full rounded-xl px-3 py-2"
+                    style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                  />
+                  <label className="mt-3 block text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor={`category-edit-parent-${cat.id}`}>
+                    親カテゴリ
+                  </label>
+                  <select
+                    id={`category-edit-parent-${cat.id}`}
+                    value={editParentId === null ? "" : String(editParentId)}
+                    onChange={(e) => setEditParentId(e.target.value === "" ? null : Number(e.target.value))}
+                    className="mt-1 w-full rounded-xl px-3 py-2"
+                    style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
                   >
-                    削除する
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfirmDelete(null)}
-                    className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
-                    style={{ background: "var(--surface)", color: "var(--text)" }}
-                  >
-                    やめる
-                  </button>
-                </>
+                    <option value="">最上位（親なし）</option>
+                    {tree.filter(({ cat: c }) => !editBlockedIds.has(c.id)).map(({ cat: c, depth: d }) => (
+                      <option key={c.id} value={String(c.id)}>{categoryOptionLabel(c, d)}</option>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>自分自身と自分の子カテゴリは親に選べません。</p>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => { setEditing(null); setError(""); }}
+                      className="flex-1 rounded-full px-3 py-2 text-sm font-bold"
+                      style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                    >
+                      キャンセル
+                    </button>
+                    <button
+                      type="button"
+                      onClick={submitEdit}
+                      disabled={update.isPending}
+                      className="flex-1 rounded-full px-3 py-2 text-sm font-bold text-white disabled:opacity-50"
+                      style={{ background: "var(--accent)" }}
+                    >
+                      {update.isPending ? "保存中…" : "保存する"}
+                    </button>
+                  </div>
+                </div>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => { setConfirmDelete(cat); setError(""); }}
-                  aria-label={`カテゴリ「${cat.name}」を削除`}
-                  className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
-                  style={{ background: "var(--surface)", color: "var(--danger)" }}
-                >
-                  削除
-                </button>
+                <div className="flex items-center gap-2 rounded-2xl px-3 py-2" style={{ background: "var(--surface-alt)" }}>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-bold" style={{ color: "var(--text)" }}>
+                      {depth > 0 && <span aria-hidden="true" style={{ color: "var(--dim)" }}>└ </span>}
+                      {cat.name}
+                    </span>
+                    <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
+                      {cat.parent_id != null ? `親: ${nameById.get(cat.parent_id) ?? "（不明）"}` : "最上位"}
+                    </span>
+                  </span>
+                  {confirmDelete?.id === cat.id ? (
+                    <>
+                      <span className="shrink-0 text-xs" style={{ color: "var(--danger)" }}>
+                        削除しますか？{childCountOf(cat.id) > 0 ? `子カテゴリは${cat.parent_id != null ? `「${nameById.get(cat.parent_id) ?? ""}」` : "最上位"}の下へ移動します。` : ""}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={del.isPending}
+                        onClick={() => del.mutate(cat.id)}
+                        className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50"
+                        style={{ background: "var(--danger)" }}
+                      >
+                        削除する
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(null)}
+                        className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
+                        style={{ background: "var(--surface)", color: "var(--text)" }}
+                      >
+                        やめる
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => startEdit(cat)}
+                        aria-label={`カテゴリ「${cat.name}」を編集`}
+                        className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
+                        style={{ background: "var(--surface)", color: "var(--text)" }}
+                      >
+                        編集
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setConfirmDelete(cat); setEditing(null); setError(""); }}
+                        aria-label={`カテゴリ「${cat.name}」を削除`}
+                        className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
+                        style={{ background: "var(--surface)", color: "var(--danger)" }}
+                      >
+                        削除
+                      </button>
+                    </>
+                  )}
+                </div>
               )}
             </div>
           ))}
@@ -903,7 +1481,9 @@ function CategoryAssignSheet({
 }) {
   const queryClient = useQueryClient();
   const [error, setError] = useState("");
-  const initialIds: number[] = character.category_ids ?? (character.category_id != null ? [character.category_id] : []);
+  const rawInitialIds: number[] = character.category_ids ?? (character.category_id != null ? [character.category_id] : []);
+  // 初期表示も祖先除外ルールでそろえる（子と祖先が両方付いた古いデータは子だけ表示）。
+  const initialIds: number[] = pruneAncestorCategoryIds(categories, rawInitialIds);
   const [selectedIds, setSelectedIds] = useState<number[]>(initialIds);
   const assign = useMutation({
     mutationFn: async (ids: number[]) => await api.setCharacterCategories({ character_id: character.id, category_ids: ids }),
@@ -914,8 +1494,22 @@ function CategoryAssignSheet({
     onError: (e) => setError(e instanceof Error ? e.message : "設定に失敗しました"),
   });
   const toggle = (id: number) => {
-    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+    setSelectedIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id);
+      // 子カテゴリを付けたら、付いていた祖先カテゴリは自動で外す（v1.27）。
+      const ancestors = categoryAncestorIdSet(categories, id);
+      return [...prev.filter((x) => !ancestors.has(x)), id];
+    });
     setError("");
+  };
+  // 選択中の子孫カテゴリがあるカテゴリ（祖先側）は選べない。
+  const blockingChildName = (id: number): string | null => {
+    for (const sid of selectedIds) {
+      if (sid !== id && categoryAncestorIdSet(categories, sid).has(id)) {
+        return categories.find((c) => c.id === sid)?.name ?? null;
+      }
+    }
+    return null;
   };
   const isDirty = [...selectedIds].sort((a, b) => a - b).join(",") !== [...initialIds].sort((a, b) => a - b).join(",");
   return (
@@ -926,7 +1520,7 @@ function CategoryAssignSheet({
           <h2 className="font-display min-w-0 flex-1 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{character.display_name}のカテゴリ</h2>
         </div>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          複数のカテゴリを選べます。複数に登録したキャラは、どのカテゴリで絞り込んでも表示されます。何も選ばなければ未分類になります。
+          複数のカテゴリを選べます。複数に登録したキャラは、どのカテゴリで絞り込んでも表示されます。子カテゴリに登録したキャラは、その親カテゴリで絞り込んだ時にも表示されます。ただし、子カテゴリとその親カテゴリは同時には選べません（子を選ぶと親は自動で外れます）。何も選ばなければ未分類になります。
         </p>
         {categories.length === 0 && (
           <p className="mt-3 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
@@ -934,28 +1528,43 @@ function CategoryAssignSheet({
           </p>
         )}
         <div className="mt-4 flex flex-col gap-2" role="group" aria-label="カテゴリの選択（複数選択可）">
-          {categories.map((cat) => {
+          {categoryTreeEntries(categories).map(({ cat, depth }) => {
             const selected = selectedIds.includes(cat.id);
+            // 子孫カテゴリが選択中なら、この祖先カテゴリは選択できない（v1.27）。
+            const blockedBy = selected ? null : blockingChildName(cat.id);
+            const disabled = blockedBy !== null;
             return (
               <label
                 key={cat.id}
-                className="flex w-full cursor-pointer items-center gap-3 rounded-2xl px-4 py-3"
+                className="flex items-center gap-3 rounded-2xl px-4 py-3"
                 style={{
                   background: selected ? "var(--accent-soft)" : "var(--surface-alt)",
                   color: "var(--text)",
                   outline: selected ? "2px solid var(--accent)" : "none",
+                  marginLeft: depth * 20,
+                  cursor: disabled ? "not-allowed" : "pointer",
+                  opacity: disabled ? 0.55 : 1,
                 }}
               >
                 <input
                   type="checkbox"
                   checked={selected}
+                  disabled={disabled}
                   onChange={() => toggle(cat.id)}
                   aria-label={`カテゴリ「${cat.name}」`}
                   className="h-5 w-5 shrink-0"
                   style={{ accentColor: "var(--accent)" }}
                 />
-                <span className="font-bold">{cat.name}</span>
+                <span className="font-bold">
+                  {depth > 0 && <span aria-hidden="true" style={{ color: "var(--dim)" }}>└ </span>}
+                  {cat.name}
+                </span>
                 {selected && <span className="ml-auto text-xs font-bold" style={{ color: "var(--accent)" }}>選択中</span>}
+                {disabled && (
+                  <span className="ml-auto text-right text-xs" style={{ color: "var(--dim)" }}>
+                    子カテゴリ「{blockedBy}」を選択中のため選べません
+                  </span>
+                )}
               </label>
             );
           })}
@@ -1328,6 +1937,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
   const [imageEditChar, setImageEditChar] = useState<CharacterItem | null>(null);
   const [menuChar, setMenuChar] = useState<CharacterItem | null>(null);
   const [viewSettingsChar, setViewSettingsChar] = useState<CharacterItem | null>(null);
+  const [editSettingsChar, setEditSettingsChar] = useState<CharacterItem | null>(null);
   const [renameChar, setRenameChar] = useState<CharacterItem | null>(null);
   const [categoryAssignChar, setCategoryAssignChar] = useState<CharacterItem | null>(null);
   const [showCategoryManage, setShowCategoryManage] = useState(false);
@@ -1428,15 +2038,16 @@ function HomeView({ go }: { go: (v: View) => void }) {
   const { characters, groups, categories } = home.data;
   const categoryNameById = new Map(categories.map((c) => [c.id, c.name]));
 
-  // カテゴリ絞り込み＋並び替えを適用した表示用リスト（v1.25）。
-  // カテゴリは複数設定できるため、絞り込みは「そのカテゴリを含むか」で判定する。
-  // A・B両方に属するキャラは、AでもBでも現れる。「すべて」は全員を並び替えだけで
-  // フラットに表示する（旧フォルダ分け表示は廃止）。「未分類」はカテゴリが1つも無いキャラ。
+  // カテゴリ絞り込み＋並び替えを適用した表示用リスト（v1.25、階層対応 v1.26）。
+  // カテゴリは複数設定できるため、絞り込みは「そのカテゴリ（子孫カテゴリを含む）に
+  // 属するか」で判定する（charMatchesCategory）。親カテゴリを選ぶと、その子・孫
+  // カテゴリのキャラも表示される。「すべて」は全員を並び替えだけでフラットに
+  // 表示する。「未分類」はカテゴリが1つも無いキャラ。
   // グループ作成のキャラ選択はこの一覧設定とは独立（シート内でカテゴリ絞り込みを持ち、
   // 並びは常に五十音順。v1.23）。
   const displayedCharacters: CharacterItem[] = (() => {
     if (categoryFilter === "none") return sortCharactersBy(characters.filter((c) => charCategoryIds(c).length === 0), sort);
-    if (categoryFilter !== "all") return sortCharactersBy(characters.filter((c) => charCategoryIds(c).includes(categoryFilter)), sort);
+    if (categoryFilter !== "all") return sortCharactersBy(characters.filter((c) => charMatchesCategory(c, categories, categoryFilter)), sort);
     return sortCharactersBy(characters, sort);
   })();
 
@@ -1642,8 +2253,8 @@ function HomeView({ go }: { go: (v: View) => void }) {
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
               <option value="all">すべて</option>
-              {categories.map((cat) => (
-                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+              {categoryTreeEntries(categories).map(({ cat, depth }) => (
+                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
               <option value="none">未分類</option>
             </select>
@@ -1782,6 +2393,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
           character={menuChar}
           onClose={() => setMenuChar(null)}
           onViewSettings={() => { setViewSettingsChar(menuChar); setMenuChar(null); }}
+          onEditSettings={() => { setEditSettingsChar(menuChar); setMenuChar(null); }}
           onEditImage={() => { setImageEditChar(menuChar); setMenuChar(null); }}
           onRename={() => { setRenameChar(menuChar); setMenuChar(null); }}
           onSetCategory={() => { setCategoryAssignChar(menuChar); setMenuChar(null); }}
@@ -1796,6 +2408,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
       )}
       {viewSettingsChar && (
         <CharacterSettingsSheet characterId={viewSettingsChar.id} onClose={() => setViewSettingsChar(null)} />
+      )}
+      {editSettingsChar && (
+        <CharacterSettingsEditSheet character={editSettingsChar} onClose={() => setEditSettingsChar(null)} />
       )}
       {renameChar && (
         <RenameCharacterSheet character={renameChar} onClose={() => setRenameChar(null)} />
@@ -1903,15 +2518,15 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
   const [allowGuests, setAllowGuests] = useState(false);
   const [allowMobs, setAllowMobs] = useState(false);
   const [error, setError] = useState("");
-  // シート内のカテゴリ絞り込み（v1.23）: "all" = 未指定（全員）/ "none" = 未分類のみ /
-  // 数値 = そのカテゴリのみ。一覧側の絞り込み・並び替え設定とは独立に持ち、
-  // 並びは設定に関わらず常に五十音順にする。
+  // シート内のカテゴリ絞り込み（v1.23、階層対応 v1.26）: "all" = 未指定（全員）/
+  // "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
+  // 一覧側の絞り込み・並び替え設定とは独立に持ち、並びは設定に関わらず常に五十音順にする。
   const [catFilter, setCatFilter] = useState<"all" | "none" | number>("all");
   const visibleCharacters = sortCharactersBy(
     characters.filter((c) => {
       if (catFilter === "all") return true;
       if (catFilter === "none") return charCategoryIds(c).length === 0;
-      return charCategoryIds(c).includes(catFilter);
+      return charMatchesCategory(c, categories, catFilter);
     }),
     "gojuon",
   );
@@ -1927,7 +2542,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
   const toggle = (id: number) => {
     setSelected((prev) => {
       if (prev.includes(id)) return prev.filter((x) => x !== id);
-      if (prev.length >= 5) { setError("グループは最大5人までです。"); return prev; }
+      if (prev.length >= 8) { setError("グループは最大8人までです。"); return prev; }
       setError("");
       return [...prev, id];
     });
@@ -1946,7 +2561,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
           className="mt-1 w-full rounded-2xl px-3 py-2 text-sm"
           style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
         />
-        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>参加キャラクター（1〜5人）</p>
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>参加キャラクター（1〜8人）</p>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>1人だけでも作れます。作成後に「なりきり」を設定すると、自分がそのキャラとして参加できます。</p>
         {categories.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1962,8 +2577,8 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
               <option value="all">すべて</option>
-              {categories.map((cat) => (
-                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+              {categoryTreeEntries(categories).map(({ cat, depth }) => (
+                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
               <option value="none">未分類</option>
             </select>
@@ -2548,7 +3163,7 @@ function GroupMenuSheet({
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
     { label: "グループチャットの名前を変える", description: "このグループの表示名を変更します（参加者や会話履歴には影響しません）", onSelect: onRename },
-    { label: "グループチャットの参加者を変える", description: "参加キャラクターを2〜5人の間で増やしたり減らしたりできます（会話履歴は残ります）", onSelect: onEditMembers },
+    { label: "グループチャットの参加者を変える", description: "参加キャラクターを1〜8人の間で増やしたり減らしたりできます（会話履歴は残ります）", onSelect: onEditMembers },
     { label: "ゲスト・モブの設定", description: "参加者以外のキャラクター（ゲスト）や、名前のない人々（モブ）が会話に混じることがあるかを選びます", onSelect: onGuestMob },
   ];
   return (
@@ -2732,7 +3347,7 @@ function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; 
   );
 }
 
-/** 参加者の変更シート。2〜5人の間で増減できる。なりきり中のキャラを外すと、なりきりは解除される（サーバ側でも未選択に戻す）。 */
+/** 参加者の変更シート。1〜8人の間で増減できる（1人だけでも保存できる）。なりきり中のキャラを外すと、なりきりは解除される（サーバ側でも未選択に戻す）。 */
 function GroupMembersSheet({
   groupId,
   currentMemberIds,
@@ -2767,29 +3382,29 @@ function GroupMembersSheet({
   const toggle = (id: number) => {
     setSelected((prev) => {
       if (prev.includes(id)) return prev.filter((x) => x !== id);
-      if (prev.length >= 5) { setError("グループは最大5人までです。"); return prev; }
+      if (prev.length >= 8) { setError("グループは最大8人までです。"); return prev; }
       setError("");
       return [...prev, id];
     });
   };
   const characters: CharacterItem[] = home.data?.characters ?? [];
   const categories: CategoryItem[] = home.data?.categories ?? [];
-  // シート内のカテゴリ絞り込み（v1.24）: グループ作成シートと機能を合わせる。
-  // "all" = 未指定（全員）/ "none" = 未分類のみ / 数値 = そのカテゴリのみ。
+  // シート内のカテゴリ絞り込み（v1.24、階層対応 v1.26）: グループ作成シートと機能を合わせる。
+  // "all" = 未指定（全員）/ "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
   // 並びは一覧側の設定に関わらず常に五十音順。絞り込みで隠れたキャラの選択は保持する。
   const [catFilter, setCatFilter] = useState<"all" | "none" | number>("all");
   const visibleCharacters = sortCharactersBy(
     characters.filter((c) => {
       if (catFilter === "all") return true;
       if (catFilter === "none") return charCategoryIds(c).length === 0;
-      return charCategoryIds(c).includes(catFilter);
+      return charMatchesCategory(c, categories, catFilter);
     }),
     "gojuon",
   );
   const roleplayRemoved = roleplayMember != null && !selected.includes(roleplayMember.character_id);
   const submit = () => {
-    if (selected.length < 2) { setError("参加者は2人以上選んでください。"); return; }
-    if (selected.length > 5) { setError("参加者は5人までです。"); return; }
+    if (selected.length < 1) { setError("参加者は1人以上選んでください。"); return; }
+    if (selected.length > 8) { setError("参加者は8人までです。"); return; }
     setError("");
     save.mutate();
   };
@@ -2798,7 +3413,7 @@ function GroupMembersSheet({
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>グループチャットの参加者を変える</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          参加キャラクターは2〜5人です。外したキャラクターは会話に参加しなくなりますが、過去の発言は名前と画像つきで会話履歴にそのまま残ります。
+          参加キャラクターは1〜8人です。外したキャラクターは会話に参加しなくなりますが、過去の発言は名前と画像つきで会話履歴にそのまま残ります。
         </p>
         <p className="mt-3 text-sm font-bold" style={{ color: "var(--text)" }}>参加キャラクター（現在 {selected.length}人）</p>
         {categories.length > 0 && (
@@ -2815,8 +3430,8 @@ function GroupMembersSheet({
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
               <option value="all">すべて</option>
-              {categories.map((cat) => (
-                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+              {categoryTreeEntries(categories).map(({ cat, depth }) => (
+                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
               <option value="none">未分類</option>
             </select>
@@ -2871,7 +3486,7 @@ function GroupMembersSheet({
           <button
             type="button"
             onClick={submit}
-            disabled={save.isPending || selected.length < 2}
+            disabled={save.isPending || selected.length < 1}
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >

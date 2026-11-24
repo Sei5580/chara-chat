@@ -36,6 +36,9 @@ export const characters = sqliteTable("characters", {
 export const categories = sqliteTable("categories", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
+  // 階層化（v1.26）: 親カテゴリのID。null は最上位。深さは無制限。
+  // 自分自身や自分の子孫を親にすることはできない（循環防止、サーバ側で検証）。
+  parentId: integer("parent_id"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
