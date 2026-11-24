@@ -2889,7 +2889,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                 )}
               </div>
             ) : (
-              <div className="flex items-end gap-2">
+              <div className="flex items-start gap-2">
                 <Avatar imageUrl={data.character.image_url} name={data.character.display_name} themeColor={data.character.theme_color} size={32} />
                 <div className="flex max-w-[82%] flex-col">
                   {reviewMode ? (
@@ -3814,7 +3814,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             return (
               <Fragment key={m.id}>
                 {divider}
-                <div className="flex items-end gap-2">
+                <div className="flex items-start gap-2">
                 <Avatar imageUrl={member?.image_url ?? null} name={m.speaker_name} themeColor={member?.theme_color ?? ""} size={32} />
                 <div className="flex max-w-[82%] flex-col">
                   <span className="font-display mb-0.5 text-xs font-bold" style={{ color: "var(--dim)" }}>{m.speaker_name}</span>
