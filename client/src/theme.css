@@ -36,6 +36,12 @@
   --gold: #b07d2b;
   --danger: #c24343;
   --radius: 16px;
+  /* 区間フレーム（履歴の区切り）: 区間の地は通常の背景色（--bg）と同一にし、
+     区間の区別は区切りの帯の裏に敷く更に暗い色（--segment-band）だけで行う。
+     --segment-band は --bg から color-mix で作るため、ダークモードでも
+     自動で追随する。 */
+  --segment: var(--bg);
+  --segment-band: color-mix(in srgb, var(--bg) 76%, #000 24%);
   --space-surface: var(--surface);
   --space-surface-alt: var(--surface-alt);
   --space-muted: var(--dim);

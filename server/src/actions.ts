@@ -10,7 +10,7 @@
 // 本文を戻し下書き（drafts）として保持する（画面が入力欄へ復元する）。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
 
@@ -256,7 +256,8 @@ type ScheduleRow = typeof schema.schedules.$inferSelect;
 
 /**
  * 自動生成リクエストの決着（成功/失敗）を自動生成ログへ残す。新規チャット型では
- * 成功時に schedules.last_group_id を今回のグループへ更新する（次回の履歴参照用）。
+ * 成功時に schedules.last_group_id を今回のグループへ更新する（前回生成した
+ * グループの記録として保持する。設計書 v3.2 以降、生成の履歴参照には使わない）。
  * manual リクエストでは何もしない。
  */
 async function closeOutAutoRequest(db: Db, req: RequestRow, ok: boolean, reason = "") {
@@ -1283,12 +1284,6 @@ async function normalizeAllCharacterCategories(db: Db): Promise<void> {
   }
 }
 
-/** 1キャラのカテゴリID一覧を返す。 */
-async function categoryIdsForCharacter(db: Db, characterId: number): Promise<number[]> {
-  const map = await categoryIdsByCharacter(db);
-  return map.get(characterId) ?? [];
-}
-
 /** キャラのカテゴリ割り当てを丸ごと差し替える。旧カラム（characters.category_id）への
  * 先頭カテゴリの同期は停止した（読み側は character_categories のみを参照し、実データの
  * 一致は検証済みのため、旧カラムは移行時点の値を保持するだけになった）。 */
@@ -1561,7 +1556,6 @@ const scheduleOutSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
-  use_history: z.boolean(),
   background_text: z.string(),
   last_fired_slot: z.string().nullable(),
   last_group_id: z.number().nullable(),
@@ -1584,7 +1578,6 @@ function scheduleToOut(s: ScheduleRow, targetGroupName: string | null): z.infer<
     allow_guests: s.allowGuests === 1,
     allow_mobs: s.allowMobs === 1,
     allow_narration: s.allowNarration === 1,
-    use_history: s.useHistory === 1,
     background_text: s.backgroundText,
     last_fired_slot: s.lastFiredSlot,
     last_group_id: s.lastGroupId,
@@ -1608,7 +1601,6 @@ const scheduleInputSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
-  use_history: z.boolean(),
   background_text: z.string().max(5000),
 });
 
@@ -1654,36 +1646,46 @@ function scheduleInputToValues(input: ScheduleInput) {
     allowGuests: input.allow_guests ? 1 : 0,
     allowMobs: input.allow_mobs ? 1 : 0,
     allowNarration: input.allow_narration ? 1 : 0,
-    useHistory: input.use_history ? 1 : 0,
     backgroundText: input.target_type === "new" ? input.background_text : "",
   };
 }
 
 /**
- * 自動生成（auto）で「履歴を使う」場合の履歴発言を決める（設計書 v2.0 / B）。
- * 既存グループ対象: そのグループ自身の過去ログ。新規チャット型: 同一スケジュールの
- * 前回生成グループ（schedules.last_group_id）の会話。前回が無い・失敗した場合は
- * 履歴なし。履歴を使わない設定の場合は常に空。
+ * 生成の文脈に含める履歴の範囲（設計書 v3.2）: 対象（キャラ／グループ）の
+ * 「過去の履歴を使う」設定と境界から決まる。使わない設定なら常に空。
+ * 使う設定なら、境界（history_boundary_seq）より後の発言だけが範囲で、
+ * その中から直近 HISTORY_LIMIT 件。自動生成（auto）でも同じ規則で、
+ * 対象自身の発言だけが材料になる（新規チャット型は作られたばかりで
+ * 発言が無いため、常にまっさらな状態から始まる）。
  */
-async function autoHistoryMessages(
-  db: Db,
-  req: RequestRow,
-  groupId: number,
-  ownMsgs: (typeof schema.groupMessages.$inferSelect)[],
-): Promise<(typeof schema.groupMessages.$inferSelect)[]> {
-  if (req.scheduleId == null) return [];
-  const srows = await db.select().from(schema.schedules).where(eq(schema.schedules.id, req.scheduleId));
-  const s = srows[0];
-  if (!s || s.useHistory !== 1) return [];
-  if (s.targetType === "new" && s.lastGroupId != null && s.lastGroupId !== groupId) {
-    const prev = await db
-      .select()
-      .from(schema.groupMessages)
-      .where(eq(schema.groupMessages.groupId, s.lastGroupId))
-      .orderBy(asc(schema.groupMessages.seq));
-    return prev.slice(-HISTORY_LIMIT);
+function historyRange<T extends { seq: number }>(useHistory: boolean, boundarySeq: number, msgs: T[]): T[] {
+  if (!useHistory) return [];
+  return msgs.filter((m) => m.seq > boundarySeq).slice(-HISTORY_LIMIT);
+}
+
+/**
+ * 区間の生成日時ラベル（設計書 v3.2 追補 / v3.3 改訂）: 区間ごとに、その区間で
+ * 最初に生成された掛け合い（no_history の先頭発言）の生成日時を JST の
+ * "YYYY/MM/DD HH:MM" で返す。戻り値は segment_no → 日時ラベルの Map。
+ * no_history の発言が無い区間は含まない。
+ */
+function segmentDateLabels(msgs: { segmentNo: number; noHistory: number; createdAt: Date }[]): Map<number, string> {
+  const firstBySegment = new Map<number, number>();
+  for (const m of msgs) {
+    if (m.noHistory !== 1) continue;
+    const t = m.createdAt.getTime();
+    const cur = firstBySegment.get(m.segmentNo);
+    if (cur == null || t < cur) firstBySegment.set(m.segmentNo, t);
   }
-  return ownMsgs.slice(-HISTORY_LIMIT);
+  const labels = new Map<number, string>();
+  for (const [seg, t] of firstBySegment) {
+    const jst = new Date(t + JST_OFFSET_MS);
+    labels.set(
+      seg,
+      `${jst.getUTCFullYear()}/${pad2(jst.getUTCMonth() + 1)}/${pad2(jst.getUTCDate())} ${pad2(jst.getUTCHours())}:${pad2(jst.getUTCMinutes())}`,
+    );
+  }
+  return labels;
 }
 
 // ------------------------------------------------------- actions
@@ -1950,8 +1952,22 @@ export const Actions = {
         image_url: z.string().nullable(),
         theme_color: z.string(),
       }),
+      // 履歴の使用設定（設計書 v3.2）: false の間は生成に過去の履歴を含めない。
+      use_history: z.boolean(),
       messages: z.array(
-        z.object({ id: z.number(), speaker: z.string(), body: z.string(), seq: z.number(), created_at: z.string() }),
+        z.object({
+          id: z.number(),
+          speaker: z.string(),
+          body: z.string(),
+          seq: z.number(),
+          // 区間と区切り線（設計書 v3.2）: segment_no は所属区間。no_history の
+          // 発言の直前には区切り線を出し、segment_date はその区間で最初に
+          // 生成された掛け合いの生成日時（JST、"YYYY/MM/DD HH:MM"）を載せる。
+          segment_no: z.number(),
+          no_history: z.boolean(),
+          segment_date: z.string().nullable(),
+          created_at: z.string(),
+        }),
       ),
       request: requestInfoOut,
       draft: draftOut,
@@ -1987,6 +2003,7 @@ export const Actions = {
         ? { body: draftRow.body, fail_reason: failedUnseen ? draftRow.fail_reason : "" }
         : null;
       if (latest?.status === "failed") await ackFailure(db, "chat", c.id, latest.id);
+      const segDates = segmentDateLabels(msgs);
       return {
         character: {
           id: c.id,
@@ -1995,7 +2012,17 @@ export const Actions = {
           image_url: await charImageUrl(ctx, c),
           theme_color: c.themeColor,
         },
-        messages: msgs.map((m) => ({ id: m.id, speaker: m.speaker, body: m.body, seq: m.seq, created_at: m.createdAt.toISOString() })),
+        use_history: c.useHistory === 1,
+        messages: msgs.map((m) => ({
+          id: m.id,
+          speaker: m.speaker,
+          body: m.body,
+          seq: m.seq,
+          segment_no: m.segmentNo,
+          no_history: m.noHistory === 1,
+          segment_date: m.noHistory === 1 ? (segDates.get(m.segmentNo) ?? null) : null,
+          created_at: m.createdAt.toISOString(),
+        })),
         request: info,
         draft,
       };
@@ -2018,7 +2045,7 @@ export const Actions = {
       if (active) throw new Error("返信待ちの発言があるため送信できません。返信が届いてから送信してください。");
       const seq = c.nextSeq;
       const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
-        db.insert(schema.messages).values({ characterId: c.id, speaker: "user", body: args.body, seq }),
+        db.insert(schema.messages).values({ characterId: c.id, speaker: "user", body: args.body, seq, segmentNo: c.currentSegmentNo }),
         db.update(schema.characters).set({ nextSeq: seq + 1 }).where(eq(schema.characters.id, c.id)),
       ];
       await db.batch(stmts);
@@ -2626,6 +2653,8 @@ export const Actions = {
       // ナレーションの許可（v3.1）: true の時、生成で会話の背景説明・場面転換・
       // 時間経過の説明（ナレーション）が入ることがある。
       allow_narration: z.boolean(),
+      // 履歴の使用設定（設計書 v3.2）: false の間は生成に過去の履歴を含めない。
+      use_history: z.boolean(),
       members: z.array(
         z.object({
           character_id: z.number(),
@@ -2651,6 +2680,10 @@ export const Actions = {
           split_status: z.string(),
           // なりきり発言かどうか（v1.19）: 利用者本人が書いたキャラ発言。
           user_authored: z.boolean(),
+          // 区間と区切り線（設計書 v3.2）: 1対1と同じ意味。
+          segment_no: z.number(),
+          no_history: z.boolean(),
+          segment_date: z.string().nullable(),
           created_at: z.string(),
         }),
       ),
@@ -2723,6 +2756,7 @@ export const Actions = {
         ? { body: draftRow.body, fail_reason: failedUnseen ? draftRow.fail_reason : "" }
         : null;
       if (latest?.status === "failed") await ackFailure(db, "group", g.id, latest.id);
+      const segDates = segmentDateLabels(msgs);
       return {
         group: { id: g.id, name: g.name, status: g.status, background_text: g.backgroundText },
         roleplay_character_id: g.roleplayCharacterId,
@@ -2730,6 +2764,7 @@ export const Actions = {
         allow_guests: g.allowGuests === 1,
         allow_mobs: g.allowMobs === 1,
         allow_narration: g.allowNarration === 1,
+        use_history: g.useHistory === 1,
         members,
         messages: msgs.map((m) => ({
           id: m.id,
@@ -2740,6 +2775,9 @@ export const Actions = {
           seq: m.seq,
           split_status: m.splitStatus,
           user_authored: m.userAuthored === 1,
+          segment_no: m.segmentNo,
+          no_history: m.noHistory === 1,
+          segment_date: m.noHistory === 1 ? (segDates.get(m.segmentNo) ?? null) : null,
           created_at: m.createdAt.toISOString(),
         })),
         request: info,
@@ -2895,6 +2933,57 @@ export const Actions = {
     },
   }),
 
+  setUseHistory: defineAction({
+    description: "1対1チャット／グループチャットの「過去の履歴を使う」設定を保存します（設計書 v3.2）。使う→使わないへ切り替えた時だけ、その時点を境界として記録し（境界はその時点の最大 seq）、新しい区間を開始します（区間番号を +1）。使わない間は生成の文脈に過去の履歴を一切含めません。使うへ戻しても境界・区間はそのままで、参照範囲は境界から今までの発言に限ります。すでに同じ値の場合は何も変えません。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+      use_history: z.boolean(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      if (args.target_kind === "chat") {
+        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
+        const c = rows[0];
+        if (!c) throw new Error("キャラクターが見つかりません");
+        if ((c.useHistory === 1) === args.use_history) return { ok: true };
+        if (args.use_history) {
+          await db.update(schema.characters).set({ useHistory: 1 }).where(eq(schema.characters.id, c.id));
+        } else {
+          await db
+            .update(schema.characters)
+            .set({
+              useHistory: 0,
+              historyBoundarySeq: Math.max(0, c.nextSeq - 1),
+              currentSegmentNo: c.currentSegmentNo + 1,
+            })
+            .where(eq(schema.characters.id, c.id));
+        }
+      } else {
+        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
+        const g = rows[0];
+        if (!g) throw new Error("グループが見つかりません");
+        if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
+        if ((g.useHistory === 1) === args.use_history) return { ok: true };
+        if (args.use_history) {
+          await db.update(schema.groups).set({ useHistory: 1 }).where(eq(schema.groups.id, g.id));
+        } else {
+          await db
+            .update(schema.groups)
+            .set({
+              useHistory: 0,
+              historyBoundarySeq: Math.max(0, g.nextSeq - 1),
+              currentSegmentNo: g.currentSegmentNo + 1,
+            })
+            .where(eq(schema.groups.id, g.id));
+        }
+      }
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
   markChatRead: defineAction({
     description: "1対1チャットを、その時点の最新発言まで既読にします。会話画面を開いた時にクライアントが呼び、一覧へ戻った直後から新着バッジが消えた状態で表示されるようにします。",
     request: z.object({ character_id: z.number().int().positive() }),
@@ -3024,6 +3113,7 @@ export const Actions = {
               body: args.body,
               seq,
               userAuthored: 1,
+              segmentNo: g.currentSegmentNo,
             }),
             db
               .update(schema.groups)
@@ -3058,7 +3148,7 @@ export const Actions = {
       }
       const seq = g.nextSeq;
       const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
-        db.insert(schema.groupMessages).values({ groupId: g.id, kind: "user", speakerName: "", body: args.body, seq }),
+        db.insert(schema.groupMessages).values({ groupId: g.id, kind: "user", speakerName: "", body: args.body, seq, segmentNo: g.currentSegmentNo }),
         db.update(schema.groups).set({ nextSeq: seq + 1 }).where(eq(schema.groups.id, g.id)),
       ];
       await db.batch(stmts);
@@ -3336,9 +3426,11 @@ export const Actions = {
           const target = msgs.filter((m) => m.speaker === "user" && m.seq > doneUpto && m.seq <= req.uptoSeq);
           if (!target.length) continue;
           const targetIds = new Set(target.map((m) => m.id));
-          const history = msgs
-            .filter((m) => !targetIds.has(m.id) && !(m.speaker === "user" && m.seq > req.uptoSeq))
-            .slice(-HISTORY_LIMIT);
+          // 履歴の範囲は対象の「過去の履歴を使う」設定と境界で決まる（設計書 v3.2）。
+          const historyCandidates = msgs.filter(
+            (m) => !targetIds.has(m.id) && !(m.speaker === "user" && m.seq > req.uptoSeq),
+          );
+          const history = historyRange(c.useHistory === 1, c.historyBoundarySeq, historyCandidates);
           const systemPrompt = [
             "あなたは、キャラクター本人として1対1の会話を楽しむための返答を書きます。以下の「キャラクター設定」が絶対の基準です。会話の流れで、口調・性格・設定・関係性が変わることはありません。",
             "",
@@ -3367,6 +3459,12 @@ export const Actions = {
           // プロンプトの全体ログ記録はサーバ側でここで行う（v2.1）。仲介の
           // 転送に依存しないため、手動・自動とも確実に履歴へ残る。
           await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt);
+          // 履歴なし生成の記録（設計書 v3.2）: completeRequest が保存時に
+          // 区切り線の印を付けるために使う。組み立てのたびに同じ値で上書きする。
+          await db
+            .update(schema.replyRequests)
+            .set({ noHistory: c.useHistory === 1 ? 0 : 1 })
+            .where(eq(schema.replyRequests.id, req.id));
           items.push({ request_id: req.id, target_kind: "chat", target_name: c.displayName, system_prompt: systemPrompt, user_prompt: userPrompt });
         } else {
           const grows = await db.select().from(schema.groups).where(eq(schema.groups.id, req.targetId));
@@ -3406,14 +3504,14 @@ export const Actions = {
           // 「AIも演じる」では、なりきりキャラだけのグループでもAIが続きを書ける。
           if (rpChar && !aiAlsoActs && !present.some((m) => m.characterId !== rpChar.id)) continue;
           const targetIds = new Set(target.map((m) => m.id));
-          let history = msgs
-            .filter((m) => !targetIds.has(m.id) && !(m.kind === "user" && m.seq > req.uptoSeq))
-            .slice(-HISTORY_LIMIT);
-          if (isAuto) {
-            // 自動生成の履歴はスケジュールの「履歴を使う」設定で決まる
-            // （既存グループは自グループの過去ログ、新規型は前回生成の会話）。
-            history = await autoHistoryMessages(db, req, g.id, msgs);
-          }
+          // 履歴の範囲はグループの「過去の履歴を使う」設定と境界で決まる
+          // （設計書 v3.2）。自動生成（auto）でも同じ規則で、材料は対象
+          // グループ自身の発言だけ（新規チャット型は発言が無いため常に
+          // まっさらな状態から始まる）。
+          const historyCandidates = msgs.filter(
+            (m) => !targetIds.has(m.id) && !(m.kind === "user" && m.seq > req.uptoSeq),
+          );
+          const history = historyRange(g.useHistory === 1, g.historyBoundarySeq, historyCandidates);
           const nameList = present.map((m) => m.character!.displayName);
           // ゲスト・モブ（v1.24）: グループ設定で許可されている時だけ、生成材料に
           // ゲスト候補の設定抜粋と、ゲスト／モブのルールを加える。許可されていない
@@ -3556,6 +3654,11 @@ export const Actions = {
               ].join("\n");
           // プロンプトの全体ログ記録はサーバ側でここで行う（v2.1、チャット側と同じ）。
           await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt);
+          // 履歴なし生成の記録（設計書 v3.2）: チャット側と同じ。
+          await db
+            .update(schema.replyRequests)
+            .set({ noHistory: g.useHistory === 1 ? 0 : 1 })
+            .where(eq(schema.replyRequests.id, req.id));
           items.push({ request_id: req.id, target_kind: "group", target_name: g.name, system_prompt: systemPrompt, user_prompt: userPrompt });
         }
       }
@@ -3633,13 +3736,44 @@ export const Actions = {
         if (!c) return failWith("generation_error");
         const seq = c.nextSeq;
         const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
-          db.insert(schema.messages).values({ characterId: c.id, speaker: "character", body: output, seq, requestId: req.id }),
+          // 区切り線と区間（設計書 v3.2）: 履歴なし生成の返信には区切り線の印を付け、
+          // 所属区間は保存時点の現在の区間にする。
+          db.insert(schema.messages).values({
+            characterId: c.id,
+            speaker: "character",
+            body: output,
+            seq,
+            requestId: req.id,
+            noHistory: req.noHistory === 1 ? 1 : 0,
+            segmentNo: c.currentSegmentNo,
+          }),
           db.update(schema.characters).set({ nextSeq: seq + 1 }).where(eq(schema.characters.id, c.id)),
           db
             .update(schema.replyRequests)
             .set({ status: "done", finishedAt: new Date() })
             .where(eq(schema.replyRequests.id, req.id)),
         ];
+        // 履歴なし生成の区間付け替え: きっかけになった利用者発言も、生成された
+        // 返信と同じ区間（保存時点の現在の区間）へ付け替える。区間番号は
+        // 「使わない」への切り替え時点で進むため、投稿時点の区間のままだと
+        // 発言だけが前の区間に残り、画面では発言が上下の区間から切り離されて
+        // 見える。区切りの帯は、この発言の前に置かれる形になる。
+        if (req.noHistory === 1 && req.origin === "manual") {
+          const doneUpto = await lastDoneUpto(db, "chat", c.id);
+          stmts.push(
+            db
+              .update(schema.messages)
+              .set({ segmentNo: c.currentSegmentNo })
+              .where(
+                and(
+                  eq(schema.messages.characterId, c.id),
+                  eq(schema.messages.speaker, "user"),
+                  gt(schema.messages.seq, doneUpto),
+                  lte(schema.messages.seq, req.uptoSeq),
+                ),
+              ),
+          );
+        }
         await db.batch(stmts);
         await appendGenerationLog(db, req, "生レスポンス", output);
         await maybeNotifyReply(db, req);
@@ -3675,6 +3809,7 @@ export const Actions = {
       );
       let seq = g.nextSeq;
       const stmts: BatchItem<"sqlite">[] = [];
+      let lineIndex = 0;
       for (const line of lines) {
         stmts.push(
           db.insert(schema.groupMessages).values({
@@ -3686,7 +3821,34 @@ export const Actions = {
             seq: seq++,
             requestId: req.id,
             splitStatus: line.kind === "raw" || abnormal ? "abnormal" : "normal",
+            // 区切り線と区間（設計書 v3.2）: 履歴なし生成ではバッチの先頭の
+            // 発言だけに区切り線の印を付け、所属区間は保存時点の現在の区間にする。
+            noHistory: req.noHistory === 1 && lineIndex === 0 ? 1 : 0,
+            segmentNo: g.currentSegmentNo,
           }),
+        );
+        lineIndex++;
+      }
+      // 履歴なし生成の区間付け替え（チャット側と同じ）: きっかけになった
+      // 利用者発言（話題・指示と、なりきり発言）も、生成された掛け合いと
+      // 同じ区間（保存時点の現在の区間）へ付け替える。
+      if (req.noHistory === 1 && req.origin === "manual") {
+        const doneUpto = await lastDoneUpto(db, "group", g.id);
+        stmts.push(
+          db
+            .update(schema.groupMessages)
+            .set({ segmentNo: g.currentSegmentNo })
+            .where(
+              and(
+                eq(schema.groupMessages.groupId, g.id),
+                gt(schema.groupMessages.seq, doneUpto),
+                lte(schema.groupMessages.seq, req.uptoSeq),
+                or(
+                  eq(schema.groupMessages.kind, "user"),
+                  and(eq(schema.groupMessages.kind, "character"), eq(schema.groupMessages.userAuthored, 1)),
+                ),
+              ),
+            ),
         );
       }
       stmts.push(db.update(schema.groups).set({ nextSeq: seq }).where(eq(schema.groups.id, g.id)));
@@ -4125,7 +4287,7 @@ export const Actions = {
   }),
 
   updateSchedule: defineAction({
-    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・履歴の使用・背景情報）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
+    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・背景情報）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
     request: scheduleInputSchema.extend({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
@@ -4178,7 +4340,6 @@ export const Actions = {
           allow_guests: s.allowGuests === 1,
           allow_mobs: s.allowMobs === 1,
           allow_narration: s.allowNarration === 1,
-          use_history: s.useHistory === 1,
           background_text: s.backgroundText,
         });
       }
