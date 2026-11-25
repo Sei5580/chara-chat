@@ -18,6 +18,11 @@ export const characters = sqliteTable("characters", {
   relationText: text("relation_text").notNull().default(""),
   sourceJson: text("source_json").notNull().default(""),
   sourceProfileId: text("source_profile_id"),
+  // 差分取り込み: 取り込み時点における取り込み元プロファイルの updated_at
+  // （ISO文字列）。次回取り込み時に元側の updated_at と突き合わせ、新しい
+  // 場合だけ再取り込みする。null は未記録（この仕組みより前の取り込み分）で、
+  // 「変更あり」として一度だけ取り込み直し、その際に記録される。
+  sourceUpdatedAt: text("source_updated_at"),
   imageBlobKey: text("image_blob_key"),
   themeColor: text("theme_color").notNull().default(""),
   nextSeq: integer("next_seq").notNull().default(1),
@@ -40,6 +45,12 @@ export const characters = sqliteTable("characters", {
   // 書き側の先頭カテゴリ同期は廃止済み（実データの一致を検証した上で停止）。
   // このカラムは移行元として値を保持するだけで、読み書きは一切されない。
   categoryId: integer("category_id"),
+  // 自動議題（ローカル改善: 上流リポジトリには無い）: 会話が一区切りして
+  // 入力待ちのまま30分動きが無い時、ランダムな議題を自動投稿する設定
+  // （既定オフ）と、利用者の発言が無いまま自動投稿した連続回数
+  // （上限3回で停止し、利用者が発言すると0に戻る）。
+  autoTopicEnabled: integer("auto_topic_enabled").notNull().default(0),
+  autoTopicCount: integer("auto_topic_count").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -72,6 +83,16 @@ export const messages = sqliteTable("messages", {
   characterId: integer("character_id").notNull(),
   speaker: text("speaker", { enum: ["user", "character"] }).notNull(),
   body: text("body").notNull(),
+  // 「自動」の議題の投稿（ローカル改善#6、旧称: 自動議題）: 1 の発言は
+  // 「自動」の議題として表示する。
+  // speaker は "user" のままなので、返信生成の対象判定は従来どおり。
+  // topic_source は議題の出所: "news"（時事ネタ）/ "interest"（キャラの
+  // 興味）/ "muse"（Muse上での出来事）/ "context"（会話の流れ）/
+  // "profile"（プロフィール由来）/ "season"（季節・今日は何の日）/
+  // "hypothetical"（もしも・二択）/ "contrast"（キャラ同士の対比）。
+  // 通常発言は ""。
+  isTopic: integer("is_topic").notNull().default(0),
+  topicSource: text("topic_source").notNull().default(""),
   seq: integer("seq").notNull(),
   requestId: integer("request_id"),
   // 区切り線（設計書 v3.2）: 履歴を使わずに生成された返信は 1。その発言の
@@ -111,6 +132,10 @@ export const groups = sqliteTable("groups", {
   // 混じらないこともある。既定はどちらも 0（従来通り参加者だけ）。
   allowGuests: integer("allow_guests").notNull().default(0),
   allowMobs: integer("allow_mobs").notNull().default(0),
+  // 自動議題（ローカル改善）: characters 側と同じ意味。既定オフ、
+  // 連続自動投稿は上限3回で停止し、利用者が発言すると0に戻る。
+  autoTopicEnabled: integer("auto_topic_enabled").notNull().default(0),
+  autoTopicCount: integer("auto_topic_count").notNull().default(0),
   // ナレーション（設計書 v3.1）: 1 の時、生成で会話の背景説明・場面転換・
   // 時間経過の説明（ナレーション）が入ることがある。誰かの台詞ではなく、
   // 次の会話までに起きた事をただ記載する。既定は 0（従来通り入れない）。
@@ -149,6 +174,11 @@ export const groupMessages = sqliteTable("group_messages", {
   // なりきり発言（v1.19）: kind="character" でも利用者本人が書いた発言は 1。
   // AI生成の発言と区別して色を変えて表示するために使う。
   userAuthored: integer("user_authored").notNull().default(0),
+  // 「自動」の議題の投稿（ローカル改善#6）: 1 の発言は「自動」の議題として表示する。
+  // kind は "user" のままなので、掛け合い生成の対象判定は従来どおり。
+  // topic_source の意味は messages 側と同じ。通常の話題・指示は ""。
+  isTopic: integer("is_topic").notNull().default(0),
+  topicSource: text("topic_source").notNull().default(""),
   // 区切り線と区間（設計書 v3.2）: messages と同じ意味（履歴なし生成の
   // きっかけになった利用者発言の区間付け替えを含む）。no_history は
   // 履歴を使わずに生成された掛け合いの先頭の発言だけ 1。
@@ -184,6 +214,16 @@ export const replyRequests = sqliteTable("reply_requests", {
     .notNull()
     .default("pending"),
   failReason: text("fail_reason").notNull().default(""),
+  // 失敗の詳細（ローカル改善: 上流リポジトリには無い）: 理由コードだけでは
+  // 原因を追えないため、生成コマンドの終了コードやエラー出力の末尾などを
+  // 仲介が failRequest の detail で渡し、ここへ原文のまま残す。サーバ側で
+  // 確定した失敗（タイムアウト等）も、その経緯をここへ書く。
+  failDetail: text("fail_detail").notNull().default(""),
+  // pending 放置の見張り（ローカル改善）: pending のまま開始されない
+  // リクエストは、見張りが仲介を叩き直した回数と最終の叩き直し時刻を
+  // ここに記録し、上限まで叩き直しても始まらなければ failed に確定する。
+  kickCount: integer("kick_count").notNull().default(0),
+  lastKickAt: integer("last_kick_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -213,6 +253,10 @@ export const reviews = sqliteTable("reviews", {
     .notNull()
     .default("pending"),
   failReason: text("fail_reason").notNull().default(""),
+  // 失敗の詳細と pending 放置の見張り（ローカル改善）: reply_requests 側と同じ意味。
+  failDetail: text("fail_detail").notNull().default(""),
+  kickCount: integer("kick_count").notNull().default(0),
+  lastKickAt: integer("last_kick_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
