@@ -8,6 +8,13 @@
 // postGroupPrompt が独自に kickMediator を呼ぶ経路では本番で仲介が起動しなかった事象への対策）。
 // リクエストが failed に確定した時は、対象だった利用者発言をログから削除し、
 // 本文を戻し下書き（drafts）として保持する（画面が入力欄へ復元する）。
+//
+// pending 放置の見張りと失敗詳細の記録（ローカル改善: 上流リポジトリには無い）:
+// pending のまま仲介に拾われないリクエスト／レビューは、runSignalAll の
+// sweepStalePending が3分ごとに仲介を叩き直し（最大2回）、それでも始まら
+// なければ failed(pending_timeout) に確定する。失敗時は理由コードに加えて
+// fail_detail（生成コマンドの終了コード・エラー出力の末尾や、サーバ側で
+// 確定した経緯）を残し、次回の失敗で原因を追えるようにする。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
@@ -15,6 +22,11 @@ import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
 
 const TEN_MIN_MS = 10 * 60 * 1000;
+// pending 放置の見張り（ローカル改善: 上流リポジトリには無い）: pending のまま
+// 3分開始されなければ仲介を叩き直し（最大2回、各回の間隔も3分空ける）、
+// それでも始まらなければ failed(pending_timeout) に確定して下書きに戻す。
+const PENDING_STALE_MS = 3 * 60 * 1000;
+const PENDING_MAX_KICKS = 2;
 const HISTORY_LIMIT = 20;
 // ゲスト候補の設定抜粋の上限（v1.24）: 参加者全員の設定とは別に、登録済みの
 // 非参加キャラの設定を生成材料へ含める際の1キャラあたりの文字数。
@@ -48,7 +60,12 @@ async function sweepTimeouts(db: Db) {
   for (const req of stale) {
     const res = await db
       .update(schema.replyRequests)
-      .set({ status: "failed", failReason: "timeout", finishedAt: new Date() })
+      .set({
+        status: "failed",
+        failReason: "timeout",
+        failDetail: "生成開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
+        finishedAt: new Date(),
+      })
       .where(and(eq(schema.replyRequests.id, req.id), eq(schema.replyRequests.status, "processing")))
       .returning({ id: schema.replyRequests.id });
     if (res.length) {
@@ -56,6 +73,107 @@ async function sweepTimeouts(db: Db) {
       await appendGenerationLog(db, req, "失敗", "理由: timeout（10分以内に生成が終わりませんでした）");
       await closeOutAutoRequest(db, req, false, "timeout");
     }
+  }
+}
+
+/**
+ * pending 放置の見張り（ローカル改善: 上流リポジトリには無い）。
+ * processing のタイムアウト（sweepTimeouts）と違い、こちらは「仲介に一度も
+ * 拾われず pending のまま止まった」リクエスト／レビューが対象。従来はこの
+ * 状態に救済経路が無く、合図（signalAll）が流れても仲介が起動しない／起動
+ * しても取りこぼすと無期限に「返信待ち」のまま固まっていた。
+ * runSignalAll（2分間隔の定期実行と発言直後の共通経路）から呼ばれる。
+ * - 作成から3分以上 pending で、前回の叩き直し（または作成）から3分以上
+ *   経っていれば、kick_count を数えて仲介を強制キックし直す（通常キックの
+ *   30秒スロットルを迂回し、dedupeKey も専用のものにして、既存の仲介
+ *   タスクの重複排除に潰されないようにする）。最大 PENDING_MAX_KICKS 回。
+ * - 叩き直しを使い切っても始まらなければ failed(pending_timeout) に確定し、
+ *   リクエストは戻し下書きを作る（レビューはそのまま失敗として記録）。
+ */
+async function sweepStalePending(ctx: Ctx, db: Db) {
+  const now = Date.now();
+  const staleCutoff = now - PENDING_STALE_MS;
+  let kickHint = 0;
+  let kickKey = "";
+
+  const staleReqs = await db
+    .select()
+    .from(schema.replyRequests)
+    .where(
+      and(
+        eq(schema.replyRequests.status, "pending"),
+        sql`${schema.replyRequests.createdAt} < ${staleCutoff}`,
+      ),
+    )
+    .orderBy(asc(schema.replyRequests.id));
+  for (const req of staleReqs) {
+    const base = Math.max(req.lastKickAt?.getTime() ?? 0, req.createdAt.getTime());
+    if (now - base < PENDING_STALE_MS) continue;
+    if (req.kickCount < PENDING_MAX_KICKS) {
+      const res = await db
+        .update(schema.replyRequests)
+        .set({ kickCount: req.kickCount + 1, lastKickAt: new Date(now) })
+        .where(and(eq(schema.replyRequests.id, req.id), eq(schema.replyRequests.status, "pending")))
+        .returning({ id: schema.replyRequests.id });
+      if (res.length && !kickHint) {
+        kickHint = req.id;
+        kickKey = `chara-mediator-watchdog-req-${req.id}-${req.kickCount + 1}`;
+      }
+    } else {
+      const ageMin = Math.max(1, Math.round((now - req.createdAt.getTime()) / 60000));
+      const res = await db
+        .update(schema.replyRequests)
+        .set({
+          status: "failed",
+          failReason: "pending_timeout",
+          failDetail: `返信リクエストが pending（待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${req.kickCount}回試みても生成が始まらなかったため、失敗として確定しました。`,
+          finishedAt: new Date(now),
+        })
+        .where(and(eq(schema.replyRequests.id, req.id), eq(schema.replyRequests.status, "pending")))
+        .returning({ id: schema.replyRequests.id });
+      if (res.length) await materializeFailedDraft(db, req, "pending_timeout");
+    }
+  }
+
+  const staleRevs = await db
+    .select()
+    .from(schema.reviews)
+    .where(
+      and(
+        eq(schema.reviews.status, "pending"),
+        sql`${schema.reviews.createdAt} < ${staleCutoff}`,
+      ),
+    )
+    .orderBy(asc(schema.reviews.id));
+  for (const rev of staleRevs) {
+    const base = Math.max(rev.lastKickAt?.getTime() ?? 0, rev.createdAt.getTime());
+    if (now - base < PENDING_STALE_MS) continue;
+    if (rev.kickCount < PENDING_MAX_KICKS) {
+      const res = await db
+        .update(schema.reviews)
+        .set({ kickCount: rev.kickCount + 1, lastKickAt: new Date(now) })
+        .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "pending")))
+        .returning({ id: schema.reviews.id });
+      if (res.length && !kickKey) {
+        kickKey = `chara-mediator-watchdog-rev-${rev.id}-${rev.kickCount + 1}`;
+      }
+    } else {
+      const ageMin = Math.max(1, Math.round((now - rev.createdAt.getTime()) / 60000));
+      await db
+        .update(schema.reviews)
+        .set({
+          status: "failed",
+          failReason: "pending_timeout",
+          failDetail: `レビューが pending（処理待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${rev.kickCount}回試みても見直しが始まらなかったため、失敗として確定しました。`,
+          finishedAt: new Date(now),
+        })
+        .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "pending")));
+    }
+  }
+
+  if (kickKey) {
+    ctx.invalidateQueries();
+    await kickMediator(ctx, db, kickHint, { force: true, dedupeKey: kickKey });
   }
 }
 
@@ -414,17 +532,78 @@ async function fireExistingSchedule(db: Db, s: ScheduleRow, slotKey: string): Pr
   return `${g.name}（自動生成）`;
 }
 
-/** 新規チャット対象の発火。カテゴリの母集団からランダム抽選してグループを作る。 */
-async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: number): Promise<string | null> {
-  const catRows = await allCategoryRows(db);
-  const expanded = new Set<number>();
-  for (const cid of parseJsonIntArray(s.categoryIds)) {
-    for (const d of categoryDescendantIds(catRows, cid)) expanded.add(d);
+/**
+ * ランダム抽選でグループを作成する共通経路（ローカル改善#7改訂: 上流リポジトリには無い）。
+ * スケジュールの新規チャット型（fireNewSchedule）と「今すぐランダム作成」
+ * ボタン（createRandomGroupNow アクション）が共用する。母集団から
+ * minMembers〜maxMembers の人数をランダムに決めて抽選し、グループと参加者を
+ * 保存する。生成（返信リクエストの作成）は含まない — 必要な呼び出し側が
+ * 別途行う。母集団が minMembers 未満なら null を返す。
+ * name が null の時は参加キャラ名の連結で自動命名する（createGroup と同じ）。
+ */
+async function createRandomGroup(
+  db: Db,
+  opts: {
+    population: CharacterRow[];
+    minMembers: number;
+    maxMembers: number;
+    allowGuests: number;
+    allowMobs: number;
+    allowNarration: number;
+    backgroundText: string;
+    name: string | null;
+  },
+): Promise<{ groupId: number; name: string; picked: CharacterRow[] } | null> {
+  if (opts.population.length < opts.minMembers) return null;
+  const span = Math.max(0, opts.maxMembers - opts.minMembers);
+  const count = Math.min(opts.population.length, opts.minMembers + Math.floor(Math.random() * (span + 1)));
+  const shuffled = [...opts.population];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = shuffled[i]!;
+    shuffled[i] = shuffled[j]!;
+    shuffled[j] = tmp;
   }
-  const catMap = await categoryIdsByCharacter(db);
+  const picked = shuffled.slice(0, count);
+  const name = (opts.name ?? picked.map((c) => c.displayName).join("・")).slice(0, 60);
+  const ins = await db
+    .insert(schema.groups)
+    .values({
+      name,
+      status: "active",
+      allowGuests: opts.allowGuests,
+      allowMobs: opts.allowMobs,
+      allowNarration: opts.allowNarration,
+      backgroundText: opts.backgroundText,
+    })
+    .returning({ id: schema.groups.id });
+  const gid = ins[0]!.id;
+  for (const c of picked) {
+    await db.insert(schema.groupMembers).values({ groupId: gid, characterId: c.id });
+  }
+  return { groupId: gid, name, picked };
+}
+
+/** 新規チャット対象の発火。カテゴリの母集団からランダム抽選してグループを作る。
+ * ローカル改善（上流リポジトリには無い）: カテゴリ未指定（category_ids が空）の
+ * 場合は全登録キャラを母集団とする。カテゴリが指定されている場合は従来どおり
+ * 選択カテゴリ（子孫展開）の和集合に属するキャラだけが母集団（未分類は含まない）。 */
+async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: number): Promise<string | null> {
+  const categoryIds = parseJsonIntArray(s.categoryIds);
   const allChars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
-  // 母集団: 選択カテゴリ（子孫展開）の和集合に属するキャラ。未分類は含まない。
-  const population = allChars.filter((c) => (catMap.get(c.id) ?? []).some((cid) => expanded.has(cid)));
+  let population: typeof allChars;
+  if (categoryIds.length === 0) {
+    // カテゴリ未指定＝全キャラ対象（ローカル改善）。
+    population = allChars;
+  } else {
+    const catRows = await allCategoryRows(db);
+    const expanded = new Set<number>();
+    for (const cid of categoryIds) {
+      for (const d of categoryDescendantIds(catRows, cid)) expanded.add(d);
+    }
+    const catMap = await categoryIdsByCharacter(db);
+    population = allChars.filter((c) => (catMap.get(c.id) ?? []).some((cid) => expanded.has(cid)));
+  }
   if (population.length < s.minMembers) {
     await addAppLog(
       db,
@@ -436,27 +615,22 @@ async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: n
     );
     return null;
   }
-  const span = Math.max(0, s.maxMembers - s.minMembers);
-  const count = Math.min(population.length, s.minMembers + Math.floor(Math.random() * (span + 1)));
-  const shuffled = [...population];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = shuffled[i]!;
-    shuffled[i] = shuffled[j]!;
-    shuffled[j] = tmp;
-  }
-  const picked = shuffled.slice(0, count);
   const jst = new Date(nowMs + JST_OFFSET_MS);
   const stamp = `${jst.getUTCMonth() + 1}/${jst.getUTCDate()} ${pad2(jst.getUTCHours())}:${pad2(jst.getUTCMinutes())}`;
-  const name = `${s.name} ${stamp}`.slice(0, 60);
-  const ins = await db
-    .insert(schema.groups)
-    .values({ name, status: "active", allowGuests: s.allowGuests, allowMobs: s.allowMobs, allowNarration: s.allowNarration, backgroundText: s.backgroundText })
-    .returning({ id: schema.groups.id });
-  const gid = ins[0]!.id;
-  for (const c of picked) {
-    await db.insert(schema.groupMembers).values({ groupId: gid, characterId: c.id });
-  }
+  // 作成そのものは「今すぐランダム作成」と共通の経路（createRandomGroup）に寄せる。
+  // 生成キック（返信リクエストの作成）はスケジュール側だけの処理としてここに残す。
+  const created = await createRandomGroup(db, {
+    population,
+    minMembers: s.minMembers,
+    maxMembers: s.maxMembers,
+    allowGuests: s.allowGuests,
+    allowMobs: s.allowMobs,
+    allowNarration: s.allowNarration,
+    backgroundText: s.backgroundText,
+    name: `${s.name} ${stamp}`,
+  });
+  if (!created) return null;
+  const { groupId: gid, name, picked } = created;
   await db.insert(schema.replyRequests).values({
     targetKind: "group",
     targetId: gid,
@@ -688,13 +862,14 @@ active: RequestRow | null,
 latest: RequestRow | null,
 unrepliedCount: number,
 failAcked = 0,
-): { status: "none" | "pending" | "processing" | "failed"; request_id: number | null; fail_reason: string; requested_at: string | null; elapsed_seconds: number; unreplied_count: number; origin: string} {
+): { status: "none" | "pending" | "processing" | "failed"; request_id: number | null; fail_reason: string; fail_detail: string; requested_at: string | null; elapsed_seconds: number; unreplied_count: number; origin: string} {
 const origin = active?.origin ?? latest?.origin ?? "manual";
 if (active) {
 return {
 status: active.status === "processing"? "processing": "pending",
 request_id: active.id,
 fail_reason: "",
+fail_detail: "",
 requested_at: active.createdAt.toISOString(),
 elapsed_seconds: Math.max(0, Math.floor((Date.now() - active.createdAt.getTime()) / 1000)),
 unreplied_count: unrepliedCount,
@@ -706,13 +881,14 @@ return {
 status: "failed",
 request_id: latest.id,
 fail_reason: latest.failReason,
+fail_detail: latest.failDetail,
 requested_at: latest.createdAt.toISOString(),
 elapsed_seconds: 0,
 unreplied_count: unrepliedCount,
 origin,
 };
 }
-return { status: "none", request_id: null, fail_reason: "", requested_at: null, elapsed_seconds: 0, unreplied_count: unrepliedCount, origin};
+return { status: "none", request_id: null, fail_reason: "", fail_detail: "", requested_at: null, elapsed_seconds: 0, unreplied_count: unrepliedCount, origin};
 }
 
 /** クリア・削除の可否: 新鮮な processing があれば不可、pending は cancelled にする。 */
@@ -740,6 +916,13 @@ await db
 
 // ------------------------------------------------------- mediator kick
 
+// テレメトリ無効化（ローカル改善: 上流リポジトリには無い。次回 pull で
+// 競合したらマージ/破棄を利用者に聞くこと）: 生成用 Claude Code の
+// テレメトリ送信先（datadoghq.com）への共有許可カードが生成のたびに
+// 出るため、起動コマンドに CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 と
+// DISABLE_TELEMETRY=1 を付け（標準開発方式ブリッジ run-claude.sh で
+// 実績のある正規の無効化手段）、加えて専用設定フォルダの settings.json
+// にも同じ env を書いて二重に止める。生成そのものには影響しない。
 const MEDIATOR_MESSAGE = [
 "あなたは「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）の返信・レビュー仲介です。返信文や見直し結果を自分で書いてはいけません。生成は必ず下記の分離Claude Codeコマンドの出力を使い、原文のまま受け渡してください（要約・改変・補足・人格の混入は禁止）。",
 "",
@@ -748,61 +931,293 @@ const MEDIATOR_MESSAGE = [
 "2. 各 item について順番に処理する:",
 " a. beginRequest({request_id: item.request_id}) を呼ぶ。ok=false ならその item は飛ばす。（プロンプトの全体ログへの記録は getWorkItems の時点でサーバ側が済ませているため、beginRequest へプロンプトを渡す必要はない）",
 " b. item.system_prompt を ~/workspace/your_files/chara-chat/runtime/<request_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
-" c. 専用設定フォルダ ~/workspace/your_files/chara-chat/claude-config が無ければ作成する。フォルダの有無にかかわらず、毎回 ~/.claude/.credentials.json をそこへ上書きコピーして最新のログイン状態に合わせる（コピー側が古いままだと、本体へ再ログインしても認証切れのまま失敗し続けるため）。作業フォルダ ~/workspace/your_files/chara-chat/workdir が無ければ空で作成する。",
-" d. workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
+" c. 専用設定フォルダ ~/workspace/your_files/chara-chat/claude-config が無ければ作成する。フォルダの有無にかかわらず、毎回 ~/.claude/.credentials.json をそこへ上書きコピーして最新のログイン状態に合わせる（コピー側が古いままだと、本体へ再ログインしても認証切れのまま失敗し続けるため）。さらに、テレメトリ無効化のため、毎回そのフォルダへ settings.json を次の内容で上書きする: {\"env\": {\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\", \"DISABLE_TELEMETRY\": \"1\"}}（この設定フォルダは生成専用なので、このファイルは生成用プロセスにしか効かない）。作業フォルダ ~/workspace/your_files/chara-chat/workdir が無ければ空で作成する。",
+" d. workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
 " e. 終了コード0で出力が空でなければ completeRequest({request_id, output: 標準出力}) を呼ぶ。",
-" f. 失敗・空出力なら failRequest({request_id, reason}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login / \"not logged in\" 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。failRequest で失敗が確定すると、対象の利用者発言はサーバ側で自動的に入力欄への戻し下書きになる（仲介側の追加処理は不要）。",
+" f. 失敗・空出力なら failRequest({request_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login / \"not logged in\" 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。failRequest で失敗が確定すると、対象の利用者発言はサーバ側で自動的に入力欄への戻し下書きになる（仲介側の追加処理は不要）。",
 "3. 返信 item を全て処理したら、レビューの見直しも処理する（手順1で数えた分に加え、返信処理の間に新しく登録されたレビューも拾えるよう、ここで改めて取得し直す）:",
 " a. artifact.invoke_action で slug=kiyaratiyatuto の getReviewWorkItems を呼ぶ。items が空なら手順4へ。",
 " b. 各 review item について順番に（1件ずつ直列に）処理する:",
 "  - beginReview({review_id: item.review_id}) を呼ぶ。ok=false ならその item は飛ばす。",
 "  - item.system_prompt を ~/workspace/your_files/chara-chat/runtime/review-<review_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
-"  - 手順2cと同じ専用設定フォルダと作業フォルダを使い、workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
+"  - 手順2cと同じ専用設定フォルダと作業フォルダを使い（settings.json の上書きも手順2cと同様に済ませてから）、workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
 "  - 終了コード0で出力が空でなければ completeReview({review_id, output: 標準出力}) を呼ぶ。出力は修正後JSONの原文のまま渡すこと（要約・整形・抜粋は禁止）。",
-"  - 失敗・空出力なら failReview({review_id, reason}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。",
+"  - 失敗・空出力なら failReview({review_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。",
 "4. 全て処理したら、処理件数を短く報告して終了する。通知（返信到着・ログイン切れ）の受け渡しは別の配送経路が担うため、getPendingNotifications / ackNotifications は呼ばないこと。",
 ].join("\n");
 
+// 一括転送（ローカル改善: 上流リポジトリには無い。次回 pull で競合したら
+// マージ/破棄を利用者に聞くこと）: 取り込み仲介の手順は「二段構え」。
+// まず軽い一覧（listProfileStubs: id・name・updated_at のみ）とキャラ
+// チャット側の記録状態（getImportStates）を突き合わせて仲介側で差分を
+// 判定し、変更がある場合だけ、その分のIDを指定して exportAllProfiles で
+// 全文を取得し importCharactersBulk へ渡す。変更が無ければ全文は一切
+// 取得しない（旧方式は変更ゼロでも全件の全文が仲介を往復し、かえって
+// 遅かったため二段構えへ改訂した）。画像取得・取り込み・サーバ側の最終
+// 差分判定は importCharactersBulk が行う。従来の「1件ずつ読んで1件ずつ
+// 書く」手順（exportProfile＋importCharacter の繰り返し）は使わない。
 const IMPORT_MESSAGE = [
-"「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）へ、アバター総合管理アプリ（スペース slug: abatazong-he-guan-li）の現在のプロファイルを一括で取り込んでください。",
+"「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）へ、アバター総合管理アプリ（スペース slug: abatazong-he-guan-li）の現在のプロファイルを一括で取り込んでください。取り込みは二段構えの一括転送方式です: まず軽い一覧だけで差分を判定し、全文の取得は変わったプロファイルだけに絞ります。1件ずつ exportProfile や importCharacter を呼んではなりません（遅くなるため）。画像の取得・保存は、すべてキャラチャット側のサーバが行います。画像をシェルでダウンロードしたり base64 化したりしてはなりません（バイト列を仲介経由で運ぶと途中で切れて画像が壊れるため）。この環境向けの手順はこの文面が正であり、他の画像取得アクションを参照してはならない。",
 "",
 "手順:",
-"1. artifact.invoke_action で slug=abatazong-he-guan-li の listProfiles({sort: \"created\"}) を呼び、全プロファイルを得る（引数は sort のみ。query は渡さない）。取り込み対象は、ここで得られた全プロファイル（全件）である。一部のプロファイルだけを取り込んで終了してはならない。全件について手順2を最後まで実行すること。",
-"2. 各プロファイルについて:",
-" a. exportProfile({id: プロファイルID}) で書き出しJSON文字列（応答の json）を得る。",
-" b. 各プロファイルについて必ず getImageData({id: プロファイルID}) を呼んで代表画像の取得を試みること（呼ぶのを省略してはならない）。found=true なら image_base64 と image_mime を使う。",
-" c. getImageData が found=false で reason=\"external_url\" の場合は、画像なしで済ませず、書き出しJSONの images 配列から代表画像（is_primary=true のもの、無ければ先頭のもの）の file に入っている http URL を取得し、シェルでダウンロードして base64 化し、画像として渡す（例: curl -sL <URL> -o /tmp/cc-import-img の後、base64 -w0 /tmp/cc-import-img）。MIME は画像の実形式に合わせる（JPEG なら image/jpeg、PNG なら image/png、WebP なら image/webp）。ダウンロードや base64 化に失敗した場合は画像なしで続ける。",
-" d. slug=kiyaratiyatuto の importCharacter({json: 手順aのJSON, image_base64: 画像base64（無ければ省略）, image_mime: MIME（無ければ省略）, batch_id: 末尾に示された batch_id の値}) を呼ぶ。batch_id はこの一括取り込み全体で同じ値を渡すこと（全体ログの設定変更ログを1件に集約するため）。画像を渡さなかった場合、キャラチャット側に既にある画像は保持され、消えることはない。",
-" e. importCharacter がエラーになったキャラは飛ばし、理由を控える（登録済みデータに影響させない）。",
-"3. 取り込んだ件数・名前・失敗したキャラと理由を短く報告する。報告には listProfiles で得た総件数と実際に取り込んだ件数を併記し、一致しない場合はその理由を明記すること。",
+"1. 軽い一覧の取得: artifact.invoke_action で slug=abatazong-he-guan-li の listProfileStubs({}) を1回だけ呼び、削除されていない全プロファイルの軽い一覧（各要素は id・name・updated_at のみ）を得る。これが取り込み対象の全件である。",
+"2. 記録状態の取得: artifact.invoke_action で slug=kiyaratiyatuto の getImportStates({}) を1回だけ呼び、取り込み済みキャラの記録状態（各要素は source_profile_id・name・source_updated_at。source_updated_at が null のものは未記録＝変更ありとして扱う）を得る。",
+"3. 差分判定（仲介側）: 手順1の一覧の各プロファイルについて、次に当てはまるものを「変更あり」とする。(a) source_profile_id がその id と一致する記録が無い。(b) 記録はあるが、記録済み source_updated_at が null、または一覧の updated_at と異なる（文字列として一致しない）。(c) id の記録は無いが、name が既存キャラの name と完全一致する（取り込み元でIDが作り直された付け替えケース）。それ以外（id の記録があり updated_at が一致するもの）は「変更なし」とする。",
+"4. 変更が1件も無い場合: 全文は一切取得せず（exportAllProfiles を呼ばず）、手順6の結果報告へ進む。この場合の件数は 追加0件・更新0件・失敗0件・スキップ=手順1の全件数 とする。",
+"5. 変更がある場合だけ全文を取得して取り込む: (a) artifact.invoke_action で slug=abatazong-he-guan-li の exportAllProfiles({ids: 手順3で変更ありと判定した id の配列}) を1回だけ呼び、変更分の全文を得る。ids を省略して全件取得してはならない。(b) 応答の profiles 配列をそのまま、slug=kiyaratiyatuto の importCharactersBulk({entries: 手順5aの profiles 配列, batch_id: 末尾に示された batch_id の値}) へ1回だけ渡す。entries の各要素は exportAllProfiles のエントリを加工せずそのまま使うこと（id・name・updated_at・profile を欠かさない）。サーバ側でも差分判定を行い、変更なしのものはスキップし、新規・変更されたものだけを取り込む。画像もサーバ側が profile 内の画像参照（images の file/url 等）から直接取得し、完全性チェックを通ったものだけを保存する（壊れた画像は保存せず、既存の正常な画像は消さない）。会話履歴・カテゴリ・参加グループは保持される。",
+"6. 結果報告（必須）: slug=kiyaratiyatuto の reportImportResult({ok, note}) を必ず呼んでから終了する。件数は次の合計で数える: 追加・更新・失敗は importCharactersBulk の応答（added・updated・failed）の件数、スキップは importCharactersBulk の skipped に手順3で変更なしと判定した件数を加えたもの（手順4の場合は 追加0・更新0・失敗0・スキップ=全件数）。note には追加・更新・スキップの件数を必ず含めること（例: 「追加 2件・更新 3件・スキップ 17件」）。failed が1件以上ある場合は、その名前と理由（results の reason）も note に含める。failed が0件なら ok=true、1件以上あれば ok=false とする。あわせて、手順1の全件数と、追加・更新・スキップ・失敗の内訳を短く報告する。",
 ].join("\n");
 
-/** 仲介タスクを起動する。失敗してもリクエスト自体は成立させる（チャット合図が代替経路）。 */
-async function kickMediator(ctx: Ctx, db: Db, hintRequestId: number) {
+/**
+ * 仲介タスクを起動する。失敗してもリクエスト自体は成立させる（チャット合図が代替経路）。
+ * opts.force（pending 見張りの叩き直し用）: 通常キックの30秒スロットルを迂回し、
+ * dedupeKey も呼び出し側指定の専用キーにする。通常キックと同じ dedupeKey だと、
+ * 起動済みのまま動いていない仲介タスクに重複排除で潰されて叩き直しにならない
+ * ことがあるため（pending 放置の実因のひとつ）。
+ */
+async function kickMediator(ctx: Ctx, db: Db, hintRequestId: number, opts?: { force?: boolean; dedupeKey?: string }) {
 try {
+if (!opts?.force) {
 const last = Number((await getMeta(db, "last_kick_at")) || "0");
 if (Date.now() - last < 30_000) return;
+}
 await setMeta(db, "last_kick_at", String(Date.now()));
 await ctx.agent.spawnTask(
 `${MEDIATOR_MESSAGE}\n\n（今回の合図のリクエストID: ${hintRequestId}。getWorkItems が返す pending は全て処理し、getReviewWorkItems が返す pending レビューも全て処理してください。リクエストIDが0の場合は、レビューの見直しだけが合図の対象です）`,
-{ dedupeKey: "chara-mediator"},
+{ dedupeKey: opts?.dedupeKey ?? "chara-mediator"},
 );
 } catch {
 /* 仲介が起動できなくても、リクエストは pending として残る */
 }
 }
 
-async function kickImport(ctx: Ctx) {
-try {
-await ctx.agent.spawnTask(`${IMPORT_MESSAGE}\n\n（batch_id: import-${Date.now()}）`);
-} catch {
-/* 取り込みはチャットからも依頼できる */
+// ------------------------------------------------------- 一括取り込みのステータス（ローカル改善4の復元）
+// 取り込み状態は meta に保持する（import_state / import_started_at /
+// import_finished_at / import_note）。kickImport が running を記録し、
+// 実施中は二重起動しない。仲介は最後に reportImportResult で done /
+// failed と追加・更新・スキップ件数を含む note を記録する。
+// running のまま20分を超えたら時間切れとして failed に確定させる。
+const IMPORT_TIMEOUT_MS = 20 * 60 * 1000;
+const IMPORT_TIMEOUT_NOTE = "取り込みが20分以上終わらなかったため、時間切れとして終了しました。もう一度お試しください。";
+
+type ImportStatusData = {
+  state: "idle" | "running" | "done" | "failed";
+  started_at: string | null;
+  finished_at: string | null;
+  note: string;
+};
+
+async function readImportStatus(db: Db): Promise<ImportStatusData> {
+  const rawState = await getMeta(db, "import_state");
+  const startedRaw = Number((await getMeta(db, "import_started_at")) || "0");
+  const finishedRaw = Number((await getMeta(db, "import_finished_at")) || "0");
+  const note = await getMeta(db, "import_note");
+  const state: ImportStatusData["state"] =
+    rawState === "running" || rawState === "done" || rawState === "failed" ? rawState : "idle";
+  if (state === "running" && startedRaw > 0 && Date.now() - startedRaw > IMPORT_TIMEOUT_MS) {
+    await setMeta(db, "import_state", "failed");
+    await setMeta(db, "import_finished_at", String(Date.now()));
+    await setMeta(db, "import_note", IMPORT_TIMEOUT_NOTE);
+    return {
+      state: "failed",
+      started_at: new Date(startedRaw).toISOString(),
+      finished_at: new Date().toISOString(),
+      note: IMPORT_TIMEOUT_NOTE,
+    };
+  }
+  return {
+    state,
+    started_at: startedRaw > 0 ? new Date(startedRaw).toISOString() : null,
+    finished_at: finishedRaw > 0 ? new Date(finishedRaw).toISOString() : null,
+    note: state === "idle" ? "" : note,
+  };
 }
+
+async function kickImport(ctx: Ctx, db: Db): Promise<boolean> {
+  const current = await readImportStatus(db);
+  if (current.state === "running") return false;
+  const now = Date.now();
+  await setMeta(db, "import_state", "running");
+  await setMeta(db, "import_started_at", String(now));
+  await setMeta(db, "import_finished_at", "");
+  await setMeta(db, "import_note", "");
+  try {
+    await ctx.agent.spawnTask(`${IMPORT_MESSAGE}\n\n（batch_id: import-${now}）`);
+    return true;
+  } catch {
+    await setMeta(db, "import_state", "failed");
+    await setMeta(db, "import_finished_at", String(Date.now()));
+    await setMeta(db, "import_note", "取り込みの開始に失敗しました。もう一度お試しください。");
+    return false;
+  }
+}
+
+// ------------------------------------------------------- 自動（旧称: 自動議題／ローカル改善#6）
+//
+// 「自動」は上流リポジトリに無いローカル改善。1対1・グループの両方で、
+// ボタンから手動で、または設定オンの会話で入力待ちが30分続いた時に自動で、
+// 議題を1つ投稿し、既存の返信生成の経路でキャラに反応させる。
+// 議題の文章作りは仲介タスク（spawnTask）が担い、材料は getTopicContext が
+// 渡す。出所は8種: 会話の流れ（context）／時事ネタ（news、大手ニュース
+// サイトの人気記事トップ20からランダムに1件）／参加キャラの興味
+// （interest）／プロフィール由来（profile、出身地・好きなもの・仲間・敵
+// など設定から抜き出した項目）／Muse上での出来事（muse）／季節・今日は
+// 何の日（season）／もしも・二択（hypothetical）／キャラ同士の対比
+// （contrast、参加キャラ2人の違い・共通点を突く）。
+// 履歴がある会話では文脈に沿った議題を基本とし、約2割の確率であえて
+// 無関係な議題（文脈以外の出所）を出す。履歴が無い会話では文脈以外の
+// 全出所からランダムに選ぶ。
+// 投稿は postTopic が「自動」の議題として分かる形（is_topic=1）で保存する。
+// 自動投稿の判定は runSignalAll（signalAll の定期実行）に相乗りし、
+// 利用者の発言が無いままの自動投稿は連続3回で止まる（利用者が発言すると
+// postMessage / postGroupPrompt が回数を0に戻す）。
+// 改名（2026-11-26、ローカル改善#6の改訂）: 利用者向けの名称は「自動議題」
+// から「自動」へ変更した（ボタン表示・設定名・議題カード）。内部の識別子
+// （autoTopic 系のカラム名・アクション名・meta キー）は互換のため不変。
+// 次回上流から更新分を pull する際、この変更と差分/コンフリクトが発生
+// したら、マージするか破棄するかを必ず利用者に聞くこと。
+
+const TOPIC_IDLE_MS = 30 * 60 * 1000;
+const TOPIC_MAX_AUTO = 3;
+// 議題の仲介を起動してから投稿されるまでの猶予。これを過ぎた「準備中」は
+// 仲介が終わらなかったものとして扱い、再び投下できるようにする。
+const TOPIC_PENDING_MS = 10 * 60 * 1000;
+
+const TOPIC_MESSAGE = [
+"あなたは「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）の「自動」仲介です。指定された会話に議題を1つ考えて投稿するのが仕事です。議題の文章を考えるのはあなたの役割ですが、キャラクターの返信文を書いてはいけません（返信は投稿後に別の生成が担当します）。",
+"",
+"手順:",
+"1. artifact.invoke_action で slug=kiyaratiyatuto の getTopicContext を、末尾に指定された target_kind と target_id で呼ぶ。ok=false なら、そのまま終了する。",
+"2. 議題の出所を決める（シェルの乱数で選ぶ。自分で偏らせない）:",
+" - 会話の履歴がある場合（getTopicContext の history が空でない場合）: まず echo $((RANDOM % 5)) を実行する。0 が出たら「無関係な議題」の回として、下の『履歴が無い場合』の手順で文脈以外の出所から1つ選ぶ（会話の流れとは無関係な話題でよい）。1〜4 が出たら「会話の流れ」（source=\"context\"）とし、これまでの会話の流れ・内容・雰囲気を踏まえ、その続きや派生、関連する話題になる議題を作る。",
+" - 履歴が無い新規の会話の場合: echo $((RANDOM % 7)) を実行し、0=時事ネタ、1=参加キャラの興味、2=プロフィール由来、3=Muse上での出来事、4=季節・今日は何の日、5=もしも・二択、6=キャラ同士の対比 とする。",
+"3. 出所ごとの作り方:",
+"   - 時事ネタ（news）: 大手ニュースサイト（Yahoo!ニュース、NHKニュース、朝日新聞デジタル、日本経済新聞、読売新聞オンライン等のうちアクセスできるもの）の人気記事ランキング／アクセスランキングの上位20件の見出しを取得し、echo $((RANDOM % 20)) で1件をランダムに選んで、その見出し・内容を具体的に含めた議題を作る。ランキングを取得できない場合は、ウェブ検索で最近（ここ数日）のニュースから同様に選ぶ。どうしても見つからない場合は「参加キャラの興味」に切り替える。",
+"   - 参加キャラの興味（interest）: getTopicContext の参加キャラの設定抜粋を読み、そのキャラ（グループなら参加者）が興味を持ちそうな話題・問いかけを作る。設定に無い経歴や出来事は捏造しない。",
+"   - プロフィール由来（profile）: getTopicContext の参加キャラの profile_items（設定から抜き出した出身地・好きなもの・仲間・敵・関係者などの項目）と relation_excerpt（関係・呼び方）から項目を1つ選び、それにちなんだ話題・問いかけを作る。項目が複数キャラ分ある場合は、どのキャラの項目か分かる形にする。profile_items が全員分とも空の場合は「参加キャラの興味」に切り替える。項目に書かれていない経歴や出来事は捏造しない。",
+"   - Muse上での出来事（muse）: getTopicContext の events（最近増えたキャラクターなど、このアプリや利用者の環境で起きたこと）から1つを取り上げた議題を作る。events が空なら「参加キャラの興味」に切り替える。",
+"   - 季節・今日は何の日（season）: getTopicContext の today（今日の日付）を使う。その日が何の記念日・何の日か、季節の行事（祝日・年中行事・旬のもの等）があればウェブ検索で確認し、それにちなんだ議題を作る。確かな記念日が分からない場合は、季節（today の月）らしい話題（天気・旬の食べ物・行事の準備など）にする。実在しない記念日は捏造しない。",
+"   - もしも・二択（hypothetical）: 仮定の質問（「もし○○だったら？」）か究極の二択（「○○と○○、どちらを選ぶ？」）の形の議題を作る。参加キャラの性格や設定に軽く絡められるとなお良いが、無理に絡めなくてよい。答えが分かれてキャラ同士の違いが出るような問いにすること。",
+"   - キャラ同士の対比（contrast）: 参加キャラから2人を選び（シェルの乱数で選ぶ）、2人の profile_items や設定抜粋を読み比べて、出身地・好きなもの・価値観などの違いや意外な共通点を突く議題を作る（例:「○○と○○は出身地がまるで違うけど、どちらの暮らしが自分に合っていると思う？」）。参加キャラが1人しかいない場合（1対1）は成立しないので「プロフィール由来」に切り替える。設定に書かれていない違いは捏造しない。",
+"4. 議題ができたら postTopic({target_kind, target_id, body: 議題文, source}) を呼ぶ。source は \"context\"（会話の流れ）/ \"news\"（時事ネタ）/ \"interest\"（キャラの興味）/ \"profile\"（プロフィール由来）/ \"muse\"（Muse上での出来事）/ \"season\"（季節・今日は何の日）/ \"hypothetical\"（もしも・二択）/ \"contrast\"（キャラ同士の対比）のどれかで、実際に使った出所に合わせる（切り替えた場合は切り替え先）。議題文は見出しや「議題：」といった前置きを付けず、話題そのものだけを1〜2文で書く（表示側で「自動」の議題と分かる形になる）。参加キャラが話し返したくなる、開かれた問いかけや話題の提示にすること。",
+"5. postTopic がエラーになった場合や、手順の途中で続行できなくなった場合は、必ず failTopic({target_kind, target_id}) を呼んでから終了する（呼ばないと「議題を準備中」の表示が残り続ける）。",
+].join("\n");
+
+/** プロフィール由来の議題の材料: キャラの設定本文と「関係・呼び方」から、
+ *  出身地・好きなもの・仲間・敵などに関わりそうな行を抜き出す（ローカル改善#6改訂）。
+ *  キーワードに触れた行だけを拾う素朴な抽出で、行そのものは原文のまま渡す。 */
+const PROFILE_ITEM_KEYWORDS = [
+  "出身", "生まれ", "育ち", "故郷", "地元",
+  "好き", "好物", "趣味", "特技", "得意",
+  "仲間", "友人", "友達", "親友", "家族", "相棒", "パートナー",
+  "敵", "ライバル", "宿敵", "苦手", "嫌い",
+  "所属", "職業", "仕事", "目標", "夢",
+];
+
+function extractProfileItems(settingsText: string, relationText: string): string[] {
+  const items: string[] = [];
+  const lines = `${settingsText}\n${relationText}`
+    .split(/\n/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 4);
+  for (const line of lines) {
+    if (line.startsWith("「") && line.endsWith("」")) continue; // セクション見出し行は項目ではない
+    if (!PROFILE_ITEM_KEYWORDS.some((k) => line.includes(k))) continue;
+    const item = line.slice(0, 160);
+    if (!items.includes(item)) items.push(item);
+    if (items.length >= 10) break;
+  }
+  return items;
+}
+
+/** 今日の日付（JST）を「2026年11月26日（木）」の形で返す。季節・今日は何の日の材料。 */
+function todayJstLabel(): string {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    weekday: "short",
+  }).formatToParts(new Date());
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${get("year")}年${get("month")}月${get("day")}日（${get("weekday")}）`;
+}
+
+async function topicPendingSince(db: Db, kind: "chat" | "group", targetId: number): Promise<number> {
+  const v = Number((await getMeta(db, `topic_pending:${kind}:${targetId}`)) || "0");
+  return Number.isFinite(v) ? v : 0;
+}
+
+async function isTopicPending(db: Db, kind: "chat" | "group", targetId: number): Promise<boolean> {
+  const t = await topicPendingSince(db, kind, targetId);
+  return t > 0 && Date.now() - t < TOPIC_PENDING_MS;
+}
+
+/** 議題の仲介を起動する。手動（auto=false）と自動投稿（auto=true）で共用。 */
+async function kickTopic(ctx: Ctx, db: Db, kind: "chat" | "group", targetId: number, auto: boolean) {
+  await setMeta(db, `topic_pending:${kind}:${targetId}`, String(Date.now()));
+  await setMeta(db, `topic_auto:${kind}:${targetId}`, auto ? "1" : "0");
+  try {
+    await ctx.agent.spawnTask(`${TOPIC_MESSAGE}\n\n（対象: target_kind="${kind}", target_id=${targetId}）`, {
+      dedupeKey: `chara-topic-${kind}-${targetId}`,
+    });
+  } catch {
+    await setMeta(db, `topic_pending:${kind}:${targetId}`, "");
+  }
+}
+
+/**
+ * 自動投稿の走査（runSignalAll から呼ばれる）。設定オンの会話で、最後の
+ * 発言がキャラ側で、そこから30分以上動きが無く、返信待ち・生成中でも
+ * 議題準備中でもなく、連続自動投稿が上限未満のものへ議題を1つ投下する。
+ * 最後のリクエストが failed のままの会話は、生成経路が壊れている可能性が
+ * あるため対象にしない。
+ */
+async function scanAutoTopics(ctx: Ctx, db: Db) {
+  const now = Date.now();
+  const chars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
+  for (const c of chars) {
+    if (c.autoTopicEnabled !== 1 || c.autoTopicCount >= TOPIC_MAX_AUTO) continue;
+    if (await activeRequest(db, "chat", c.id)) continue;
+    const latest = await latestRequest(db, "chat", c.id);
+    if (latest?.status === "failed") continue;
+    if (await isTopicPending(db, "chat", c.id)) continue;
+    const msgs = await db
+      .select()
+      .from(schema.messages)
+      .where(eq(schema.messages.characterId, c.id))
+      .orderBy(asc(schema.messages.seq));
+    const last = msgs[msgs.length - 1];
+    if (!last || last.speaker !== "character") continue;
+    if (now - last.createdAt.getTime() < TOPIC_IDLE_MS) continue;
+    await kickTopic(ctx, db, "chat", c.id, true);
+  }
+  const groupRows = await db
+    .select()
+    .from(schema.groups)
+    .where(eq(schema.groups.status, "active"))
+    .orderBy(asc(schema.groups.id));
+  for (const g of groupRows) {
+    if (g.autoTopicEnabled !== 1 || g.autoTopicCount >= TOPIC_MAX_AUTO) continue;
+    if (await activeRequest(db, "group", g.id)) continue;
+    const latest = await latestRequest(db, "group", g.id);
+    if (latest?.status === "failed") continue;
+    if (await isTopicPending(db, "group", g.id)) continue;
+    const msgs = await db
+      .select()
+      .from(schema.groupMessages)
+      .where(eq(schema.groupMessages.groupId, g.id))
+      .orderBy(asc(schema.groupMessages.seq));
+    const last = msgs[msgs.length - 1];
+    if (!last || last.kind !== "character") continue;
+    if (now - last.createdAt.getTime() < TOPIC_IDLE_MS) continue;
+    await kickTopic(ctx, db, "group", g.id, true);
+  }
 }
 
 // ------------------------------------------------------- profile conversion
 
-type ProfileParts = { name: string; settingsText: string; relationText: string; sourceProfileId: string | null; themeColor: string};
+type ProfileParts = { name: string; settingsText: string; relationText: string; sourceProfileId: string | null; sourceUpdatedAt: string | null; themeColor: string};
 
 function section(title: string, body: unknown): string | null {
 if (body == null) return null;
@@ -893,6 +1308,7 @@ name,
 settingsText,
 relationText: relationParts.filter(Boolean).join("\n\n"),
 sourceProfileId: typeof profile["id"] === "string" && profile["id"]? (profile["id"] as string): null,
+sourceUpdatedAt: typeof profile["updated_at"] === "string" && profile["updated_at"]? (profile["updated_at"] as string): null,
 themeColor: str(profile["theme_color"]),
 };
 }
@@ -907,6 +1323,78 @@ const cand = `${base}${i}`;
 if (!taken.has(cand)) return cand;
 }
 return `${base}-${Date.now()}`;
+}
+
+// ------------------------------------------------------- character images
+
+const IMAGE_FETCH_MAX_BYTES = 6_000_000;
+
+/** 先頭バイトから画像形式を判定する（対応形式のみ）。 */
+function sniffImageMime(bytes: Uint8Array): string | null {
+if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+return null;
+}
+
+/**
+ * 画像データが最後まで揃っているか（途中で切れていないか）を形式ごとの
+ * 終端マーカーで確認する。仲介経由の base64 は転送途中で切れて、欠けた
+ * 画像がそのまま保存され表示が崩れた事故があったため、保存前に必須とする。
+ */
+function imageBytesComplete(bytes: Uint8Array, mime: string): boolean {
+const n = bytes.length;
+if (mime === "image/png") {
+if (n < 12) return false;
+const tail = [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
+return tail.every((b, i) => bytes[n - 12 + i] === b);
+}
+if (mime === "image/jpeg") return n >= 2 && bytes[n - 2] === 0xff && bytes[n - 1] === 0xd9;
+if (mime === "image/webp") {
+if (n < 12) return false;
+const riffSize = (bytes[4] ?? 0) | ((bytes[5] ?? 0) << 8) | ((bytes[6] ?? 0) << 16) | ((bytes[7] ?? 0) << 24);
+return riffSize === n - 8;
+}
+if (mime === "image/gif") return n >= 1 && bytes[n - 1] === 0x3b;
+return false;
+}
+
+/** 完全な画像データならその MIME を、壊れている・非対応なら null を返す。 */
+function validImageMime(bytes: Uint8Array): string | null {
+const mime = sniffImageMime(bytes);
+if (!mime) return null;
+return imageBytesComplete(bytes, mime) ? mime : null;
+}
+
+/**
+ * 画像URLからサーバ側で直接画像を取得する。仲介エージェントのテキスト
+ * 経由（base64）だと大きな画像が途中で切れて壊れるため、バイト列は
+ * この経路だけで運ぶ。取得できない・壊れている場合は null（画像なしで
+ * 取り込み自体は続行し、次回の再取り込みで回復できるようにする）。
+ */
+async function fetchImageBytes(url: string): Promise<{ bytes: Uint8Array; mime: string } | null> {
+try {
+if (!/^https?:\/\//.test(url)) return null;
+const res = await fetch(url, {
+headers: {
+"User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36",
+Accept: "image/*",
+},
+signal: AbortSignal.timeout(25_000),
+redirect: "follow",
+});
+if (!res.ok) return null;
+const declared = Number(res.headers.get("content-length") || "0");
+if (declared > IMAGE_FETCH_MAX_BYTES) return null;
+const bytes = new Uint8Array(await res.arrayBuffer());
+if (!bytes.length || bytes.length > IMAGE_FETCH_MAX_BYTES) return null;
+const mime = validImageMime(bytes);
+if (!mime) return null;
+return { bytes, mime };
+} catch {
+return null;
+}
 }
 
 // ------------------------------------------------------- output checks / split
@@ -1063,7 +1551,12 @@ async function sweepReviewTimeouts(db: Db) {
   for (const r of stale) {
     const res = await db
       .update(schema.reviews)
-      .set({ status: "failed", failReason: "timeout", finishedAt: new Date() })
+      .set({
+        status: "failed",
+        failReason: "timeout",
+        failDetail: "見直し開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
+        finishedAt: new Date(),
+      })
       .where(and(eq(schema.reviews.id, r.id), eq(schema.reviews.status, "processing")))
       .returning({ id: schema.reviews.id });
     if (res.length) {
@@ -1101,6 +1594,9 @@ async function applyProfileToCharacter(
       settingsText: parts.settingsText,
       relationText: parts.relationText,
       sourceJson: jsonStr,
+      // 差分取り込みの記録: 適用するJSONに updated_at があれば取り込み時点の
+      // 元プロファイル更新日時として更新する。無ければ既存の記録を保持する。
+      sourceUpdatedAt: parts.sourceUpdatedAt ?? existing.sourceUpdatedAt,
       themeColor: parts.themeColor || existing.themeColor,
     })
     .where(eq(schema.characters.id, existing.id));
@@ -1160,12 +1656,15 @@ first_unread_seq: z.number().nullable(),
 // 一覧の「最近使用した順」用: そのキャラとの1対1で最後に発言があった時刻
 // （利用者・キャラどちらでも可）。会話が無い場合は null。
 last_activity_at: z.string().nullable(),
+// 自動議題の自動投稿がオンかどうか（ローカル改善）。設定メニューの初期値用。
+auto_topic_enabled: z.boolean(),
 });
 
 const requestInfoOut = z.object({
 status: z.enum(["none", "pending", "processing", "failed"]),
 request_id: z.number().nullable(),
 fail_reason: z.string(),
+fail_detail: z.string(),
 requested_at: z.string().nullable(),
 elapsed_seconds: z.number(),
 unreplied_count: z.number(),
@@ -1428,6 +1927,11 @@ async function ensureAutoRequest(db: Db, kind: "chat" | "group", targetId: numbe
 async function runSignalAll(ctx: Ctx, db: Db): Promise<{ created: number; targets: string[]; review_targets: string[] }> {
   await sweepTimeouts(db);
   await sweepReviewTimeouts(db);
+  // pending のまま仲介に拾われていないリクエスト／レビューの見張り
+  // （叩き直しと、最終的な失敗確定）。通常の走査・キックより前に行い、
+  // ここで失敗確定した対象はこの後の走査で新規リクエスト化しない
+  // （latest が failed で未返信が増えていない対象は従来どおり対象外）。
+  await sweepStalePending(ctx, db);
   const targets: string[] = [];
   let firstRequestId = 0;
   const chars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
@@ -1508,6 +2012,8 @@ async function runSignalAll(ctx: Ctx, db: Db): Promise<{ created: number; target
     ctx.invalidateQueries();
     await kickMediator(ctx, db, firstRequestId);
   }
+  // 自動議題の自動投稿もこの定期の流れに相乗りさせる（ローカル改善）。
+  await scanAutoTopics(ctx, db);
   return { created: targets.length, targets, review_targets: reviewTargets };
 }
 
@@ -1536,6 +2042,130 @@ async function logImportSettingsChange(db: Db, batchId: string | undefined, disp
     const id = await addAppLog(db, "settings", title, body);
     await setMeta(db, logKey, String(id));
   }
+}
+
+// ------------------------------------------------------- プロファイル取り込み（共通処理）
+//
+// importCharacter（単発）と importCharactersBulk（一括転送）の共通処理。
+// 一括転送は上流リポジトリに無いローカル改善: アバター総合管理の
+// exportAllProfiles が返した全プロファイルを1回のアクション呼び出しで
+// 受け取り、差分判定（source_updated_at との突き合わせ）もサーバ側で
+// 行う。次回上流から更新分を pull する際、この変更と差分/コンフリクトが
+// 発生したら、マージするか破棄するかを必ず利用者に聞くこと
+// （他のローカル改善と同じ扱い）。
+
+type ImportOneResult = { id: number; name: string; display_name: string; is_new: boolean; has_image: boolean };
+
+/**
+ * プロファイルJSONから代表画像のURLを取り出す（貼り付け取り込みの
+ * クライアント側 extractProfileImageUrl と同じ規則: 代表画像
+ * （is_primary、無ければ先頭）の url → file → image_base.image_ref の
+ * 順で、http で始まるもの）。
+ */
+function profileImageUrl(profile: Record<string, unknown>): string | undefined {
+  const obj = (v: unknown): Record<string, unknown> =>
+    v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  const imgs = Array.isArray(profile["images"]) ? (profile["images"] as unknown[]) : [];
+  const primary = imgs.find((i) => !!obj(i)["is_primary"]) ?? imgs[0];
+  const candidates = [obj(primary)["url"], obj(primary)["file"], obj(profile["image_base"])["image_ref"]];
+  for (const c of candidates) {
+    if (typeof c === "string" && /^https?:\/\//.test(c)) return c;
+  }
+  return undefined;
+}
+
+/**
+ * avatar-profile v1.0 の書き出しJSONを1件取り込む（importCharacter の実体）。
+ * 既存キャラの照合: まず source_profile_id で探し、見つからない場合は
+ * 書き出しJSONの name（元の名前）と完全一致する既存キャラを更新対象と
+ * する（取り込み元アプリの作り直し等でプロファイルIDが変わった場合に
+ * 別キャラとして重複登録されるのを防ぐ）。名前で見つけた場合は
+ * source_profile_id を新しいIDへ付け替えるため、以後はIDで一致する。
+ * 更新時は設定を上書きし、画像は渡された場合のみ差し替え、渡されなければ
+ * 既存の画像を保持する。会話履歴・カテゴリ・参加グループはキャラ行に
+ * 紐付くため、更新でも保持される。取り込み時点の元プロファイル更新日時
+ * （JSON内の updated_at）は source_updated_at として記録される。
+ */
+async function importOneProfile(
+  ctx: Ctx,
+  db: Db,
+  opts: { json: string; imageUrl?: string; imageBase64?: string; batchId?: string },
+): Promise<ImportOneResult> {
+  let profile: Record<string, unknown>;
+  try {
+    profile = JSON.parse(opts.json) as Record<string, unknown>;
+  } catch {
+    throw new Error("JSONとして読み取れませんでした");
+  }
+  const ver = profile["format_version"];
+  if (ver !== undefined && ver !== "1.0") throw new Error(`未知の形式バージョンです: ${String(ver)}`);
+  const parts = profileToParts(profile);
+  let imageBlobKey: string | null = null;
+  // 画像はまず image_url からサーバ側で直接取得する（バイト列を仲介の
+  // テキスト経由で運ぶと途中で切れて壊れるため）。base64 は予備経路で、
+  // どちらの経路でも完全性チェックを通った画像だけを保存する。壊れた
+  // 画像は保存せず、既存の画像も消さない（次回の再取り込みで回復する）。
+  if (opts.imageUrl) {
+    const got = await fetchImageBytes(opts.imageUrl);
+    if (got) {
+      imageBlobKey = `char-image/${parts.sourceProfileId ?? "manual"}-${Date.now()}`;
+      await ctx.blobs.put(imageBlobKey, got.bytes, { contentType: got.mime });
+    }
+  }
+  if (!imageBlobKey && opts.imageBase64) {
+    const bytes = new Uint8Array(Buffer.from(opts.imageBase64, "base64"));
+    const mime = validImageMime(bytes);
+    if (mime) {
+      imageBlobKey = `char-image/${parts.sourceProfileId ?? "manual"}-${Date.now()}`;
+      await ctx.blobs.put(imageBlobKey, bytes, { contentType: mime });
+    }
+  }
+  let existing = parts.sourceProfileId
+    ? (await db.select().from(schema.characters).where(eq(schema.characters.sourceProfileId, parts.sourceProfileId)))[0] ?? null
+    : null;
+  if (!existing) {
+    const byName = await db.select().from(schema.characters).where(eq(schema.characters.name, parts.name));
+    // 同名が複数ある場合は、最初に登録された（IDが最も小さい）ものを正とする。
+    existing = byName.sort((a, b) => a.id - b.id)[0] ?? null;
+  }
+  if (existing) {
+    const displayName = await applyProfileToCharacter(db, existing, profile, opts.json);
+    if (parts.sourceProfileId && existing.sourceProfileId !== parts.sourceProfileId) {
+      await db
+        .update(schema.characters)
+        .set({ sourceProfileId: parts.sourceProfileId })
+        .where(eq(schema.characters.id, existing.id));
+    }
+    if (imageBlobKey) {
+      await db.update(schema.characters).set({ imageBlobKey }).where(eq(schema.characters.id, existing.id));
+    }
+    if (imageBlobKey && existing.imageBlobKey && existing.imageBlobKey !== imageBlobKey) {
+      try {
+        await ctx.blobs.delete(existing.imageBlobKey);
+      } catch {
+        /* ignore */
+      }
+    }
+    await logImportSettingsChange(db, opts.batchId, displayName);
+    return { id: existing.id, name: parts.name, display_name: displayName, is_new: false, has_image: !!(imageBlobKey ?? existing.imageBlobKey) };
+  }
+  const displayName = await uniqueDisplayName(db, parts.name);
+  const ins = await db
+    .insert(schema.characters)
+    .values({
+      name: parts.name,
+      displayName,
+      settingsText: parts.settingsText,
+      relationText: parts.relationText,
+      sourceJson: opts.json,
+      sourceProfileId: parts.sourceProfileId,
+      sourceUpdatedAt: parts.sourceUpdatedAt,
+      imageBlobKey,
+      themeColor: parts.themeColor,
+    })
+    .returning({ id: schema.characters.id });
+  await logImportSettingsChange(db, opts.batchId, displayName);
+  return { id: ins[0]!.id, name: parts.name, display_name: displayName, is_new: true, has_image: !!imageBlobKey };
 }
 
 // ------------------------------------------------------- スケジュール入出力（設計書 v2.0 / B・E）
@@ -1622,10 +2252,13 @@ async function validateScheduleInput(db: Db, input: ScheduleInput) {
       throw new Error("なりきり設定が有効なグループはスケジュールの対象にできません");
     }
   } else {
-    if (!input.category_ids.length) throw new Error("カテゴリを1つ以上選んでください");
-    const catRows = await allCategoryRows(db);
-    if (input.category_ids.some((id) => !catRows.some((c) => c.id === id))) {
-      throw new Error("カテゴリが見つかりません");
+    // ローカル改善（上流リポジトリには無い）: 新規チャット型ではカテゴリ未指定を
+    // 許可し、その場合は全キャラが抽選対象になる。指定がある場合だけ存在を検証する。
+    if (input.category_ids.length) {
+      const catRows = await allCategoryRows(db);
+      if (input.category_ids.some((id) => !catRows.some((c) => c.id === id))) {
+        throw new Error("カテゴリが見つかりません");
+      }
     }
     if (input.min_members > input.max_members) throw new Error("人数の最小は最大以下にしてください");
   }
@@ -1698,7 +2331,8 @@ const okResponse = z.object({ ok: z.literal(true) });
  * 参照され得るため、名前は両方残す）。
  */
 async function runRequestImport(ctx: Ctx): Promise<{ ok: true }> {
-  await kickImport(ctx);
+  const db = getDb(ctx);
+  await kickImport(ctx, db);
   ctx.invalidateQueries();
   return { ok: true };
 }
@@ -1755,6 +2389,7 @@ export const Actions = {
           category_id: catIds[0] ?? null,
           first_unread_seq: await chatFirstUnreadSeq(db, c.id, c.lastReadSeq),
           last_activity_at: await chatLastActivityAt(db, c.id),
+          auto_topic_enabled: c.autoTopicEnabled === 1,
         });
       }
       const groupRows = await db.select().from(schema.groups).orderBy(asc(schema.groups.id));
@@ -1967,10 +2602,16 @@ export const Actions = {
           no_history: z.boolean(),
           segment_date: z.string().nullable(),
           created_at: z.string(),
+          // 自動議題の投稿かどうかと、その出所（ローカル改善）。
+          is_topic: z.boolean(),
+          topic_source: z.string(),
         }),
       ),
       request: requestInfoOut,
       draft: draftOut,
+      // 自動議題（ローカル改善）: 自動投稿の設定と、議題の準備中かどうか。
+      auto_topic_enabled: z.boolean(),
+      topic_pending: z.boolean(),
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
@@ -2022,9 +2663,13 @@ export const Actions = {
           no_history: m.noHistory === 1,
           segment_date: m.noHistory === 1 ? (segDates.get(m.segmentNo) ?? null) : null,
           created_at: m.createdAt.toISOString(),
+          is_topic: m.isTopic === 1,
+          topic_source: m.topicSource,
         })),
         request: info,
         draft,
+        auto_topic_enabled: c.autoTopicEnabled === 1,
+        topic_pending: await isTopicPending(db, "chat", c.id),
       };
     },
   }),
@@ -2046,7 +2691,8 @@ export const Actions = {
       const seq = c.nextSeq;
       const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
         db.insert(schema.messages).values({ characterId: c.id, speaker: "user", body: args.body, seq, segmentNo: c.currentSegmentNo }),
-        db.update(schema.characters).set({ nextSeq: seq + 1 }).where(eq(schema.characters.id, c.id)),
+        // 利用者が発言したら、自動議題の連続自動投稿の数え直しをする（ローカル改善）。
+        db.update(schema.characters).set({ nextSeq: seq + 1, autoTopicCount: 0 }).where(eq(schema.characters.id, c.id)),
       ];
       await db.batch(stmts);
       await clearDraft(db, "chat", c.id);
@@ -2107,6 +2753,8 @@ export const Actions = {
       await db
         .delete(schema.replyRequests)
         .where(and(eq(schema.replyRequests.targetKind, "chat"), eq(schema.replyRequests.targetId, args.character_id)));
+      // 履歴が無くなったので、自動議題の連続自動投稿も数え直す（ローカル改善）。
+      await db.update(schema.characters).set({ autoTopicCount: 0 }).where(eq(schema.characters.id, args.character_id));
       await clearDraft(db, "chat", args.character_id);
       ctx.invalidateQueries();
       return { ok: true };
@@ -2183,10 +2831,12 @@ export const Actions = {
       if (!c) throw new Error("キャラクターが見つかりません");
       const allowed = ["image/png", "image/jpeg", "image/webp"];
       if (!allowed.includes(args.image_mime)) throw new Error("対応していない画像形式です（PNG / JPEG / WebP のいずれか）");
-      const bytes = Buffer.from(args.image_base64, "base64");
+      const bytes = new Uint8Array(Buffer.from(args.image_base64, "base64"));
       if (!bytes.length) throw new Error("画像データを読み取れませんでした");
+      // 途中で切れた壊れた画像は保存しない（表示が崩れる原因になるため）。
+      if (validImageMime(bytes) !== args.image_mime) throw new Error("画像データが壊れているため保存できませんでした（もう一度選び直してください）");
       const key = `char-image/custom-${c.id}-${Date.now()}`;
-      await ctx.blobs.put(key, new Uint8Array(bytes), { contentType: args.image_mime });
+      await ctx.blobs.put(key, bytes, { contentType: args.image_mime });
       await db.update(schema.characters).set({ imageBlobKey: key }).where(eq(schema.characters.id, c.id));
       if (c.imageBlobKey && c.imageBlobKey !== key) {
         try {
@@ -2507,6 +3157,7 @@ export const Actions = {
     description: "avatar-profile v1.0 の書き出しJSON（＋任意で画像base64）からキャラクターを取り込みます。既存キャラの照合はプロファイルIDで行い、IDで見つからない場合はプロファイルの name と完全一致する既存キャラを更新対象とし、そのキャラのプロファイルIDを新しいIDへ付け替えます（取り込み元でIDが作り直されても重複登録されません）。更新時は設定を上書きし（画像は渡された場合のみ差し替え、渡されなければ既存の画像を保持します）、会話履歴・カテゴリ・参加グループは保持します。batch_id を渡すと、一括取り込み全体の設定変更ログが1件に集約されます。",
     request: z.object({
       json: z.string().min(1).max(2_000_000),
+      image_url: z.string().max(2000).optional(),
       image_base64: z.string().max(8_000_000).optional(),
       image_mime: z.string().max(100).optional(),
       batch_id: z.string().trim().min(1).max(100).optional(),
@@ -2514,74 +3165,160 @@ export const Actions = {
     response: z.object({ id: z.number(), name: z.string(), display_name: z.string(), is_new: z.boolean(), has_image: z.boolean() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      let profile: Record<string, unknown>;
-      try {
-        profile = JSON.parse(args.json) as Record<string, unknown>;
-      } catch {
-        throw new Error("JSONとして読み取れませんでした");
-      }
-      const ver = profile["format_version"];
-      if (ver !== undefined && ver !== "1.0") throw new Error(`未知の形式バージョンです: ${String(ver)}`);
-      const parts = profileToParts(profile);
-      let imageBlobKey: string | null = null;
-      if (args.image_base64) {
-        const bytes = Buffer.from(args.image_base64, "base64");
-        imageBlobKey = `char-image/${parts.sourceProfileId ?? "manual"}-${Date.now()}`;
-        await ctx.blobs.put(imageBlobKey, new Uint8Array(bytes), { contentType: args.image_mime || "image/webp" });
-      }
-      // 既存キャラの照合: まず source_profile_id で探す。見つからない場合は
-      // 書き出しJSONの name（元の名前）と完全一致する既存キャラを探し、更新対象
-      // とする（取り込み元アプリの作り直し等でプロファイルIDが変わった場合に、
-      // 別キャラとして重複登録されるのを防ぐ）。名前で見つけた場合は、下で
-      // source_profile_id を新しいIDへ付け替えるため、以後はIDで一致する。
-      // 会話履歴・カテゴリ・参加グループはキャラ行に紐付くため、更新でも保持される。
-      let existing = parts.sourceProfileId
-        ? (await db.select().from(schema.characters).where(eq(schema.characters.sourceProfileId, parts.sourceProfileId)))[0] ?? null
-        : null;
-      if (!existing) {
-        const byName = await db.select().from(schema.characters).where(eq(schema.characters.name, parts.name));
-        // 同名が複数ある場合は、最初に登録された（IDが最も小さい）ものを正とする。
-        existing = byName.sort((a, b) => a.id - b.id)[0] ?? null;
-      }
-      if (existing) {
-        const displayName = await applyProfileToCharacter(db, existing, profile, args.json);
-        if (parts.sourceProfileId && existing.sourceProfileId !== parts.sourceProfileId) {
-          await db
-            .update(schema.characters)
-            .set({ sourceProfileId: parts.sourceProfileId })
-            .where(eq(schema.characters.id, existing.id));
-        }
-        if (imageBlobKey) {
-          await db.update(schema.characters).set({ imageBlobKey }).where(eq(schema.characters.id, existing.id));
-        }
-        if (imageBlobKey && existing.imageBlobKey && existing.imageBlobKey !== imageBlobKey) {
-          try {
-            await ctx.blobs.delete(existing.imageBlobKey);
-          } catch {
-            /* ignore */
-          }
-        }
-        await logImportSettingsChange(db, args.batch_id, displayName);
-        ctx.invalidateQueries();
-        return { id: existing.id, name: parts.name, display_name: displayName, is_new: false, has_image: !!(imageBlobKey ?? existing.imageBlobKey) };
-      }
-      const displayName = await uniqueDisplayName(db, parts.name);
-      const ins = await db
-        .insert(schema.characters)
-        .values({
-          name: parts.name,
-          displayName,
-          settingsText: parts.settingsText,
-          relationText: parts.relationText,
-          sourceJson: args.json,
-          sourceProfileId: parts.sourceProfileId,
-          imageBlobKey,
-          themeColor: parts.themeColor,
-        })
-        .returning({ id: schema.characters.id });
-      await logImportSettingsChange(db, args.batch_id, displayName);
+      // 実体は共通処理 importOneProfile（importCharactersBulk と共用）。
+      const result = await importOneProfile(ctx, db, {
+        json: args.json,
+        imageUrl: args.image_url,
+        imageBase64: args.image_base64,
+        batchId: args.batch_id,
+      });
       ctx.invalidateQueries();
-      return { id: ins[0]!.id, name: parts.name, display_name: displayName, is_new: true, has_image: !!imageBlobKey };
+      return result;
+    },
+  }),
+
+  // 一括転送（ローカル改善: 上流リポジトリには無い。次回 pull で競合したら
+  // マージ/破棄を利用者に聞くこと）: アバター総合管理の exportAllProfiles の
+  // 各エントリ（プロファイルID・更新日時・本体JSON）をまとめて受け取り、
+  // 差分判定と取り込みをサーバ側で一括処理する。従来の「仲介が1件ずつ
+  // 読んで1件ずつ書く」手順はこの一括手順に置き換えた（importCharacter
+  // 自体は互換のため残す）。
+  importCharactersBulk: defineAction({
+    description: "アバター総合管理の exportAllProfiles の結果（プロファイルID・名前・更新日時・本体JSONの配列）を一括で受け取り、差分判定と取り込みをサーバ側でまとめて行います。既存キャラとの照合は importCharacter と同じ規則（プロファイルID優先、無ければ名前の完全一致で更新対象としIDを付け替え）。記録済みの source_updated_at とエントリの updated_at が一致するもの（および記録の方が新しいもの）はスキップし、新規・変更されたものだけを取り込みます（設定の上書き、画像はプロファイル内の参照からサーバ側で直接取得＋完全性チェック、壊れた画像は保存しない・既存の正常な画像は消さない、会話履歴・カテゴリ・参加グループは保持、source_updated_at を記録）。応答には追加・更新・スキップ・失敗の件数と、項目ごとの結果を含みます。1件の失敗で全体は止めず、その項目だけ failed として理由を返します。",
+    request: z.object({
+      entries: z
+        .array(
+          z.object({
+            id: z.string().trim().min(1).max(200),
+            name: z.string().max(500).default(""),
+            updated_at: z.string().trim().min(1).max(100),
+            profile: z.record(z.string(), z.unknown()),
+          }),
+        )
+        .min(1)
+        .max(500),
+      batch_id: z.string().trim().min(1).max(100).optional(),
+    }),
+    response: z.object({
+      added: z.number(),
+      updated: z.number(),
+      skipped: z.number(),
+      failed: z.number(),
+      results: z.array(
+        z.object({
+          profile_id: z.string(),
+          name: z.string(),
+          status: z.enum(["added", "updated", "skipped", "failed"]),
+          character_id: z.number().nullable(),
+          reason: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      const batchId = args.batch_id ?? `import-${Date.now()}`;
+      // 照合用の既存キャラ一覧（ID照合・名前照合・差分判定に使う）。
+      const allChars = await db.select().from(schema.characters);
+      const byProfileId = new Map<string, CharacterRow>();
+      const byName = new Map<string, CharacterRow>();
+      for (const c of [...allChars].sort((a, b) => a.id - b.id)) {
+        if (c.sourceProfileId && !byProfileId.has(c.sourceProfileId)) byProfileId.set(c.sourceProfileId, c);
+        if (!byName.has(c.name)) byName.set(c.name, c);
+      }
+      type BulkResult = { profile_id: string; name: string; status: "added" | "updated" | "skipped" | "failed"; character_id: number | null; reason: string };
+      const results: BulkResult[] = [];
+      let added = 0;
+      let updated = 0;
+      let skipped = 0;
+      let failed = 0;
+      for (const entry of args.entries) {
+        const entryName = entry.name || (typeof entry.profile["name"] === "string" ? (entry.profile["name"] as string) : "");
+        try {
+          // 差分判定: プロファイルIDで一致する既存キャラがいて、記録済みの
+          // source_updated_at があり、エントリの updated_at がそれより
+          // 新しくなければスキップ（従来の仲介側の差分判定と同じ規則）。
+          // IDで見つからず名前だけで一致する場合は、IDの付け替えを伴う
+          // 更新として取り込む（importCharacter の照合規則どおり）。
+          const matchedById = byProfileId.get(entry.id) ?? null;
+          if (
+            matchedById &&
+            matchedById.sourceUpdatedAt != null &&
+            !(entry.updated_at > matchedById.sourceUpdatedAt)
+          ) {
+            skipped++;
+            results.push({ profile_id: entry.id, name: matchedById.name, status: "skipped", character_id: matchedById.id, reason: "" });
+            continue;
+          }
+          // 本体JSONへ ID と更新日時をエントリ側の値で確実に載せる
+          // （source_profile_id / source_updated_at の記録を差分判定の
+          // キーと一致させるため）。
+          const profile: Record<string, unknown> = { ...entry.profile, id: entry.id, updated_at: entry.updated_at };
+          const json = JSON.stringify(profile);
+          const result = await importOneProfile(ctx, db, {
+            json,
+            imageUrl: profileImageUrl(profile),
+            batchId,
+          });
+          if (result.is_new) {
+            added++;
+            results.push({ profile_id: entry.id, name: result.name, status: "added", character_id: result.id, reason: "" });
+          } else {
+            updated++;
+            results.push({ profile_id: entry.id, name: result.name, status: "updated", character_id: result.id, reason: "" });
+          }
+          // 同一バッチ内で後続エントリが同じキャラを再照合しても壊れない
+          // よう、照合マップへ反映しておく。
+          const fresh = (await db.select().from(schema.characters).where(eq(schema.characters.id, result.id)))[0];
+          if (fresh) {
+            if (fresh.sourceProfileId) byProfileId.set(fresh.sourceProfileId, fresh);
+            byName.set(fresh.name, fresh);
+          }
+        } catch (e) {
+          failed++;
+          results.push({
+            profile_id: entry.id,
+            name: entryName,
+            status: "failed",
+            character_id: null,
+            reason: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      ctx.invalidateQueries();
+      return { added, updated, skipped, failed, results };
+    },
+  }),
+
+  getImportStates: defineAction({
+    description: "差分取り込みの突き合わせ用に、取り込み済みキャラの取り込み元プロファイルID・名前・取り込み時点の元プロファイル更新日時だけを軽く返します。source_updated_at が null のキャラは未記録（旧取り込み分）で、変更ありとして扱います。",
+    request: z.object({}),
+    response: z.object({
+      states: z.array(
+        z.object({
+          source_profile_id: z.string(),
+          name: z.string(),
+          source_updated_at: z.string().nullable(),
+        }),
+      ),
+    }),
+    async handler(ctx) {
+      const db = getDb(ctx);
+      const rows = await db
+        .select({
+          sourceProfileId: schema.characters.sourceProfileId,
+          name: schema.characters.name,
+          sourceUpdatedAt: schema.characters.sourceUpdatedAt,
+        })
+        .from(schema.characters);
+      return {
+        states: rows
+          .filter((r) => r.sourceProfileId)
+          .map((r) => ({
+            source_profile_id: r.sourceProfileId as string,
+            name: r.name,
+            source_updated_at: r.sourceUpdatedAt,
+          })),
+      };
     },
   }),
 
@@ -2600,6 +3337,38 @@ export const Actions = {
     response: okResponse,
     async handler(ctx): Promise<z.infer<typeof okResponse>> {
       return runRequestImport(ctx);
+    },
+  }),
+
+  getImportStatus: defineAction({
+    description: "一括取り込みの状態を返します（idle / running / done / failed、開始・終了時刻、追加・更新・スキップ件数などを含む報告文）。running のまま20分を超えた場合は時間切れとして failed に確定させて返します。",
+    request: z.object({}),
+    response: z.object({
+      state: z.enum(["idle", "running", "done", "failed"]),
+      started_at: z.string().nullable(),
+      finished_at: z.string().nullable(),
+      note: z.string(),
+    }),
+    async handler(ctx) {
+      const db = getDb(ctx);
+      return readImportStatus(db);
+    },
+  }),
+
+  reportImportResult: defineAction({
+    description: "一括取り込み仲介用: 取り込みの完了・失敗を記録します。note には追加・更新・スキップの件数を必ず含めてください。記録された状態は getImportStatus で取得でき、ホームのバナーとキャラ追加シートに表示されます。",
+    request: z.object({
+      ok: z.boolean(),
+      note: z.string().trim().max(2000).default(""),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      await setMeta(db, "import_state", args.ok ? "done" : "failed");
+      await setMeta(db, "import_finished_at", String(Date.now()));
+      await setMeta(db, "import_note", args.note);
+      ctx.invalidateQueries();
+      return { ok: true };
     },
   }),
 
@@ -2634,6 +3403,39 @@ export const Actions = {
       }
       ctx.invalidateQueries();
       return { id: gid };
+    },
+  }),
+
+  // 「今すぐランダム作成」（ローカル改善#7改訂: 上流リポジトリには無い）。
+  // スケジュールの新規チャット型と同じサーバ側の共通経路（createRandomGroup）で
+  // グループを作成する。条件はボタン専用に固定: 対象は全キャラ（カテゴリ指定
+  // なし）、人数は3〜8人からランダム、ゲスト/モブ/ナレーションの可否は
+  // ランダム、背景情報なし。作成のみで、生成（返信リクエスト）は開始しない。
+  createRandomGroupNow: defineAction({
+    description: "登録済みの全キャラクターからランダムに3〜8人を選び、ゲスト/モブ/ナレーションの可否もランダムに決めて、グループチャットをその場で1件作成します（スケジュールの新規チャット型と共通の作成経路）。作成のみで会話の生成は開始しません。キャラクターが3人未満の場合は作成せずエラーを返します。",
+    request: z.object({}),
+    response: z.object({ id: z.number() }),
+    async handler(ctx) {
+      const db = getDb(ctx);
+      const allChars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
+      if (allChars.length < 3) {
+        throw new Error(`グループを自動作成するにはキャラクターが3人以上必要です（現在${allChars.length}人）。キャラを追加してください。`);
+      }
+      const created = await createRandomGroup(db, {
+        population: allChars,
+        minMembers: 3,
+        maxMembers: 8,
+        allowGuests: Math.random() < 0.5 ? 1 : 0,
+        allowMobs: Math.random() < 0.5 ? 1 : 0,
+        allowNarration: Math.random() < 0.5 ? 1 : 0,
+        backgroundText: "",
+        name: null,
+      });
+      if (!created) {
+        throw new Error(`グループを自動作成するにはキャラクターが3人以上必要です（現在${allChars.length}人）。キャラを追加してください。`);
+      }
+      ctx.invalidateQueries();
+      return { id: created.groupId };
     },
   }),
 
@@ -2685,10 +3487,16 @@ export const Actions = {
           no_history: z.boolean(),
           segment_date: z.string().nullable(),
           created_at: z.string(),
+          // 自動議題の投稿かどうかと、その出所（ローカル改善）。
+          is_topic: z.boolean(),
+          topic_source: z.string(),
         }),
       ),
       request: requestInfoOut,
       draft: draftOut,
+      // 自動議題（ローカル改善）: 自動投稿の設定と、議題の準備中かどうか。
+      auto_topic_enabled: z.boolean(),
+      topic_pending: z.boolean(),
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
@@ -2779,9 +3587,13 @@ export const Actions = {
           no_history: m.noHistory === 1,
           segment_date: m.noHistory === 1 ? (segDates.get(m.segmentNo) ?? null) : null,
           created_at: m.createdAt.toISOString(),
+          is_topic: m.isTopic === 1,
+          topic_source: m.topicSource,
         })),
         request: info,
         draft,
+        auto_topic_enabled: g.autoTopicEnabled === 1,
+        topic_pending: await isTopicPending(db, "group", g.id),
       };
     },
   }),
@@ -3117,7 +3929,8 @@ export const Actions = {
             }),
             db
               .update(schema.groups)
-              .set({ nextSeq: seq + 1, lastReadSeq: Math.max(g.lastReadSeq, seq) })
+              // 利用者が発言したら、自動議題の連続自動投稿の数え直しをする（ローカル改善）。
+              .set({ nextSeq: seq + 1, lastReadSeq: Math.max(g.lastReadSeq, seq), autoTopicCount: 0 })
               .where(eq(schema.groups.id, g.id)),
           ];
           await db.batch(stmts);
@@ -3149,7 +3962,8 @@ export const Actions = {
       const seq = g.nextSeq;
       const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
         db.insert(schema.groupMessages).values({ groupId: g.id, kind: "user", speakerName: "", body: args.body, seq, segmentNo: g.currentSegmentNo }),
-        db.update(schema.groups).set({ nextSeq: seq + 1 }).where(eq(schema.groups.id, g.id)),
+        // 利用者が発言したら、自動議題の連続自動投稿の数え直しをする（ローカル改善）。
+        db.update(schema.groups).set({ nextSeq: seq + 1, autoTopicCount: 0 }).where(eq(schema.groups.id, g.id)),
       ];
       await db.batch(stmts);
       await clearDraft(db, "group", g.id);
@@ -3174,6 +3988,8 @@ export const Actions = {
       await db
         .delete(schema.replyRequests)
         .where(and(eq(schema.replyRequests.targetKind, "group"), eq(schema.replyRequests.targetId, args.group_id)));
+      // 履歴が無くなったので、自動議題の連続自動投稿も数え直す（ローカル改善）。
+      await db.update(schema.groups).set({ autoTopicCount: 0 }).where(eq(schema.groups.id, args.group_id));
       await clearDraft(db, "group", args.group_id);
       ctx.invalidateQueries();
       return { ok: true };
@@ -3274,6 +4090,7 @@ export const Actions = {
           feedback: z.string(),
           status: z.string(),
           fail_reason: z.string(),
+          fail_detail: z.string(),
           created_at: z.string(),
           revision: z
             .object({
@@ -3321,6 +4138,7 @@ export const Actions = {
           feedback: r.feedback,
           status: r.status,
           fail_reason: r.failReason,
+          fail_detail: r.failDetail,
           created_at: r.createdAt.toISOString(),
           revision: rev
             ? {
@@ -3375,6 +4193,263 @@ export const Actions = {
     async handler(ctx) {
       const db = getDb(ctx);
       return runSignalAll(ctx, db);
+    },
+  }),
+
+  // ----------------------------------------------------- 自動（旧称: 自動議題／ローカル改善#6）
+
+  requestTopic: defineAction({
+    description: "「自動」ボタン用: 指定した会話へ議題を1つ投下するよう、議題の仲介を起動します。議題は仲介が少し遅れて投稿し、投稿されると既存の返信生成が始まります。返信待ち・生成中は投下できません。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      await sweepTimeouts(db);
+      if (args.target_kind === "chat") {
+        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
+        if (!rows[0]) throw new Error("キャラクターが見つかりません");
+      } else {
+        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
+        const g = rows[0];
+        if (!g) throw new Error("グループが見つかりません");
+        if (g.status !== "active") throw new Error("解散したグループには議題を投下できません");
+      }
+      const active = await activeRequest(db, args.target_kind, args.target_id);
+      if (active) throw new Error("返信待ち・生成中のため、今は議題を投下できません。返信が届いてからお試しください。");
+      if (await isTopicPending(db, args.target_kind, args.target_id)) {
+        throw new Error("議題を準備中です。少し待ってからお試しください。");
+      }
+      await kickTopic(ctx, db, args.target_kind, args.target_id, false);
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  setAutoTopic: defineAction({
+    description: "「自動」の自動投稿設定を保存します。オンにした会話では、キャラの返信を最後に入力待ちのまま30分動きが無いと、議題が1つ自動で投稿されます（利用者の発言が無いままの自動投稿は連続3回まで）。参加者・会話履歴には影響しません。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+      enabled: z.boolean(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      if (args.target_kind === "chat") {
+        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
+        if (!rows[0]) throw new Error("キャラクターが見つかりません");
+        await db
+          .update(schema.characters)
+          .set({ autoTopicEnabled: args.enabled ? 1 : 0 })
+          .where(eq(schema.characters.id, args.target_id));
+      } else {
+        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
+        const g = rows[0];
+        if (!g) throw new Error("グループが見つかりません");
+        if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
+        await db
+          .update(schema.groups)
+          .set({ autoTopicEnabled: args.enabled ? 1 : 0 })
+          .where(eq(schema.groups.id, args.target_id));
+      }
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  getTopicContext: defineAction({
+    description: "「自動」の仲介用: 議題を作るための材料（参加キャラの設定抜粋・プロフィール項目の抜き出し・関係の抜粋・直近の会話履歴・今日の日付・このアプリで最近起きた出来事）と投下可否を返します。議題の準備中でない対象や、返信待ち・生成中の対象には ok=false を返します。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      reason: z.string(),
+      auto: z.boolean(),
+      target_name: z.string(),
+      today: z.string(),
+      participants: z.array(
+        z.object({
+          name: z.string(),
+          settings_excerpt: z.string(),
+          relation_excerpt: z.string(),
+          profile_items: z.array(z.string()),
+        }),
+      ),
+      history: z.array(z.string()),
+      events: z.array(z.string()),
+    }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      await sweepTimeouts(db);
+      const ng = (reason: string) => ({
+        ok: false,
+        reason,
+        auto: false,
+        target_name: "",
+        today: todayJstLabel(),
+        participants: [] as { name: string; settings_excerpt: string; relation_excerpt: string; profile_items: string[] }[],
+        history: [] as string[],
+        events: [] as string[],
+      });
+      if (!(await isTopicPending(db, args.target_kind, args.target_id))) return ng("not_pending");
+      const auto = (await getMeta(db, `topic_auto:${args.target_kind}:${args.target_id}`)) === "1";
+      if (await activeRequest(db, args.target_kind, args.target_id)) return ng("reply_in_progress");
+      let targetName = "";
+      const participants: { name: string; settings_excerpt: string; relation_excerpt: string; profile_items: string[] }[] = [];
+      const history: string[] = [];
+      if (args.target_kind === "chat") {
+        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
+        const c = rows[0];
+        if (!c) return ng("not_found");
+        targetName = c.displayName;
+        participants.push({
+          name: c.displayName,
+          settings_excerpt: c.settingsText.slice(0, 1200),
+          relation_excerpt: c.relationText.slice(0, 600),
+          profile_items: extractProfileItems(c.settingsText, c.relationText),
+        });
+        const msgs = await db
+          .select()
+          .from(schema.messages)
+          .where(eq(schema.messages.characterId, c.id))
+          .orderBy(asc(schema.messages.seq));
+        for (const m of msgs.slice(-10)) {
+          history.push(`${m.speaker === "user" ? "利用者" : c.displayName}: ${m.body.slice(0, 300)}`);
+        }
+      } else {
+        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
+        const g = rows[0];
+        if (!g || g.status !== "active") return ng("not_found");
+        targetName = g.name;
+        const memberRows = await groupMemberRows(db, g.id);
+        for (const m of memberRows) {
+          if (m.character) {
+            participants.push({
+              name: m.character.displayName,
+              settings_excerpt: m.character.settingsText.slice(0, 800),
+              relation_excerpt: m.character.relationText.slice(0, 400),
+              profile_items: extractProfileItems(m.character.settingsText, m.character.relationText),
+            });
+          }
+        }
+        if (!participants.length) return ng("no_members");
+        const msgs = await db
+          .select()
+          .from(schema.groupMessages)
+          .where(eq(schema.groupMessages.groupId, g.id))
+          .orderBy(asc(schema.groupMessages.seq));
+        for (const m of msgs.slice(-10)) {
+          if (m.kind === "user") history.push(`話題提供: ${m.body.slice(0, 300)}`);
+          else if (m.kind === "character") history.push(`${m.speakerName}: ${m.body.slice(0, 300)}`);
+        }
+      }
+      // Muse上での出来事: このアプリが把握できる範囲の最近の変化。
+      const events: string[] = [];
+      const now = Date.now();
+      const allChars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
+      const recentChars = allChars.filter((c) => now - c.createdAt.getTime() < 30 * 24 * 3600 * 1000);
+      for (const c of recentChars.slice(-5)) {
+        events.push(`最近、新しいキャラクター「${c.displayName}」がこのアプリに増えた`);
+      }
+      events.push(`このアプリには今、キャラクターが${allChars.length}人いる`);
+      const activeGroups = await db.select().from(schema.groups).where(eq(schema.groups.status, "active"));
+      if (activeGroups.length) events.push(`グループチャットは${activeGroups.length}件ある`);
+      const impState = await getMeta(db, "import_state");
+      const impFinished = Number((await getMeta(db, "import_finished_at")) || "0");
+      const impNote = await getMeta(db, "import_note");
+      if (impState === "done" && impFinished > 0 && now - impFinished < 14 * 24 * 3600 * 1000 && impNote) {
+        events.push(`最近、アバター管理からの一括取り込みが行われた（${impNote.slice(0, 120)}）`);
+      }
+      return { ok: true, reason: "", auto, target_name: targetName, today: todayJstLabel(), participants, history, events };
+    },
+  }),
+
+  postTopic: defineAction({
+    description: "「自動」の仲介用: 考えた議題を会話へ「自動」の議題として投稿し、既存の経路で返信生成を開始します。自動投稿として起動された時は連続自動投稿の回数を1つ増やし、手動の時は0に戻します。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+      body: z.string().trim().min(1).max(500),
+      source: z.enum(["news", "interest", "muse", "context", "profile", "season", "hypothetical", "contrast"]),
+    }),
+    response: z.object({ ok: z.literal(true), seq: z.number(), request_id: z.number() }),
+    async handler(ctx, args): Promise<{ ok: true; seq: number; request_id: number }> {
+      const db = getDb(ctx);
+      await sweepTimeouts(db);
+      const auto = (await getMeta(db, `topic_auto:${args.target_kind}:${args.target_id}`)) === "1";
+      const active = await activeRequest(db, args.target_kind, args.target_id);
+      if (active) throw new Error("返信待ち・生成中のため、議題を投稿できません");
+      let seq = 0;
+      if (args.target_kind === "chat") {
+        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
+        const c = rows[0];
+        if (!c) throw new Error("キャラクターが見つかりません");
+        seq = c.nextSeq;
+        const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
+          db.insert(schema.messages).values({
+            characterId: c.id,
+            speaker: "user",
+            body: args.body,
+            seq,
+            isTopic: 1,
+            topicSource: args.source,
+          }),
+          db
+            .update(schema.characters)
+            .set({ nextSeq: seq + 1, autoTopicCount: auto ? c.autoTopicCount + 1 : 0 })
+            .where(eq(schema.characters.id, c.id)),
+        ];
+        await db.batch(stmts);
+      } else {
+        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
+        const g = rows[0];
+        if (!g) throw new Error("グループが見つかりません");
+        if (g.status !== "active") throw new Error("解散したグループには議題を投稿できません");
+        seq = g.nextSeq;
+        const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
+          db.insert(schema.groupMessages).values({
+            groupId: g.id,
+            kind: "user",
+            speakerName: "",
+            body: args.body,
+            seq,
+            isTopic: 1,
+            topicSource: args.source,
+          }),
+          db
+            .update(schema.groups)
+            .set({ nextSeq: seq + 1, autoTopicCount: auto ? g.autoTopicCount + 1 : 0 })
+            .where(eq(schema.groups.id, g.id)),
+        ];
+        await db.batch(stmts);
+      }
+      await setMeta(db, `topic_pending:${args.target_kind}:${args.target_id}`, "");
+      await clearDraft(db, args.target_kind, args.target_id);
+      const requestId = await ensureAutoRequest(db, args.target_kind, args.target_id);
+      ctx.invalidateQueries();
+      // 生成の開始は signalAll と同一の共通経路（runSignalAll）を通す。
+      await runSignalAll(ctx, db);
+      return { ok: true, seq, request_id: requestId };
+    },
+  }),
+
+  failTopic: defineAction({
+    description: "「自動」の仲介用: 議題の投下を断念した時に呼び、「議題を準備中」の表示を消します。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = getDb(ctx);
+      await setMeta(db, `topic_pending:${args.target_kind}:${args.target_id}`, "");
+      ctx.invalidateQueries();
+      return { ok: true };
     },
   }),
 
@@ -3716,10 +4791,10 @@ export const Actions = {
       const req = rows[0];
       if (!req || req.status !== "processing") return { accepted: false, saved_messages: 0 };
       const output = args.output.trim();
-      const failWith = async (reason: string) => {
+      const failWith = async (reason: string, detail = "") => {
         await db
           .update(schema.replyRequests)
-          .set({ status: "failed", failReason: reason, finishedAt: new Date() })
+          .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
           .where(eq(schema.replyRequests.id, req.id));
         await materializeFailedDraft(db, req, reason);
         // 全体ログ（設計書 v2.0 / D）: 失敗時は生レスポンスが無いため理由のみ記録する。
@@ -3728,12 +4803,12 @@ export const Actions = {
         ctx.invalidateQueries();
         return { accepted: true, saved_messages: 0 };
       };
-      if (!output) return failWith("generation_error");
+      if (!output) return failWith("generation_error", "生成コマンドの出力が空でした。");
       if (req.targetKind === "chat") {
-        if (looksLikeRefusal(output)) return failWith("generation_error");
+        if (looksLikeRefusal(output)) return failWith("generation_error", "生成結果が拒否応答と判定されたため、返信として保存しませんでした。");
         const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, req.targetId));
         const c = crows[0];
-        if (!c) return failWith("generation_error");
+        if (!c) return failWith("generation_error", "対象のキャラクターが見つかりませんでした。");
         const seq = c.nextSeq;
         const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
           // 区切り線と区間（設計書 v3.2）: 履歴なし生成の返信には区切り線の印を付け、
@@ -3783,8 +4858,8 @@ export const Actions = {
       // group
       const grows = await db.select().from(schema.groups).where(eq(schema.groups.id, req.targetId));
       const g = grows[0];
-      if (!g) return failWith("generation_error");
-      if (looksLikeRefusal(output)) return failWith("generation_error");
+      if (!g) return failWith("generation_error", "対象のグループが見つかりませんでした。");
+      if (looksLikeRefusal(output)) return failWith("generation_error", "生成結果が拒否応答と判定されたため、返信として保存しませんでした。");
       const memberRows = await groupMemberRows(db, g.id);
       const present = memberRows.filter((m) => m.character);
       // ゲスト・モブ（v1.24）: 許可されているグループでは、名簿外の名前形の行も
@@ -3866,8 +4941,12 @@ export const Actions = {
   }),
 
   failRequest: defineAction({
-    description: "仲介用: 生成の失敗を記録します（理由: timeout / generation_error / rate_limited など）。pending・processing のリクエストにだけ受理され、失敗の確定と同時に対象だった利用者発言をログから削除して戻し下書きを作成します。",
-    request: z.object({ request_id: z.number().int().positive(), reason: z.string().trim().min(1).max(100) }),
+    description: "仲介用: 生成の失敗を記録します（理由: timeout / generation_error / rate_limited など）。detail には生成コマンドの終了コードとエラー出力の末尾を原文で渡してください（失敗原因の追跡用にそのまま保存されます）。pending・processing のリクエストにだけ受理され、失敗の確定と同時に対象だった利用者発言をログから削除して戻し下書きを作成します。",
+    request: z.object({
+      request_id: z.number().int().positive(),
+      reason: z.string().trim().min(1).max(100),
+      detail: z.string().max(2000).optional(),
+    }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
@@ -3876,7 +4955,7 @@ export const Actions = {
       if (!req || (req.status !== "pending" && req.status !== "processing")) return { ok: false };
       const res = await db
         .update(schema.replyRequests)
-        .set({ status: "failed", failReason: args.reason, finishedAt: new Date() })
+        .set({ status: "failed", failReason: args.reason, failDetail: (args.detail ?? "").trim(), finishedAt: new Date() })
         .where(
           and(
             eq(schema.replyRequests.id, args.request_id),
@@ -3933,7 +5012,12 @@ export const Actions = {
         if (!c.sourceJson.trim()) {
           await db
             .update(schema.reviews)
-            .set({ status: "failed", failReason: "no_source_json", finishedAt: new Date() })
+            .set({
+              status: "failed",
+              failReason: "no_source_json",
+              failDetail: "キャラクターに取り込み元の設定JSONが保持されていないため、見直しできませんでした。",
+              finishedAt: new Date(),
+            })
             .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "pending")));
           continue;
         }
@@ -4070,10 +5154,10 @@ export const Actions = {
       const rows = await db.select().from(schema.reviews).where(eq(schema.reviews.id, args.review_id));
       const rev = rows[0];
       if (!rev || rev.status !== "processing") return { accepted: false, outcome: "" };
-      const failWith = async (reason: string) => {
+      const failWith = async (reason: string, detail = "") => {
         await db
           .update(schema.reviews)
-          .set({ status: "failed", failReason: reason, finishedAt: new Date() })
+          .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
           .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "processing")));
         const fcrows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
         await addAppLog(
@@ -4089,7 +5173,7 @@ export const Actions = {
       };
       const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
       const c = crows[0];
-      if (!c) return failWith("character_not_found");
+      if (!c) return failWith("character_not_found", "対象のキャラクターが見つかりませんでした。");
       // コードフェンスが付いていても中身を取り出す。
       let text = args.output.trim();
       if (text.startsWith("```")) {
@@ -4102,13 +5186,13 @@ export const Actions = {
       try {
         parsed = JSON.parse(text) as Record<string, unknown>;
       } catch {
-        return failWith("invalid_json");
+        return failWith("invalid_json", `生成結果をJSONとして解釈できませんでした。出力の先頭: ${text.slice(0, 300)}`);
       }
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return failWith("invalid_json");
-      if (parsed["format"] !== "avatar-profile") return failWith("invalid_format");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return failWith("invalid_json", "生成結果がJSONオブジェクトではありませんでした。");
+      if (parsed["format"] !== "avatar-profile") return failWith("invalid_format", `生成結果の format が avatar-profile ではありませんでした（実際: ${String(parsed["format"] ?? "")}）。`);
       const outName = typeof parsed["name"] === "string" ? parsed["name"].trim() : "";
-      if (!outName || outName !== c.name.trim()) return failWith("name_mismatch");
-      if (c.sourceProfileId && parsed["id"] !== c.sourceProfileId) return failWith("id_mismatch");
+      if (!outName || outName !== c.name.trim()) return failWith("name_mismatch", `生成結果のキャラクター名「${outName}」が対象「${c.name.trim()}」と一致しませんでした。`);
+      if (c.sourceProfileId && parsed["id"] !== c.sourceProfileId) return failWith("id_mismatch", "生成結果のプロファイルIDが元のものと一致しませんでした。");
       let beforeParsed: unknown = {};
       try {
         beforeParsed = JSON.parse(c.sourceJson) as unknown;
@@ -4135,8 +5219,8 @@ export const Actions = {
       const afterJson = JSON.stringify(parsed, null, 2);
       try {
         profileToParts(parsed);
-      } catch {
-        return failWith("invalid_profile");
+      } catch (e) {
+        return failWith("invalid_profile", `生成結果から設定を構築できませんでした: ${e instanceof Error ? e.message : String(e)}`);
       }
       const ins = await db
         .insert(schema.settingRevisions)
@@ -4178,14 +5262,18 @@ export const Actions = {
   }),
 
   failReview: defineAction({
-    description: "仲介用: レビューの見直し失敗を記録します（理由: timeout / generation_error / rate_limited など）。pending・processing のレビューにだけ受理され、設定は変更しません。",
-    request: z.object({ review_id: z.number().int().positive(), reason: z.string().trim().min(1).max(100) }),
+    description: "仲介用: レビューの見直し失敗を記録します（理由: timeout / generation_error / rate_limited など）。detail には生成コマンドの終了コードとエラー出力の末尾を原文で渡してください（失敗原因の追跡用にそのまま保存されます）。pending・processing のレビューにだけ受理され、設定は変更しません。",
+    request: z.object({
+      review_id: z.number().int().positive(),
+      reason: z.string().trim().min(1).max(100),
+      detail: z.string().max(2000).optional(),
+    }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
       const res = await db
         .update(schema.reviews)
-        .set({ status: "failed", failReason: args.reason, finishedAt: new Date() })
+        .set({ status: "failed", failReason: args.reason, failDetail: (args.detail ?? "").trim(), finishedAt: new Date() })
         .where(
           and(
             eq(schema.reviews.id, args.review_id),
@@ -4271,7 +5359,7 @@ export const Actions = {
   }),
 
   createSchedule: defineAction({
-    description: "自動生成のスケジュールを新規作成します。対象は既存グループ（なりきり設定が有効なグループは選べません）か、毎回新規チャット（カテゴリからランダム抽選）のどちらかです。",
+    description: "自動生成のスケジュールを新規作成します。対象は既存グループ（なりきり設定が有効なグループは選べません）か、毎回新規チャット（カテゴリからランダム抽選。カテゴリ未指定の場合は全キャラから抽選）のどちらかです。",
     request: scheduleInputSchema,
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {

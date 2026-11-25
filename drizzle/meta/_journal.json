@@ -120,6 +120,27 @@
       "when": 1795604719952,
       "tag": "0017_move_no_history_trigger_comments_into_generated_segment",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1795585152113,
+      "tag": "0018_add_source_updated_at_for_diff_import",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1795589980749,
+      "tag": "0019_add_auto_topic_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1795598502633,
+      "tag": "0020_add_fail_detail_and_pending_watchdog_columns",
+      "breakpoints": true
     }
   ]
 }
