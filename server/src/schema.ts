@@ -25,8 +25,9 @@ export const characters = sqliteTable("characters", {
   // 既読になった最大 seq。seq がこれより大きいキャラ発言が未読。
   lastReadSeq: integer("last_read_seq").notNull().default(0),
   // 旧カテゴリ分類（v1.8）: 単一カテゴリ時代のカラム。v1.25 で多対多へ移行し、
-  // 正は character_categories 側になった。このカラムは移行元として残すが、
-  // 新規の読み書きは character_categories を使う（互換のため先頭カテゴリを同期する）。
+  // 正は character_categories 側になった。読み側の旧カラムフォールバックと
+  // 書き側の先頭カテゴリ同期は廃止済み（実データの一致を検証した上で停止）。
+  // このカラムは移行元として値を保持するだけで、読み書きは一切されない。
   categoryId: integer("category_id"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
@@ -90,6 +91,14 @@ export const groups = sqliteTable("groups", {
   // 混じらないこともある。既定はどちらも 0（従来通り参加者だけ）。
   allowGuests: integer("allow_guests").notNull().default(0),
   allowMobs: integer("allow_mobs").notNull().default(0),
+  // ナレーション（設計書 v3.1）: 1 の時、生成で会話の背景説明・場面転換・
+  // 時間経過の説明（ナレーション）が入ることがある。誰かの台詞ではなく、
+  // 次の会話までに起きた事をただ記載する。既定は 0（従来通り入れない）。
+  allowNarration: integer("allow_narration").notNull().default(0),
+  // 背景情報（設計書 v2.0 / C）: グループの生成（通常・自動の両方）の
+  // システムプロンプトへ「背景情報」セクションとして常時含める自由文。
+  // 一度書けば使われ続ける。1対1には含めない。
+  backgroundText: text("background_text").notNull().default(""),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -104,7 +113,10 @@ export const groupMembers = sqliteTable("group_members", {
 export const groupMessages = sqliteTable("group_messages", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   groupId: integer("group_id").notNull(),
-  kind: text("kind", { enum: ["user", "character", "raw"] }).notNull(),
+  // kind="narration"（設計書 v3.1）: ナレーション。発言者（キャラ）を持たず
+  // character_id は null、speaker_name は空。表示は吹き出しではなく中央揃えの
+  // システムメッセージ形式。未読・新着の扱いは character と同じ。
+  kind: text("kind", { enum: ["user", "character", "raw", "narration"] }).notNull(),
   characterId: integer("character_id"),
   speakerName: text("speaker_name").notNull().default(""),
   body: text("body").notNull(),
@@ -126,6 +138,13 @@ export const replyRequests = sqliteTable("reply_requests", {
   targetKind: text("target_kind", { enum: ["chat", "group"] }).notNull(),
   targetId: integer("target_id").notNull(),
   uptoSeq: integer("upto_seq").notNull(),
+  // 発生源（設計書 v2.0 / B）: manual = 利用者の発言への通常返信、
+  // auto = スケジューリングの自動生成。auto は送信取り消し・戻し下書きの
+  // 対象外で、生成の優先順位は manual の後（getWorkItems の並びで末尾）。
+  origin: text("origin", { enum: ["manual", "auto"] }).notNull().default("manual"),
+  // auto の時、発火したスケジュールのID（schedules.id）。成功時に
+  // schedules.last_group_id の更新や自動生成ログの記録に使う。
+  scheduleId: integer("schedule_id"),
   status: text("status", {
     enum: ["pending", "processing", "done", "failed", "cancelled"],
   })
@@ -182,6 +201,62 @@ export const settingRevisions = sqliteTable("setting_revisions", {
     .notNull()
     .$defaultFn(() => new Date()),
   revertedAt: integer("reverted_at", { mode: "timestamp_ms" }),
+});
+
+// スケジューリング（設計書 v2.0 / B・E）: 自動生成のスケジュール。複数作成でき、
+// それぞれ名前を持つ。対象は既存グループ（target_type="existing"、そのグループの
+// 設定を参照して会話を生成・更新する）か、毎回新規チャット（target_type="new"、
+// カテゴリからランダム抽選してグループを作成する）。
+// weekdays / times / category_ids は JSON 文字列で保持する
+// （weekdays: 0=日曜〜6=土曜の配列、times: "HH:MM" の配列）。
+// last_fired_slot は JST の "YYYY-MM-DD HH:MM" で、発火・スキップ確定と同時に
+// 記録して二重発火と同一スロットの重複スキップログを防ぐ。
+// last_group_id は新規チャット型で前回生成したグループ（履歴参照用）。
+export const schedules = sqliteTable("schedules", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  enabled: integer("enabled").notNull().default(1),
+  frequency: text("frequency", { enum: ["daily", "weekly"] }).notNull().default("daily"),
+  weekdays: text("weekdays").notNull().default("[]"),
+  times: text("times").notNull().default("[]"),
+  targetType: text("target_type", { enum: ["existing", "new"] }).notNull().default("existing"),
+  targetGroupId: integer("target_group_id"),
+  categoryIds: text("category_ids").notNull().default("[]"),
+  minMembers: integer("min_members").notNull().default(2),
+  maxMembers: integer("max_members").notNull().default(4),
+  allowGuests: integer("allow_guests").notNull().default(0),
+  allowMobs: integer("allow_mobs").notNull().default(0),
+  // ナレーション（設計書 v3.1）: 新規チャット型でのみ意味を持ち、作成される
+  // グループの allow_narration へ引き継ぐ。既存グループ型はグループ側の設定に従う。
+  allowNarration: integer("allow_narration").notNull().default(0),
+  useHistory: integer("use_history").notNull().default(0),
+  // 新規チャット型でのみ意味を持つ背景情報（スケジュール側が正）。
+  // 作成グループへは初期値としてコピーする（逆流はしない）。
+  backgroundText: text("background_text").notNull().default(""),
+  lastFiredSlot: text("last_fired_slot"),
+  lastGroupId: integer("last_group_id"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 全体ログ（設計書 v2.0 / D）: 利用者の送信・生成のプロンプトと生レスポンス・
+// レビュー・キャラ設定変更・自動生成の記録。保持は全種別合算で最新100件
+// （挿入時に超過分を古い順に削除する）。一覧は見出しのみを返し、本文は
+// 開閉時に個別取得する。
+export const appLogs = sqliteTable("app_logs", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  kind: text("kind", { enum: ["user_send", "generation", "review", "settings", "auto"] }).notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull().default(""),
+  relatedType: text("related_type"),
+  relatedId: integer("related_id"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
 });
 
 // 戻し下書き（設計書 v1.4）: リクエストが failed に確定した時、対象だった利用者発言を

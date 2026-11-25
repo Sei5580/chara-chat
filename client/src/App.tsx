@@ -27,7 +27,14 @@ type View =
   // 一覧（listHome）が計算した値を遷移時に固定して渡し、開いている間に
   // 到着した返信では区切り位置が動かないようにする。未読が無ければ null。
   | { kind: "chat"; characterId: number; unreadFromSeq: number | null }
-  | { kind: "group"; groupId: number; unreadFromSeq: number | null };
+  | { kind: "group"; groupId: number; unreadFromSeq: number | null }
+  // 全体ログ（履歴ページ、設計書 v2.0 / D）。入口はホーム下部の目立たないリンク。
+  | { kind: "logs" };
+
+type SchedulesData = ApiResponse<typeof api, "listSchedules">;
+type ScheduleItem = SchedulesData["schedules"][number];
+type AppLogsData = ApiResponse<typeof api, "listAppLogs">;
+type AppLogItem = AppLogsData["logs"][number];
 
 const FAIL_REASONS: Record<string, string> = {
   timeout: "タイムアウト（10分以内に生成が終わりませんでした）",
@@ -441,7 +448,7 @@ function ImageEditSheet({
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{characterName}の画像を変更</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          画像ファイルを選んで、正方形にトリミングして保存します。保存すると一覧・チャット・グループの表示にすぐ反映されます。
+          画像ファイルを選んで正方形にトリミングして保存すると、一覧・チャット・グループの表示にすぐ反映されます。
         </p>
 
         <input
@@ -584,11 +591,11 @@ function CharacterMenuSheet({
   onSetCategory: () => void;
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
-    { label: "概要を確認する", description: "生成に使われている設定本文と、関係・呼び方を確認します", onSelect: onViewSettings },
-    { label: "設定を編集する", description: "設定を項目ごとの入力欄で書き換えます（次の返信から反映されます）", onSelect: onEditSettings },
-    { label: "画像を変更", description: "画像ファイルを選んで正方形にトリミングして差し替えます", onSelect: onEditImage },
-    { label: "表示名を変更", description: "一覧やチャットで表示される名前だけを変えます（設定には影響しません）", onSelect: onRename },
-    { label: "カテゴリを設定", description: "登録済みカテゴリから選んで分類します（複数選択できます。同じカテゴリは複数のキャラにも設定できます）", onSelect: onSetCategory },
+    { label: "概要を確認する", description: "設定本文と関係・呼び方を確認します", onSelect: onViewSettings },
+    { label: "設定を編集する", description: "項目ごとの入力欄で設定を書き換えます", onSelect: onEditSettings },
+    { label: "画像を変更", description: "画像を選んでトリミングして差し替えます", onSelect: onEditImage },
+    { label: "表示名を変更", description: "表示される名前だけを変えます", onSelect: onRename },
+    { label: "カテゴリを設定", description: "カテゴリを選んで分類します（複数選択可）", onSelect: onSetCategory },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${character.display_name}の設定メニュー`}>
@@ -692,7 +699,7 @@ function CharacterSettingsSheet({ characterId, onClose }: { characterId: number;
               </div>
             )}
             <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-              設定を書き換える時は、設定メニューの「設定を編集する」から行えます。発言への指摘による見直しは、チャット画面のレビューモードから行えます。
+              設定の書き換えは設定メニューの「設定を編集する」から、発言への指摘はチャット画面のレビューモードから行えます。
             </p>
           </div>
         )}
@@ -801,6 +808,9 @@ function CharacterSettingsEditForm({
   const [backgroundText, setBackgroundText] = useState(initial.background_text);
   const [linksText, setLinksText] = useState(initial.background_links.join("\n"));
   const [linkSummary, setLinkSummary] = useState(initial.link_summary);
+  const [portrayalFocus, setPortrayalFocus] = useState(initial.portrayal_focus);
+  const [videoUrlsText, setVideoUrlsText] = useState(initial.video_urls.join("\n"));
+  const [videoNotes, setVideoNotes] = useState(initial.video_notes);
   const [userRelationship, setUserRelationship] = useState(initial.user_relationship);
   const [callUserAs, setCallUserAs] = useState(initial.call_user_as);
   const [speechStyle, setSpeechStyle] = useState(initial.speech_style);
@@ -825,6 +835,9 @@ function CharacterSettingsEditForm({
         background_text: backgroundText,
         background_links: linksText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
         link_summary: linkSummary,
+        portrayal_focus: portrayalFocus,
+        video_urls: videoUrlsText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+        video_notes: videoNotes,
         user_relationship: userRelationship,
         call_user_as: callUserAs,
         speech_style: speechStyle,
@@ -869,7 +882,7 @@ function CharacterSettingsEditForm({
   return (
     <div className="flex flex-col gap-5">
       <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-        保存すると、このアプリ内の設定が書き換わり、次の返信から新しい設定で生成されます。アバター管理ツールの設定は変わりません。一覧の表示名はここでは変わりません（表示名の変更は別の項目です）。
+        保存すると、このアプリ内の設定が書き換わり、次の返信から反映されます（アバター管理ツール側の設定と表示名は変わりません）。
       </p>
 
       <EditSection title="基本">
@@ -883,6 +896,8 @@ function CharacterSettingsEditForm({
         <EditAreaField label="背景（本文）" fieldProps={F.background_text} value={backgroundText} onChange={setBackgroundText} rows={8} />
         <EditAreaField label="関連リンク" value={linksText} onChange={setLinksText} rows={3} hint="1行に1件ずつ入力してください。" />
         <EditAreaField label="つながりの要約" fieldProps={F.link_summary} value={linkSummary} onChange={setLinkSummary} rows={4} />
+        <EditAreaField label="演じる姿・状況" fieldProps={F.portrayal_focus} value={portrayalFocus} onChange={setPortrayalFocus} rows={3} hint="このキャラクターを演じる前提の姿・状況です。空欄なら指定なしです。" />
+        <EditAreaField label="参考動画URL" value={videoUrlsText} onChange={setVideoUrlsText} rows={3} hint="1行に1件ずつ入力してください。" />
       </EditSection>
 
       <EditSection title="話し方">
@@ -891,6 +906,7 @@ function CharacterSettingsEditForm({
         <EditTextField label="二人称" fieldProps={F.speech_second_person} value={secondPerson} onChange={setSecondPerson} />
         <EditAreaField label="口癖" fieldProps={F.speech_catchphrase} value={catchphrase} onChange={setCatchphrase} rows={2} />
         <EditAreaField label="話し方のメモ" fieldProps={F.speech_memo} value={speechMemo} onChange={setSpeechMemo} rows={3} />
+        <EditAreaField label="口調の参考資料（参考動画の所見）" fieldProps={F.video_notes} value={videoNotes} onChange={setVideoNotes} rows={4} hint="参考動画の台詞から得た口調の所見です。参考資料であり、台詞や言い回しの正本ではありません。" />
       </EditSection>
 
       <EditSection title="相手との関係">
@@ -1092,7 +1108,7 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>表示名を変更</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          一覧やチャットで表示される名前だけを変えます。生成に使う設定や会話履歴には影響しません。
+          一覧やチャットで表示される名前だけを変えます（設定や会話履歴には影響しません）。
         </p>
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="rename-display-name">
           表示名
@@ -1897,6 +1913,9 @@ function loadCompact(): boolean {
 let sessionSort: CharSort | null = null;
 let sessionCompact: boolean | null = null;
 
+// グループ一覧のページ位置（10件/ページ、設計書 v2.0 / A）。画面遷移で失われないようセッション内に保持する。
+let sessionGroupPage = 0;
+
 // 一覧上部のタブ（個人 / グループ）。選択中タブのチャットだけを一覧に表示する。
 // 画面遷移で失われないようセッション内に保持する。
 let sessionHomeTab: "personal" | "group" = "personal";
@@ -1951,6 +1970,21 @@ function HomeView({ go }: { go: (v: View) => void }) {
     sessionHomeTab = t;
     setHomeTab(t);
   };
+  // グループ一覧のページ（10件/ページ、設計書 v2.0 / A）。
+  const [groupPage, setGroupPage] = useState(sessionGroupPage);
+  const changeGroupPage = (p: number) => {
+    sessionGroupPage = p;
+    setGroupPage(p);
+  };
+  // スケジューリング（設計書 v2.0 / B）: 一覧と編集シート。
+  const schedulesQuery = useQuery({ queryKey: ["schedules"], queryFn: () => api.listSchedules({}), refetchInterval: 30000 });
+  const [scheduleSheet, setScheduleSheet] = useState<{ mode: "create" } | { mode: "edit"; schedule: ScheduleItem } | null>(null);
+  // 全体設定（v2.1）: 返信が届いたらClaudeへ通知する ON/OFF。サーバ側（meta）に保存する。
+  const globalSettings = useQuery({ queryKey: ["global-settings"], queryFn: () => api.getGlobalSettings({}) });
+  const saveGlobalSettings = useMutation({
+    mutationFn: async (v: { notify_reply: boolean }) => await api.saveGlobalSettings(v),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["global-settings"] }),
+  });
 
   // 並び替え・簡易表示の選択はサーバ側（meta）にも保存し、次回開いた時に復元する。
   // この端末の localStorage は埋め込み表示では保持されないことがあるため、
@@ -2037,6 +2071,18 @@ function HomeView({ go }: { go: (v: View) => void }) {
   }
   const { characters, groups, categories } = home.data;
   const categoryNameById = new Map(categories.map((c) => [c.id, c.name]));
+
+  // グループ一覧は更新された順（最終発言時刻の降順。自動生成分も含む）に並べ、
+  // 10件ごとにページ分けする（設計書 v2.0 / A）。個人一覧は従来通り。
+  const GROUP_PAGE_SIZE = 10;
+  const sortedGroups = [...groups].sort((a, b) =>
+    b.last_activity_at !== a.last_activity_at
+      ? b.last_activity_at.localeCompare(a.last_activity_at)
+      : a.id - b.id,
+  );
+  const groupPageCount = Math.max(1, Math.ceil(sortedGroups.length / GROUP_PAGE_SIZE));
+  const safeGroupPage = Math.min(groupPage, groupPageCount - 1);
+  const pageGroups = sortedGroups.slice(safeGroupPage * GROUP_PAGE_SIZE, safeGroupPage * GROUP_PAGE_SIZE + GROUP_PAGE_SIZE);
 
   // カテゴリ絞り込み＋並び替えを適用した表示用リスト（v1.25、階層対応 v1.26）。
   // カテゴリは複数設定できるため、絞り込みは「そのカテゴリ（子孫カテゴリを含む）に
@@ -2272,7 +2318,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         {characters.length === 0 ? (
           <div className="mt-4 rounded-3xl p-5" style={{ background: "var(--surface)" }}>
             <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-              まだキャラクターがいません。アバターテンプレ管理のプロファイルを取り込むか、書き出しJSONを貼って追加できます。
+              まだキャラクターがいません。アバター総合管理のプロファイルを取り込むか、書き出しJSONを貼って追加できます。
             </p>
             <div className="mt-4 flex flex-col gap-2">
               <button
@@ -2314,6 +2360,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
       )}
 
       {homeTab === "group" && (
+      <>
       <section aria-label="グループチャット">
         <div className="mt-4 flex items-center justify-between">
           <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>グループチャット</h2>
@@ -2332,8 +2379,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
             キャラ同士の掛け合いを楽しむグループは、まだありません。1人から作れて、なりきり機能で自分も参加できます。
           </p>
         ) : (
+          <>
           <div className="mt-3 flex flex-col gap-3">
-            {groups.map((g) => (
+            {pageGroups.map((g) => (
               <button
                 key={g.id}
                 type="button"
@@ -2373,17 +2421,100 @@ function HomeView({ go }: { go: (v: View) => void }) {
               </button>
             ))}
           </div>
+          {groupPageCount > 1 && (
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => changeGroupPage(safeGroupPage - 1)}
+                disabled={safeGroupPage === 0}
+                aria-label="前のページ"
+                className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                前のページ
+              </button>
+              <span className="text-xs font-bold" style={{ color: "var(--dim)" }}>
+                {safeGroupPage + 1} / {groupPageCount} ページ（全{sortedGroups.length}件）
+              </span>
+              <button
+                type="button"
+                onClick={() => changeGroupPage(safeGroupPage + 1)}
+                disabled={safeGroupPage >= groupPageCount - 1}
+                aria-label="次のページ"
+                className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                次のページ
+              </button>
+            </div>
+          )}
+          </>
         )}
       </section>
+
+      <SchedulingSection
+        data={schedulesQuery.data}
+        isPending={schedulesQuery.isPending}
+        isError={!!schedulesQuery.error}
+        onRetry={() => schedulesQuery.refetch()}
+        onCreate={() => setScheduleSheet({ mode: "create" })}
+        onEdit={(s) => setScheduleSheet({ mode: "edit", schedule: s })}
+      />
+      </>
       )}
 
       <p className="mt-10 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
         発言を送ると、連携済みのClaudeが分離した生成プロセスで自動で返信を書きます（数分かかることがあります）。返信に失敗した時は、送った文章が入力欄に戻るので、そのまま再送信できます。生成に渡される履歴は直近20発言までで、それより前の会話は参照されません。会話ログはこのアプリ内に保存されます。外部へのバックアップは無いため、アプリを削除するとログも消えます。
       </p>
 
+      {/* 全体設定（v2.1）: 返信到着時のClaudeへの通知 ON/OFF。 */}
+      <section aria-label="全体設定" className="mt-10">
+        <h2 className="font-display text-base font-black" style={{ color: "var(--text)" }}>全体設定</h2>
+        <label className="mt-3 flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={globalSettings.data?.notify_reply ?? false}
+            disabled={globalSettings.isPending || saveGlobalSettings.isPending}
+            onChange={(e) => saveGlobalSettings.mutate({ notify_reply: e.target.checked })}
+            aria-label="返信が届いたらClaudeに通知する"
+            className="mt-0.5 h-5 w-5 shrink-0"
+            style={{ accentColor: "var(--accent)" }}
+          />
+          <span>
+            <span className="block text-sm font-bold" style={{ color: "var(--text)" }}>返信が届いたらClaudeに通知する</span>
+            <span className="mt-1 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              ONにすると、キャラからの返信（スケジューリングの自動生成も含む）が届いた時に、Claude側へメッセージが送られます。なお、Claudeのログイン切れ（トークン切れ）で生成に失敗した場合は、この設定がOFFでも通知されます。
+            </span>
+          </span>
+        </label>
+        {saveGlobalSettings.isError && (
+          <p className="mt-2 text-xs font-bold" style={{ color: "var(--danger)" }}>設定の保存に失敗しました。もう一度お試しください。</p>
+        )}
+      </section>
+
+      {/* 全体ログ（履歴ページ）への入口。目立たない形でページ下部に置く（設計書 v2.0 / D）。 */}
+      <div className="mt-8 text-center">
+        <button
+          type="button"
+          onClick={() => go({ kind: "logs" })}
+          className="px-3 py-1.5 text-xs"
+          style={{ color: "var(--dim)", opacity: 0.7 }}
+        >
+          履歴（全体ログ）
+        </button>
+      </div>
+
       {showImport && <ImportSheet onClose={() => setShowImport(false)} />}
       {showCreateGroup && (
         <CreateGroupSheet characters={characters} categories={categories} onClose={() => setShowCreateGroup(false)} go={openView} />
+      )}
+      {scheduleSheet && schedulesQuery.data && (
+        <ScheduleEditSheet
+          initial={scheduleSheet.mode === "edit" ? scheduleSheet.schedule : null}
+          eligibleGroups={schedulesQuery.data.eligible_groups}
+          categories={categories}
+          onClose={() => setScheduleSheet(null)}
+        />
       )}
       {showCategoryManage && (
         <CategoryManageSheet categories={categories} onClose={() => setShowCategoryManage(false)} />
@@ -2437,6 +2568,597 @@ function HomeView({ go }: { go: (v: View) => void }) {
   );
 }
 
+// ------------------------------------------------------------------ scheduling (v2.0 / B)
+
+const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
+
+function scheduleSummary(s: ScheduleItem): string {
+  const freq = s.frequency === "weekly"
+    ? `毎週 ${s.weekdays.map((d) => WEEKDAY_LABELS[d] ?? "").filter(Boolean).join("・")}`
+    : "毎日";
+  const target = s.target_type === "existing"
+    ? (s.target_group_name ? `グループ「${s.target_group_name}」` : "（対象グループなし）")
+    : "毎回新規チャット";
+  return `${freq} ${s.times.join("・")} ／ ${target}`;
+}
+
+/** グループ一覧の下部に置く「スケジューリング」セクション。スケジュールの一覧・有効/無効・編集・削除と、作成ボタンを出す。 */
+function SchedulingSection({
+  data,
+  isPending,
+  isError,
+  onRetry,
+  onCreate,
+  onEdit,
+}: {
+  data: SchedulesData | undefined;
+  isPending: boolean;
+  isError: boolean;
+  onRetry: () => void;
+  onCreate: () => void;
+  onEdit: (s: ScheduleItem) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [confirmDelete, setConfirmDelete] = useState<ScheduleItem | null>(null);
+  const [error, setError] = useState("");
+  const toggle = useMutation({
+    mutationFn: async (v: { id: number; enabled: boolean }) => await api.setScheduleEnabled(v),
+    onSuccess: () => {
+      setError("");
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "切り替えに失敗しました"),
+  });
+  const del = useMutation({
+    mutationFn: async (id: number) => await api.deleteSchedule({ id }),
+    onSuccess: () => {
+      setConfirmDelete(null);
+      setError("");
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "削除に失敗しました"),
+  });
+  const schedules = data?.schedules ?? [];
+  return (
+    <section aria-label="スケジューリング" className="mt-10">
+      <div className="flex items-center justify-between">
+        <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>スケジューリング</h2>
+        <button
+          type="button"
+          onClick={onCreate}
+          className="rounded-full px-4 py-2 text-sm font-bold"
+          style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+        >
+          スケジュールを作成
+        </button>
+      </div>
+      <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+        決まった時刻になると、対象のグループチャットでキャラクター同士の会話を自動で生成します。スケジュールは複数作れます。
+      </p>
+      {isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+      {isError && (
+        <div className="mt-3">
+          <p className="text-sm" style={{ color: "var(--danger)" }}>スケジュールの読み込みに失敗しました。</p>
+          <button type="button" onClick={onRetry} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            再読み込み
+          </button>
+        </div>
+      )}
+      {data && schedules.length === 0 && (
+        <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>まだスケジュールがありません。「スケジュールを作成」から追加できます。</p>
+      )}
+      <div className="mt-3 flex flex-col gap-3">
+        {schedules.map((s) => (
+          <div key={s.id} className="rounded-3xl p-4" style={{ background: "var(--surface)" }}>
+            <div className="flex items-center gap-2">
+              <span className="font-display min-w-0 flex-1 truncate font-bold" style={{ color: "var(--text)" }}>{s.name}</span>
+              <label className="flex shrink-0 items-center gap-1.5 text-xs font-bold" style={{ color: "var(--text)" }}>
+                <input
+                  type="checkbox"
+                  checked={s.enabled}
+                  disabled={toggle.isPending}
+                  onChange={(e) => toggle.mutate({ id: s.id, enabled: e.target.checked })}
+                  aria-label={`スケジュール「${s.name}」の有効・無効`}
+                  className="h-5 w-5"
+                  style={{ accentColor: "var(--accent)" }}
+                />
+                {s.enabled ? "有効" : "無効"}
+              </label>
+            </div>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{scheduleSummary(s)}</p>
+            <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {s.use_history ? "履歴を使う" : "履歴を使わない"}
+              {s.target_type === "new" ? ` ／ カテゴリから${s.min_members}〜${s.max_members}人を抽選` : ""}
+              {s.allow_guests ? " ／ ゲストあり" : ""}
+              {s.allow_mobs ? " ／ モブあり" : ""}
+              {s.target_type === "new" && s.allow_narration ? " ／ ナレーションあり" : ""}
+            </p>
+            <div className="mt-2.5 flex gap-2">
+              <button
+                type="button"
+                onClick={() => onEdit(s)}
+                className="rounded-full px-4 py-1.5 text-sm font-bold"
+                style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+              >
+                編集
+              </button>
+              <button
+                type="button"
+                onClick={() => { setConfirmDelete(s); setError(""); }}
+                className="rounded-full px-4 py-1.5 text-sm font-bold"
+                style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
+              >
+                削除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+      {confirmDelete && (
+        <ConfirmSheet
+          title={`スケジュール「${confirmDelete.name}」を削除しますか？`}
+          body="このスケジュールでの自動生成は止まります。作成済みのグループや会話履歴は残ります。"
+          confirmLabel="削除する"
+          busy={del.isPending}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => del.mutate(confirmDelete.id)}
+        />
+      )}
+    </section>
+  );
+}
+
+/** スケジュールの作成・編集シート。スケジュール側ではキャラを指定しない（対象チャットの設定を参照するため）。新規チャット型の時だけカテゴリ・人数・背景情報を指定する。 */
+function ScheduleEditSheet({
+  initial,
+  eligibleGroups,
+  categories,
+  onClose,
+}: {
+  initial: ScheduleItem | null;
+  eligibleGroups: SchedulesData["eligible_groups"];
+  categories: CategoryItem[];
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const F = FIELDS.createSchedule;
+  const [name, setName] = useState(initial?.name ?? "");
+  const [enabled, setEnabled] = useState(initial?.enabled ?? true);
+  const [frequency, setFrequency] = useState<"daily" | "weekly">(initial?.frequency === "weekly" ? "weekly" : "daily");
+  const [weekdays, setWeekdays] = useState<number[]>(initial?.weekdays ?? []);
+  const [times, setTimes] = useState<string[]>(initial && initial.times.length ? initial.times : ["08:00"]);
+  const [targetType, setTargetType] = useState<"existing" | "new">(initial?.target_type === "new" ? "new" : "existing");
+  const [targetGroupId, setTargetGroupId] = useState<number | null>(initial?.target_group_id ?? null);
+  const [categoryIds, setCategoryIds] = useState<number[]>(initial?.category_ids ?? []);
+  const [minMembers, setMinMembers] = useState(initial?.min_members ?? 2);
+  const [maxMembers, setMaxMembers] = useState(initial?.max_members ?? 4);
+  const [allowGuests, setAllowGuests] = useState(initial?.allow_guests ?? false);
+  const [allowMobs, setAllowMobs] = useState(initial?.allow_mobs ?? false);
+  const [allowNarration, setAllowNarration] = useState(initial?.allow_narration ?? false);
+  const [useHistory, setUseHistory] = useState(initial?.use_history ?? false);
+  const [backgroundText, setBackgroundText] = useState(initial?.background_text ?? "");
+  const [error, setError] = useState("");
+
+  const buildPayload = () => ({
+    name: name.trim(),
+    enabled,
+    frequency,
+    weekdays,
+    times: times.map((t) => t.trim()).filter(Boolean),
+    target_type: targetType,
+    target_group_id: targetType === "existing" ? targetGroupId : null,
+    category_ids: categoryIds,
+    min_members: minMembers,
+    max_members: maxMembers,
+    allow_guests: allowGuests,
+    allow_mobs: allowMobs,
+    allow_narration: allowNarration,
+    use_history: useHistory,
+    background_text: backgroundText,
+  });
+  const save = useMutation({
+    mutationFn: async () => {
+      const p = buildPayload();
+      return initial ? await api.updateSchedule({ id: initial.id, ...p }) : await api.createSchedule(p);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+  });
+  const submit = () => {
+    if (!name.trim()) { setError("スケジュール名を入力してください。"); return; }
+    if (times.map((t) => t.trim()).filter(Boolean).length === 0) { setError("生成時刻を1つ以上入れてください。"); return; }
+    if (frequency === "weekly" && weekdays.length === 0) { setError("曜日を1つ以上選んでください。"); return; }
+    if (targetType === "existing" && targetGroupId == null) { setError("対象のグループチャットを選んでください。"); return; }
+    if (targetType === "new" && categoryIds.length === 0) { setError("カテゴリを1つ以上選んでください。"); return; }
+    if (minMembers > maxMembers) { setError("人数の最小は最大以下にしてください。"); return; }
+    setError("");
+    save.mutate();
+  };
+  // 対象グループの選択肢。編集時に現在の対象が選択肢（なりきり無効・解散していない
+  // グループ）に無い場合は、現状が分かるよう注記つきで1件追加する。
+  const groupOptions = [...eligibleGroups];
+  if (initial?.target_group_id != null && !groupOptions.some((g) => g.id === initial.target_group_id)) {
+    groupOptions.push({ id: initial.target_group_id, name: `${initial.target_group_name ?? "（不明なグループ）"}（現在は対象に選べません）` });
+  }
+  const toggleWeekday = (d: number) =>
+    setWeekdays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
+  const toggleCategory = (id: number) =>
+    setCategoryIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={initial ? "スケジュールを編集" : "スケジュールを作成"}>
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{initial ? "スケジュールを編集" : "スケジュールを作成"}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="閉じる"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
+            style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
+          >
+            ×
+          </button>
+        </div>
+
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-name">
+          スケジュール名（必須）
+        </label>
+        <input
+          id="schedule-name"
+          {...F.name}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="例: 朝の雑談"
+          className="mt-1 w-full rounded-2xl px-3 py-2.5"
+          style={editInputStyle}
+        />
+        <label className="mt-3 flex items-center gap-2 text-sm font-bold" style={{ color: "var(--text)" }}>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-5 w-5" style={{ accentColor: "var(--accent)" }} />
+          このスケジュールを有効にする
+        </label>
+
+        <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>生成スケジュール</p>
+        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label="頻度">
+          {(
+            [
+              { key: "daily", label: "毎日" },
+              { key: "weekly", label: "毎週" },
+            ] as const
+          ).map((o) => (
+            <label key={o.key} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: frequency === o.key ? "var(--accent-soft)" : "transparent" }}>
+              <input type="radio" name="schedule-frequency" checked={frequency === o.key} onChange={() => setFrequency(o.key)} aria-label={o.label} className="h-5 w-5 shrink-0" />
+              <span className="font-bold" style={{ color: "var(--text)" }}>{o.label}</span>
+            </label>
+          ))}
+        </div>
+        {frequency === "weekly" && (
+          <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label="曜日（複数選択可）">
+            {WEEKDAY_LABELS.map((label, d) => {
+              const on = weekdays.includes(d);
+              return (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => toggleWeekday(d)}
+                  aria-pressed={on}
+                  aria-label={`曜日: ${label}`}
+                  className="h-10 w-10 rounded-full text-sm font-bold"
+                  style={
+                    on
+                      ? { background: "var(--accent)", color: "#fff" }
+                      : { background: "var(--surface-alt)", color: "var(--text)" }
+                  }
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>生成時刻（複数選択可・日本時間）</p>
+        <div className="mt-2 flex flex-col gap-2">
+          {times.map((t, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="time"
+                value={t}
+                onChange={(e) => setTimes((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))}
+                aria-label={`生成時刻${i + 1}`}
+                className="rounded-2xl px-3 py-2.5"
+                style={editInputStyle}
+              />
+              {times.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setTimes((prev) => prev.filter((_, j) => j !== i))}
+                  aria-label={`生成時刻${i + 1}を削除`}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base"
+                  style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+          {times.length < 10 && (
+            <button
+              type="button"
+              onClick={() => setTimes((prev) => [...prev, "12:00"])}
+              className="self-start rounded-full px-4 py-2 text-sm font-bold"
+              style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+            >
+              ＋ 時刻を追加
+            </button>
+          )}
+        </div>
+
+        <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>対象</p>
+        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label="対象の種類">
+          {(
+            [
+              { key: "existing", label: "既存のグループチャット", desc: "選んだグループの設定（参加者・ゲスト/モブ・ナレーション・背景情報）を使って、その中で会話を生成します" },
+              { key: "new", label: "毎回新規チャット", desc: "実行のたびに新しいグループを作り、カテゴリから抽選したキャラで会話を生成します" },
+            ] as const
+          ).map((o) => (
+            <label key={o.key} className="flex cursor-pointer items-start gap-3 rounded-2xl px-2 py-2" style={{ background: targetType === o.key ? "var(--accent-soft)" : "transparent" }}>
+              <input type="radio" name="schedule-target-type" checked={targetType === o.key} onChange={() => setTargetType(o.key)} aria-label={o.label} className="mt-0.5 h-5 w-5 shrink-0" />
+              <span>
+                <span className="block font-bold" style={{ color: "var(--text)" }}>{o.label}</span>
+                <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{o.desc}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+
+        {targetType === "existing" && (
+          <div className="mt-3">
+            <label className="block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-target-group">
+              対象のグループチャット
+            </label>
+            <select
+              id="schedule-target-group"
+              value={targetGroupId === null ? "" : String(targetGroupId)}
+              onChange={(e) => setTargetGroupId(e.target.value === "" ? null : Number(e.target.value))}
+              className="mt-1 w-full rounded-2xl px-3 py-2.5"
+              style={editInputStyle}
+            >
+              <option value="">選んでください</option>
+              {groupOptions.map((g) => (
+                <option key={g.id} value={String(g.id)}>{g.name}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              なりきり設定が有効なグループは対象にできません。背景情報はグループ側の設定を使います。
+            </p>
+          </div>
+        )}
+
+        {targetType === "new" && (
+          <div className="mt-3">
+            <p className="text-sm font-bold" style={{ color: "var(--text)" }}>抽選するカテゴリ（複数選択可）</p>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              選んだカテゴリ（子カテゴリを含む）に属するキャラクターの中から抽選します。未分類のキャラクターは対象になりません。
+            </p>
+            {categories.length === 0 && (
+              <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>まだカテゴリが登録されていません。一覧の「カテゴリ管理」から先にカテゴリを追加してください。</p>
+            )}
+            <div className="mt-2 flex flex-col gap-2" role="group" aria-label="カテゴリの選択（複数選択可）">
+              {categoryTreeEntries(categories).map(({ cat, depth }) => {
+                const selected = categoryIds.includes(cat.id);
+                return (
+                  <label
+                    key={cat.id}
+                    className="flex items-center gap-3 rounded-2xl px-4 py-3"
+                    style={{
+                      background: selected ? "var(--accent-soft)" : "var(--surface-alt)",
+                      color: "var(--text)",
+                      outline: selected ? "2px solid var(--accent)" : "none",
+                      marginLeft: depth * 20,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => toggleCategory(cat.id)}
+                      aria-label={`カテゴリ「${cat.name}」`}
+                      className="h-5 w-5 shrink-0"
+                      style={{ accentColor: "var(--accent)" }}
+                    />
+                    <span className="font-bold">
+                      {depth > 0 && <span aria-hidden="true" style={{ color: "var(--dim)" }}>└ </span>}
+                      {cat.name}
+                    </span>
+                    {selected && <span className="ml-auto text-xs font-bold" style={{ color: "var(--accent)" }}>選択中</span>}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="mt-3 flex items-center gap-3">
+              <label className="text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-min-members">人数</label>
+              <select
+                id="schedule-min-members"
+                value={String(minMembers)}
+                onChange={(e) => setMinMembers(Number(e.target.value))}
+                aria-label="人数の最小"
+                className="rounded-2xl px-3 py-2"
+                style={editInputStyle}
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={String(n)}>{n}人</option>
+                ))}
+              </select>
+              <span style={{ color: "var(--dim)" }}>〜</span>
+              <select
+                value={String(maxMembers)}
+                onChange={(e) => setMaxMembers(Number(e.target.value))}
+                aria-label="人数の最大"
+                className="rounded-2xl px-3 py-2"
+                style={editInputStyle}
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={String(n)}>{n}人</option>
+                ))}
+              </select>
+            </div>
+            <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>ゲスト・モブ・ナレーション（作成されるグループに引き継がれます）</p>
+            <div className="mt-2 flex flex-col gap-1">
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowGuests} onChange={(e) => setAllowGuests(e.target.checked)} aria-label="ゲストを許可する" className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>ゲストあり</span>
+              </label>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowMobs ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowMobs} onChange={(e) => setAllowMobs(e.target.checked)} aria-label="モブを許可する" className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>モブあり</span>
+              </label>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowNarration} onChange={(e) => setAllowNarration(e.target.checked)} aria-label="ナレーションを許可する" className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>ナレーションあり</span>
+              </label>
+            </div>
+            <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }}>
+              背景情報
+              <textarea
+                {...F.background_text}
+                value={backgroundText}
+                onChange={(e) => setBackgroundText(e.target.value)}
+                rows={4}
+                placeholder="例: 放課後の教室で、文化祭の準備をしている"
+                className="mt-1 w-full rounded-2xl px-3 py-2.5 font-normal"
+                style={editInputStyle}
+              />
+            </label>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              ここに書いた背景情報が正で、作成されるグループへ初期値としてコピーされます（グループ側で編集しても、こちらには戻りません）。
+            </p>
+          </div>
+        )}
+
+        <label className="mt-5 flex items-start gap-2 text-sm" style={{ color: "var(--text)" }}>
+          <input type="checkbox" checked={useHistory} onChange={(e) => setUseHistory(e.target.checked)} className="mt-0.5 h-5 w-5 shrink-0" style={{ accentColor: "var(--accent)" }} />
+          <span>
+            <span className="font-bold">履歴を使う</span>
+            <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {targetType === "existing"
+                ? "オンにすると、そのグループの過去の会話を材料にして続きから話し始めます。オフでは履歴を送らず、背景情報だけを材料に話し始めます。"
+                : "オンにすると、このスケジュールで前回作ったグループの会話を材料にして話し始めます（前回が無い・失敗した場合は履歴なしで始まります）。"}
+            </span>
+          </span>
+        </label>
+
+        {error && <p className="mt-3 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <div className="mt-4 flex gap-3">
+          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            キャンセル
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={save.isPending}
+            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+            style={{ background: "var(--accent)" }}
+          >
+            {save.isPending ? "保存中…" : initial ? "保存する" : "作成する"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ app logs (v2.0 / D)
+
+const LOG_KIND_LABELS: Record<string, string> = {
+  user_send: "送信",
+  generation: "生成",
+  review: "レビュー",
+  settings: "設定変更",
+  auto: "自動生成",
+};
+
+function LogBody({ id }: { id: number }) {
+  const q = useQuery({ queryKey: ["app-log", id], queryFn: () => api.getAppLogBody({ id }) });
+  if (q.isPending) return <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>;
+  if (q.error) {
+    return (
+      <div className="mt-2">
+        <p className="text-sm" style={{ color: "var(--danger)" }}>本文の読み込みに失敗しました。</p>
+        <button type="button" onClick={() => q.refetch()} className="mt-1 rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--text)" }}>
+          再読み込み
+        </button>
+      </div>
+    );
+  }
+  return (
+    <pre className="mt-2 max-h-80 overflow-auto rounded-xl p-3 text-xs leading-relaxed whitespace-pre-wrap break-words" style={{ background: "var(--surface)", color: "var(--text)" }}>
+      {q.data?.body || "（本文なし）"}
+    </pre>
+  );
+}
+
+/** 全体ログ（履歴ページ）。見出しのみの一覧で、タップした行だけ本文を個別に読み込んで開閉表示する。 */
+function LogsView({ back }: { back: () => void }) {
+  const logs = useQuery({ queryKey: ["app-logs"], queryFn: () => api.listAppLogs({}), refetchInterval: 20000 });
+  const [openId, setOpenId] = useState<number | null>(null);
+  const items: AppLogItem[] = logs.data?.logs ?? [];
+  return (
+    <main className="mx-auto w-full max-w-2xl px-4 pb-10">
+      <div className="mt-4 flex items-center gap-3">
+        <button type="button" onClick={back} aria-label="一覧へ戻る" className="flex h-10 w-10 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
+          ←
+        </button>
+        <h2 className="font-display text-lg font-black" style={{ color: "var(--text)" }}>履歴（全体ログ）</h2>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+        あなたの送信、生成に使ったプロンプトと生レスポンス、レビュー、キャラクター設定の変更、自動生成の記録です。新しい順に最大100件まで残ります（古い物から消えます）。見出しをタップすると本文を開きます。
+      </p>
+      {logs.isPending && <p className="mt-6 text-center text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+      {logs.error && (
+        <div className="mt-6 text-center">
+          <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+          <button type="button" onClick={() => logs.refetch()} className="mt-3 rounded-full px-5 py-2 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            再読み込み
+          </button>
+        </div>
+      )}
+      {logs.data && items.length === 0 && (
+        <p className="mt-6 rounded-3xl p-5 text-sm" style={{ background: "var(--surface)", color: "var(--dim)" }}>
+          まだログがありません。チャットで送信したり、設定を変更したりすると、ここに記録されます。
+        </p>
+      )}
+      <div className="mt-4 flex flex-col gap-2">
+        {items.map((l) => {
+          const open = openId === l.id;
+          return (
+            <div key={l.id} className="rounded-2xl px-3 py-2.5" style={{ background: "var(--surface-alt)" }}>
+              <button
+                type="button"
+                onClick={() => setOpenId(open ? null : l.id)}
+                aria-expanded={open}
+                aria-label={`ログ「${l.title}」の本文を${open ? "閉じる" : "開く"}`}
+                className="flex w-full items-center gap-2 text-left"
+              >
+                <span className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
+                  {LOG_KIND_LABELS[l.kind] ?? l.kind}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-sm font-bold" style={{ color: "var(--text)" }}>{l.title}</span>
+                <span className="shrink-0 text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(l.created_at)}</span>
+                <span aria-hidden="true" className="shrink-0 text-xs" style={{ color: "var(--dim)" }}>{open ? "▲" : "▼"}</span>
+              </button>
+              {open && <LogBody id={l.id} />}
+            </div>
+          );
+        })}
+      </div>
+    </main>
+  );
+}
+
 function ImportSheet({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
   const [json, setJson] = useState("");
@@ -2458,7 +3180,7 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>キャラクターを追加</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          アバターテンプレ管理アプリの書き出しJSON（avatar-profile形式）を貼ると、そのキャラクターを追加できます。同じプロファイルの再取り込みでは、設定だけが更新され、会話履歴は残ります。ここからの追加では画像は付きません（画像つきで取り込む場合は下の一括取り込みを使ってください）。
+          アバター総合管理アプリの書き出しJSON（avatar-profile形式）を貼ると、そのキャラクターを追加できます。同じプロファイルの再取り込みでは、設定だけが更新され、会話履歴は残ります。ここからの追加では画像は付きません（画像つきで取り込む場合は下の一括取り込みを使ってください）。
         </p>
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="import-json">
           書き出しJSON
@@ -2517,6 +3239,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
   const [selected, setSelected] = useState<number[]>([]);
   const [allowGuests, setAllowGuests] = useState(false);
   const [allowMobs, setAllowMobs] = useState(false);
+  const [allowNarration, setAllowNarration] = useState(false);
   const [error, setError] = useState("");
   // シート内のカテゴリ絞り込み（v1.23、階層対応 v1.26）: "all" = 未指定（全員）/
   // "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
@@ -2531,7 +3254,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
     "gojuon",
   );
   const create = useMutation({
-    mutationFn: async () => await api.createGroup({ name: name.trim(), character_ids: selected, allow_guests: allowGuests, allow_mobs: allowMobs }),
+    mutationFn: async () => await api.createGroup({ name: name.trim(), character_ids: selected, allow_guests: allowGuests, allow_mobs: allowMobs, allow_narration: allowNarration }),
     onSuccess: (r) => {
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
@@ -2603,7 +3326,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
             <p className="px-2 py-3 text-sm" style={{ color: "var(--dim)" }}>このカテゴリのキャラクターはいません。</p>
           )}
         </div>
-        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>ゲスト・モブ</p>
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>ゲスト・モブ・ナレーション</p>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>オンにすると、会話の流れに応じて参加者以外が混じることがあります（混じらないこともあります）。作成後もグループの設定から変えられます。</p>
         <div className="mt-2 flex flex-col gap-1">
           <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
@@ -2625,6 +3348,16 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
               className="h-5 w-5 shrink-0"
             />
             <span className="font-bold" style={{ color: "var(--text)" }}>モブ（住民・生徒などの名前のない人々が入ることがある）</span>
+          </label>
+          <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
+            <input
+              type="checkbox"
+              checked={allowNarration}
+              onChange={(e) => setAllowNarration(e.target.checked)}
+              aria-label="ナレーションを許可する"
+              className="h-5 w-5 shrink-0"
+            />
+            <span className="font-bold" style={{ color: "var(--text)" }}>ナレーション（背景説明・場面転換・時間経過の説明が入ることがある）</span>
           </label>
         </div>
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
@@ -2774,7 +3507,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
   // 下に出す。生成が始まったら（processing）もう取り消せないので出さない。
   const waiting = req?.status === "pending" || req?.status === "processing";
   const chatUserMsgs = (data?.messages ?? []).filter((m) => m.speaker === "user");
-  const unrepliedMsgs = req?.status === "pending" && req.unreplied_count > 0 ? chatUserMsgs.slice(-req.unreplied_count) : [];
+  const unrepliedMsgs = req?.status === "pending" && req.origin !== "auto" && req.unreplied_count > 0 ? chatUserMsgs.slice(-req.unreplied_count) : [];
   const cancelTargetId = unrepliedMsgs.length ? unrepliedMsgs[unrepliedMsgs.length - 1]!.id : null;
 
   // 送信ボタンと Enter キーで共用する送信処理。
@@ -3027,7 +3760,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
 // ------------------------------------------------------------------ group chat
 
-/** なりきり設定シート（v1.19 / v1.20）: なりきるキャラの選択（未選択で解除）と、「なりきりキャラの台詞」の扱い（AIも演じる / 自分だけが演じる）を選ぶ。どちらを選んでも、発言したらAIは返信する。 */
+/** なりきり設定シート（v1.19 / v1.20 / v1.30）: なりきるキャラの選択（未選択で解除）と、「なりきりキャラの台詞」の扱い（AIも演じる / 自分だけが演じる）を選ぶ。どちらを選んでも、発言したらAIは返信する。台詞の既定値は、なりきり未設定のグループでは「AIも演じる」。すでに保存済みのグループは保存値をそのまま初期値にし、「自分だけが演じる」を選んで保存した選択は変えない。 */
 function RoleplaySheet({
   groupId,
   members,
@@ -3043,7 +3776,10 @@ function RoleplaySheet({
 }) {
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<number | null>(currentCharacterId);
-  const [cont, setCont] = useState<boolean>(currentContinue);
+  // 既定値（v1.30）: なりきり未設定（currentCharacterId が null）のグループで
+  // キャラを新たに選ぶ時は「AIも演じる」を既定にする。保存済みのグループは
+  // 保存値 currentContinue をそのまま初期値にし、既存の選択を勝手に変えない。
+  const [cont, setCont] = useState<boolean>(currentCharacterId == null ? true : currentContinue);
   const [error, setError] = useState("");
   const save = useMutation({
     mutationFn: async () => await api.setGroupRoleplay({ group_id: groupId, character_id: selected, continue_mode: cont }),
@@ -3147,24 +3883,27 @@ function RoleplaySheet({
   );
 }
 
-/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブの設定」の3つ。 */
+/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「背景情報を編集する」の4つ。 */
 function GroupMenuSheet({
   groupName,
   onClose,
   onRename,
   onEditMembers,
   onGuestMob,
+  onBackground,
 }: {
   groupName: string;
   onClose: () => void;
   onRename: () => void;
   onEditMembers: () => void;
   onGuestMob: () => void;
+  onBackground: () => void;
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
     { label: "グループチャットの名前を変える", description: "このグループの表示名を変更します（参加者や会話履歴には影響しません）", onSelect: onRename },
     { label: "グループチャットの参加者を変える", description: "参加キャラクターを1〜8人の間で増やしたり減らしたりできます（会話履歴は残ります）", onSelect: onEditMembers },
-    { label: "ゲスト・モブの設定", description: "参加者以外のキャラクター（ゲスト）や、名前のない人々（モブ）が会話に混じることがあるかを選びます", onSelect: onGuestMob },
+    { label: "ゲスト・モブ・ナレーションの設定", description: "参加者以外のキャラクター（ゲスト）や名前のない人々（モブ）が会話に混じることがあるかと、背景説明・場面転換のナレーションを入れるかを選びます", onSelect: onGuestMob },
+    { label: "背景情報を編集する", description: "このグループの生成（通常・自動の両方）に常に添える背景情報（場所や状況など）を書きます。一度書けば使われ続けます", onSelect: onBackground },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="グループ設定メニュー">
@@ -3197,26 +3936,30 @@ function GroupMenuSheet({
   );
 }
 
-/** ゲスト・モブの設定シート（グループ設定メニューの「ゲスト・モブの設定」から開く）。
+/** ゲスト・モブ・ナレーションの設定シート（グループ設定メニューの「ゲスト・モブ・ナレーションの設定」から開く）。
  *  オンにすると、生成の場面に応じて参加者以外のキャラ（ゲスト）や名前のない人々
- *  （モブ）が会話に混じることがある。混じらないこともある。 */
+ *  （モブ）が会話に混じることがある。混じらないこともある。ナレーションは、会話の
+ *  背景説明・場面転換・時間経過の説明が、誰の台詞でもない形で入ることがある。 */
 function GroupGuestMobSheet({
   groupId,
   currentGuests,
   currentMobs,
+  currentNarration,
   onClose,
 }: {
   groupId: number;
   currentGuests: boolean;
   currentMobs: boolean;
+  currentNarration: boolean;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
   const [guests, setGuests] = useState(currentGuests);
   const [mobs, setMobs] = useState(currentMobs);
+  const [narration, setNarration] = useState(currentNarration);
   const [error, setError] = useState("");
   const save = useMutation({
-    mutationFn: async () => await api.setGroupGuestMob({ group_id: groupId, allow_guests: guests, allow_mobs: mobs }),
+    mutationFn: async () => await api.setGroupGuestMob({ group_id: groupId, allow_guests: guests, allow_mobs: mobs, allow_narration: narration }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       onClose();
@@ -3224,9 +3967,9 @@ function GroupGuestMobSheet({
     onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
   });
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="ゲスト・モブの設定">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="ゲスト・モブ・ナレーションの設定">
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>ゲスト・モブの設定</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>ゲスト・モブ・ナレーションの設定</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
           オンにすると、会話の流れに応じて参加者以外のキャラクターや人々が混じることがあります（混じらないこともあります）。参加者や会話履歴には影響しません。
         </p>
@@ -3261,7 +4004,83 @@ function GroupGuestMobSheet({
               </span>
             </span>
           </label>
+          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: narration ? "var(--accent-soft)" : "var(--surface-alt)" }}>
+            <input
+              type="checkbox"
+              checked={narration}
+              onChange={(e) => setNarration(e.target.checked)}
+              aria-label="ナレーションを許可する"
+              className="mt-0.5 h-5 w-5 shrink-0"
+            />
+            <span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>ナレーション</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+                会話の背景説明・場面転換・時間経過の説明が、誰の台詞でもないナレーションとして入ることがあります（例:「〇〇達は××に訪れていた」「◯時間後」）。吹き出しではなく、中央揃えの控えめな表示になります。場面の立ち上げや転換の時だけ、控えめに入ります。
+              </span>
+            </span>
+          </label>
         </div>
+        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <div className="mt-4 flex gap-3">
+          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            キャンセル
+          </button>
+          <button
+            type="button"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+            style={{ background: "var(--accent)" }}
+          >
+            {save.isPending ? "保存中…" : "保存する"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 背景情報の編集シート（設計書 v2.0 / C）。グループの生成（通常・自動の両方）のシステムプロンプトへ常時含まれる。 */
+function GroupBackgroundSheet({
+  groupId,
+  currentText,
+  onClose,
+}: {
+  groupId: number;
+  currentText: string;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [text, setText] = useState(currentText);
+  const [error, setError] = useState("");
+  const save = useMutation({
+    mutationFn: async () => await api.updateGroupBackground({ group_id: groupId, background_text: text }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["group", groupId] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+  });
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="背景情報を編集する">
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>背景情報を編集する</h2>
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+          このグループの会話の前提になる情報（場所・状況・関係性など）を書きます。ここに書いた内容は、このグループの生成（通常の投稿への返信・スケジューリングの自動生成の両方）に毎回添えられます。一度書けば使われ続け、空にすると添えられなくなります。自動生成を使わないグループでも設定できます。
+        </p>
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="group-background-text">
+          背景情報
+        </label>
+        <textarea
+          id="group-background-text"
+          {...FIELDS.updateGroupBackground.background_text}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={8}
+          placeholder="例: 放課後の教室で、文化祭の準備をしている。3人は同じクラスの同級生。"
+          className="mt-1 w-full rounded-2xl px-3 py-2.5 text-sm"
+          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
+        />
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
@@ -3517,6 +4336,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   const [showRenameGroup, setShowRenameGroup] = useState(false);
   const [showEditMembers, setShowEditMembers] = useState(false);
   const [showGuestMob, setShowGuestMob] = useState(false);
+  const [showBackground, setShowBackground] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
   const [selectedReviewId, setSelectedReviewId] = useState<number | null>(null);
   const [reviewError, setReviewError] = useState("");
@@ -3627,13 +4447,15 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   // 生成が始まる前（pending の間）だけ出す。対象は、未返信の話題がある時は
   // その最後の話題、なりきり発言への返信待ちの時は最後のなりきり発言。
   const waiting = req?.status === "pending" || req?.status === "processing";
+  // 自動生成（auto）の開始待ちは送信取り消しの対象外（設計書 v2.0 / B）。
+  const canCancel = req?.status === "pending" && req.origin !== "auto";
   const groupUserMsgs = (data?.messages ?? []).filter((m) => m.kind === "user");
-  const unrepliedMsgs = req?.status === "pending" && req.unreplied_count > 0 ? groupUserMsgs.slice(-req.unreplied_count) : [];
+  const unrepliedMsgs = canCancel && req.unreplied_count > 0 ? groupUserMsgs.slice(-req.unreplied_count) : [];
   const roleplayMsgs = (data?.messages ?? []).filter((m) => m.user_authored);
   const cancelTargetId =
     unrepliedMsgs.length
       ? unrepliedMsgs[unrepliedMsgs.length - 1]!.id
-      : req?.status === "pending" && roleplayMsgs.length
+      : canCancel && roleplayMsgs.length
         ? roleplayMsgs[roleplayMsgs.length - 1]!.id
         : null;
 
@@ -3791,6 +4613,20 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                         送信を取り消す
                       </button>
                     )}
+                  </div>
+                </Fragment>
+              );
+            }
+            if (m.kind === "narration") {
+              // ナレーション（v3.1）: 吹き出しにせず、アバター・名前なしで
+              // 中央揃えのシステムメッセージ的に表示する。
+              return (
+                <Fragment key={m.id}>
+                  {divider}
+                  <div className="flex justify-center px-2 py-1">
+                    <p className="max-w-[88%] text-center text-sm leading-relaxed whitespace-pre-wrap" style={{ color: "var(--dim)" }}>
+                      {m.body}
+                    </p>
                   </div>
                 </Fragment>
               );
@@ -3969,6 +4805,18 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             setShowGroupMenu(false);
             setShowGuestMob(true);
           }}
+          onBackground={() => {
+            setShowGroupMenu(false);
+            setShowBackground(true);
+          }}
+        />
+      )}
+
+      {showBackground && data && (
+        <GroupBackgroundSheet
+          groupId={groupId}
+          currentText={data.group.background_text}
+          onClose={() => setShowBackground(false)}
         />
       )}
 
@@ -3977,6 +4825,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
           groupId={groupId}
           currentGuests={data.allow_guests}
           currentMobs={data.allow_mobs}
+          currentNarration={data.allow_narration}
           onClose={() => setShowGuestMob(false)}
         />
       )}
@@ -4052,6 +4901,12 @@ export function App() {
       )}
       {view.kind === "chat" && <ChatView characterId={view.characterId} unreadFromSeq={view.unreadFromSeq} back={goHome} />}
       {view.kind === "group" && <GroupView groupId={view.groupId} unreadFromSeq={view.unreadFromSeq} back={goHome} />}
+      {view.kind === "logs" && (
+        <>
+          <SafeAreaTopScrim backgroundColor="var(--bg)" />
+          <LogsView back={goHome} />
+        </>
+      )}
     </div>
   );
 }

@@ -216,6 +216,21 @@
 - **画面**: 作成シート・参加者変更シートの選択上限を8人へ変更し、参加者変更シートは1人でも保存可能に（従来の「2人以上必須」を撤廃）。表示文言も「1〜8人」へ統一。
 - **生成側**: グループ生成のプロンプト組み立て・発言分割は参加者を動的に扱っており、5人前提の上限は残っていなかったため変更なし。1人グループ＋なりきり「自分だけが演じる」でAIが書けるキャラが居ない場合は返信を生成しない例外も従来通り維持。
 
+## v1.30 変更（2026-11-25、なりきり台詞の既定値を「AIも演じる」へ）
+- **要望**: なりきり機能を使う時、「AIもなりきり元の返信を行う」オプション（「なりきりキャラの台詞」＝「AIも演じる」、continue_mode=true）をデフォルトでONにしたい（利用者要望）。
+- **画面**: なりきり設定シート（RoleplaySheet）の台詞モード初期値を変更。なりきり未設定のグループ（roleplay_character_id が null）では「AIも演じる」を初期選択にし、そのまま保存すれば continue_mode=true で保存される。すでに保存済みのグループは保存値（roleplay_continue）をそのまま初期値にするため、「自分だけが演じる」を選んで保存したグループの選択は変わらない。なりきり未設定のグループの動作（生成側の扱い）は従来通り変更なし。
+- **データ**: スキーマ変更なし（groups.roleplay_continue のDB既定値は 0 のまま。既定値の意味付けはシートの初期値でのみ行い、保存済み行は一切書き換えない）。
+
+## v2.0 変更（2026-11-25、グループ一覧ページ分け・スケジューリング・背景情報・全体ログ・設計書 v2.0〜v2.2.2）
+- **要望**: グループ一覧を更新順＋10件ごとのページ分けにしたい。グループ一覧の下部に「スケジューリング」セクションを作り、時刻になると自動で会話を生成したい（対象は既存グループ／毎回新規チャットの選択式、新規はカテゴリ抽選）。背景情報はグループ側の設定として持たせたい。全体のログを最大100件、ページ下部の目立たない入口から見出し一覧＋開閉で見られるようにしたい。実装前にClaudeレビューを繰り返し、問題なしになった設計（設計書 v2.0〜v2.2.2）で実装（利用者要望）。
+- **A. グループ一覧**: `listHome` の groups に `last_activity_at`（最新メッセージ時刻、自動生成分も含む。無ければグループ作成時刻）を追加。クライアントは降順ソート＋10件/ページ（前へ/次へ＋ページ表示、ページ位置はセッション内保持）。個人一覧は変更なし。
+- **B. スケジューリング**: 新テーブル `schedules`（name/enabled/frequency(daily・weekly)/weekdays/times はJSON文字列、target_type(existing・new)/target_group_id/category_ids/min_members/max_members/allow_guests/allow_mobs/use_history/background_text/last_fired_slot/last_group_id）。発火判定は既存の `runSignalAll` 内（本番の1分間隔 cron `chara-chat-signal-sweep` が駆動。space.json の managedCronJobs は従来通り空）。JST判定で、スケジュールごとに `last_fired_slot`（"YYYY-MM-DD HH:MM"）を発火・スキップ確定と同時に記録し二重発火を防止。対象は最新の未処理スロットのみ（古いスロットは無言で破棄）。30分以内なら遅延発火、30分超ならスキップ＋自動生成ログ（同一スロット1回だけ）。対象に有効なリクエストがある場合はスキップ＋ログ。対象グループが削除・解散なら自動で無効化＋ログ。なりきり有効なグループは対象にできない（作成・更新・有効化の保存時エラー＋選択肢から除外＋発火時スキップ）。逆に、有効なスケジュールの対象グループへは `setGroupRoleplay` でなりきりを設定できない。新規チャット型は母集団＝選択カテゴリ＋子孫の和集合（重複排除、未分類は含まない）からランダム抽選し、グループ名は「スケジュール名＋生成日時（M/D HH:MM）」。母集団が最小人数未満なら生成せずログに理由を残す。ゲスト/モブ・背景情報はスケジュール側が正で、作成グループへ初期値コピー（逆流なし）。`use_history` は既存型＝そのグループの過去ログ、新規型＝同一スケジュールの前回グループ（`last_group_id`、成功時のみ更新）の履歴を使うか。
+- **自動生成の経路**: `reply_requests.origin`（manual/auto）と `schedule_id` を追加。`getWorkItems` は auto について「自由開始」の材料（背景情報＋履歴を使う場合は直近20発言＋会話開始の指示文）を組み立て、生成の優先順位は manual・レビューが先、auto は末尾。auto は送信取り消し・戻し下書きの対象外。pending の auto があるグループへ利用者発言が来たら auto を取り消して通常返信を優先（processing 中は取り消さない）。auto の失敗（rate_limited 含む）は自動生成ログに残し、リトライしない。auto の発言も未読・新着の対象。
+- **C. 背景情報**: `groups.background_text` を追加。グループ設定メニューに「背景情報を編集する」を追加（新アクション `updateGroupBackground`）。グループ生成のシステムプロンプトへ「背景情報」セクションとして常時含める（通常・自動の両方、1対1には含めない）。
+- **D. 全体ログ**: 新テーブル `app_logs`（kind: user_send/generation/review/settings/auto、title/body/related_type/related_id）。保持は全種別合算で最新100件（挿入時に古い順に削除）。一覧は見出しのみ返し、本文は開閉時に `getAppLogBody` で個別取得。生成ログは「プロンプト＋生レスポンス」を1件にまとめ、プロンプトは `beginRequest` の processing 遷移時にリクエスト単位で1回だけ記録（仲介は system_prompt/user_prompt を渡す）、生レスポンスは `completeRequest` で同じログへ追記、失敗時は理由のみ。利用者の送信は user_send として別記録。レビューは登録と結果（適用/変更なし/失敗）を記録。設定変更ログの対象は updateCharacterSettings、レビュー自動適用、revertRevision、importCharacter、updateCharacterImage、renameCharacter、setCharacterCategories、deleteCharacter で、内容は対象と要約のみ。`importCharacter` に任意の `batch_id` を追加し、一括取り込み（kickInitialImport/requestImport）は取り込み全体で同一 batch_id を渡して設定変更ログを1件に集約。自動生成ログは発火・スキップ理由・抽選結果・成否を記録。
+- **画面**: グループタブの下部にスケジューリングセクション（名前・有効切替・要約・編集/削除）と編集シート（頻度・曜日チップ・時刻の追加削除、対象の既存/新規切替、カテゴリツリーの複数選択、人数1〜8、ゲスト/モブ、履歴、背景情報）。ページ最下部に目立たない「履歴（全体ログ）」入口を置き、全体ログ画面は種別バッジ付き見出し一覧＋行ごとの遅延本文取得。
+- **データ**: migration 0013 で `schedules` / `app_logs` テーブル新設、`reply_requests.origin` / `reply_requests.schedule_id`、`groups.background_text` を追加。検証はサンドボックスDBで実施（発火・遅延発火・スキップ1回のみ・抽選・背景コピー・last_group_id更新・pending auto の優先取消・なりきり相互ガード・batch集約を確認）。本番 cron は既存のまま変更なし。
+
 ## Rejected approaches
 - **Tried**: アクション内 ctx.inference で直接生成
   **Why rejected**: 利用者指定が「このmuseに連携したclaude」（Claude Code / Pro枠）であり、設計書1.3でも分離Claude Code方式で確定済み。inference は別枠のため主経路にしない。
@@ -223,3 +238,73 @@
   **Why rejected**: ビルド用サンドボックスは自アプリ専用で `This task's data workspace belongs to kiyaratiyatuto` と拒否された。取り込みは本番で spawnTask 仲介エージェント経由（list_actions/invoke はエージェント側ツール）に行う設計とし、ソース読解で形式を確定した。
 - **Tried**: 3分間隔の自動チェック生成
   **Why rejected**: 利用者との協議で合図制に確定。待機監視に LLM を使う方式はトークン消費が大きいため採用しない（設計書2章）。
+
+## v2.1 変更（2026-11-25、自動生成のプロンプト履歴の確実化・返信到着/認証切れのClaude通知）
+- **事象**: スケジューリングによる自動生成の時だけ、AIへ送信した内容（プロンプト）が全体ログの履歴に残っていない（利用者報告）。手動生成では残っていた。
+- **原因**: プロンプトの記録が「仲介（LLMエージェント）が getWorkItems で受け取ったプロンプトを beginRequest へそのまま渡し直す」経路に依存していた。仲介が巨大なプロンプト文字列を転送する際に落とす／切り詰めることがあり、実データでも (1) プロンプト無しで生レスポンスだけの生成ログ、(2) システムプロンプトが冒頭1行だけに切り詰められた自動生成の生成ログ、を確認した。自動生成は参加キャラが多くプロンプトが最大になるため、被害が自動生成に集中していた。
+- **修正（プロンプト記録）**: `getWorkItems` が材料を組み立てた時点で、サーバ側が `ensureGenerationPromptLog` で生成ログ（システムプロンプト＋ユーザープロンプト）をリクエスト単位で1回だけ記録する方式へ変更（手動・自動共通）。仲介の手順（MEDIATOR_MESSAGE）からはプロンプトの受け渡しを外し、`beginRequest` は request_id のみで呼ぶ。`beginRequest` のプロンプト記録は、生成ログがまだ無い場合の予備として残す。生レスポンス・失敗理由の追記（completeRequest / failRequest / sweepTimeouts）は従来通り同じログへ。
+- **通知（新規）**: 全体設定「返信が届いたらClaudeに通知する」を追加（meta の `pref_notify_reply`、既定 OFF。新アクション `getGlobalSettings` / `saveGlobalSettings`、画面はホーム下部の「全体設定」セクション）。ON の時、`completeRequest` の成功（1対1・グループ・自動生成の全て）で `ctx.agent.spawnTask` の通知タスクを起動し、その報告がユーザーのチャットへ届く（仲介と同じ経路、dedupeKey はリクエスト単位）。Claudeのログイン切れ（`auth_error`）による失敗は設定にかかわらず通知する（`failRequest` / `failReview` の auth_error 確定時に `notifyAuthFailure`、meta の `last_auth_notify_at` で30分に1回まで）。通知の失敗は生成結果の保存に影響させない。
+- **データ**: スキーマ変更なし（既存 `meta` テーブルのみ使用）。
+
+## v3.0 変更（2026-11-25、JSON最新化: 取り込み元をアバター総合管理へ切替・新項目の反映と編集）
+- **背景**: アバター総合管理アプリ（slug: abatazong-he-guan-li）の書き出しJSONが、format "avatar-profile" / format_version "1.0" のまま拡張された（background へ portrayal_focus 一式・video_urls・video_notes・unreadable_videos・video_processed_urls を追加、flavor traits へ frequency・scenes・effective_frequency を追加）。利用者が E2（先にアバター総合管理側の画像実体を直す）を選択し、前提作業（旧アプリ保管場所に残っていた画像実体の複製と、新アプリへの getImageData 追加）は完了済み。
+- **取り込み元の切り替え（A）**: IMPORT_MESSAGE（kickInitialImport / requestImport の仲介指示）を旧アプリ abatatenpureguan-li から abatazong-he-guan-li へ切り替え。listProfiles は {sort} のみ（query は渡さない）、exportProfile({id}) は従来通り。画像は新アプリの getImageData({id}) で取得する（found=true なら image_base64 / image_mime）。found=false で reason="external_url" の場合は、書き出しJSONの images[]（代表画像）の file に入っている http URL を仲介が取得して base64 化し importCharacter へ渡す。どちらの方法でも得られない場合は画像なしで取り込む。importCharacter は従来通り、画像が渡されなかった再取り込みでは既存画像を保持する（上書きしない）。一致は source_profile_id、会話履歴は保持。
+- **生成への反映（B）**: profileToParts を拡張。(1) background.portrayal_focus を「演じる姿・状況」として設定本文へ含める（前提として応答する旨の一文付き）。ただし portrayal_focus_status が "failed" の場合は無効として含めない。(2) background.video_notes を「口調の参考資料」として話し方まわりに含め、参考資料であり台詞や言い回しの正本ではない旨を明記する。(3) flavor traits は実効頻度（書き出しJSONの effective_frequency を正とし、無ければ frequency ?? level、level 既定 3）を「頻度: N/5」として、scenes を「場面: …」として性格の特徴へ反映し、実効頻度 0 の項目は除外する。video_urls / unreadable_videos / video_processed_urls / preparation 系 / portrayal_focus_checks は生成に使わず source_json に保持のみ。
+- **設定編集フォーム（C）**: getCharacterSettingsForm / updateCharacterSettings に portrayal_focus（本文）・video_urls（行リスト）・video_notes を追加。編集画面の「背景」セクションに「演じる姿・状況」「参考動画URL」、「話し方」セクションに「口調の参考資料（参考動画の所見）」を追加。portrayal_focus_status などフォーム外の項目は元の source_json の値を保持する現行仕様を維持。
+- **レビュー機能（D）**: getReviewWorkItems の指示文に、新項目の意味（portrayal_focus は演じる姿の指定であり portrayal_focus_status が "failed" の場合は無効である事、video_notes は口調の参考資料である事）と、指摘と無関係に書き換えない旨を追記。completeReview の検証は現行のまま。
+- **画面文言**: 空状態とJSON貼り付け追加の説明文の「アバターテンプレ管理」を「アバター総合管理」へ更新。
+- **データ**: スキーマ変更なし（既存カラムのみ使用）。
+
+## v3.1 変更（2026-11-25、再取り込みで重複登録が生じる問題の修正）
+- **事象・原因**: v3.0 の取り込み実行時、11件が既存キャラの更新ではなく新規キャラとして登録され、「（名前）2」の重複になった。アバター総合管理のプロファイルは全て新しいID（av_mwv…系）で作り直されており、キャラチャット側の既存キャラが保持する旧アプリ由来の source_profile_id と一致しなかったため、`importCharacter` が既存キャラを見つけられなかった。
+- **修正1（照合の拡張）**: `importCharacter` の照合を拡張。source_profile_id で既存キャラが見つからない場合、書き出しJSONの name と完全一致する既存キャラ（同名が複数ある場合はIDが最も小さいもの）を更新対象とする。その際、そのキャラの source_profile_id を新しいIDへ付け替えるため、以後はIDで一致する。会話履歴・カテゴリ・参加グループはキャラ行に紐付くため保持される。IDでも名前でも見つからない場合のみ新規作成する。
+- **修正2（仲介手順の明確化）**: IMPORT_MESSAGE を明確化。取り込み対象は listProfiles で得られる全プロファイル（全件）である事、各プロファイルについて必ず getImageData を試す事、external_url の場合は画像なしで済ませず書き出しJSONの images[].file のURLを取得して画像を渡す事、報告には総件数と取り込み件数を併記し不一致時は理由を明記する事を明記した（前回は37件中11件しか取り込まれず、画像も大半付かなかったため）。
+- **データ**: スキーマ変更なし（既存カラムのみ使用）。重複11件の削除と全件の再取り込みは、この修正の反映後に別途実施する。
+
+## v3.2 変更（2026-11-25、ナレーション機能・設計書 v3.1）
+- **概要**: グループチャットに「ナレーション」を追加。ゲスト/モブと同様にグループごとに ON/OFF を指定できる（既定 OFF）。対象はグループチャットのみ（1対1には付けない）。ナレーションにキャラ付けはせず、次の会話までに起きた事（背景説明・場面転換・時間経過）をただ記載する。
+- **データ**: migration 0014 で `groups.allow_narration` と `schedules.allow_narration`（integer、既定0）を追加。ナレーションの発言は `group_messages` に kind="narration"（character_id=null、speaker_name=""）として保存する（schema.ts の kind enum へ "narration" を追加）。
+- **生成**: ON のグループでは getWorkItems のシステムプロンプト末尾へ「--- ナレーションのルール ---」を追加（場面の立ち上げ・転換・時間経過の時だけ控えめに使う、キャラ付けしない、出力形式は「【ナレーション】本文」の専用行）。OFF のグループのプロンプトは従来と完全に同一。次回以降の生成では、ナレーションも履歴の文脈に「【ナレーション】本文」として含める（起きた事として確定した事実として扱う）。
+- **分割**: splitGroupOutput に allowNarration オプションを追加。「【ナレーション】」で始まる行をコロン判定より先に narration として分ける。ナレーションだけの出力も有効な生成結果として受理する。completeRequest はグループの allow_narration を見て有効化する。
+- **表示**: 吹き出しにせず、アバター・名前なしで中央揃えのシステムメッセージ形式（控えめな色・小さめの文字）。未読数・「新着」区切りは通常発言と同じ扱い（groupUnreadCount / groupFirstUnreadSeq の対象に narration を追加）。レビュー対象にはしない（kind="character" のみが対象のまま）。
+- **全文出力**: exportGroupText ではナレーション行は発言者名を付けず、その文面のまま1行として出す。
+- **設定導線**: グループ作成時にも選択でき（createGroup の allow_narration）、グループ設定メニューの「ゲスト・モブ・ナレーションの設定」シートから後から変更できる（setGroupGuestMob に allow_narration を追加）。
+- **スケジュール**: 新規チャット型のスケジュールはゲスト/モブと同様に allow_narration をスケジュール側に持ち（scheduleInputSchema / scheduleToOut へ追加）、作成されるグループへ引き継ぐ。既存グループ型はそのグループの設定に従う。
+
+## v3.3 変更（2026-11-25、Claude通知が届かない問題の修正・通知経路をアウトボックス方式へ）
+- **事象**: 全体設定「返信が届いたらClaudeに通知する」を ON にしたのに、返信が届いても Muse からの通知メッセージが来ない（利用者報告）。本番データで確認: 設定は ON（meta の `pref_notify_reply` = 1）、設定有効後に返信が2件完了（11:06 グループ「ランダムバトル 11/25 07:10」、11:43 グループ「ライスシャワー・テスト用キャラ」）していたが、通知は1件も届いていなかった。
+- **原因**: v2.1 の通知は `completeRequest` / `failRequest` の処理中から `ctx.agent.spawnTask` で通知専用タスクを起動し、そのタスクの最終報告がユーザーのチャットへ届く想定だった。しかし completeRequest 等を呼ぶのは仲介エージェント自身であり、その文脈から起動したタスクの報告はユーザーのチャットへ届かない。仲介自身の最終報告も「処理件数のみ」と指示されているため、通知文が表に出る経路が存在しなかった。サンドボックスでも同じ呼び出し方（エージェントが completeRequest を呼ぶ）で再現し、どこにも通知が届かないことを確認した。
+- **修正（通知経路の変更）**: 通知文をその場でタスク起動せず、meta の `notify_outbox`（未送信の通知キュー、JSON配列・最大20件・id で重複排除）へ積む方式に変更した（`enqueueNotification` / `readNotifyOutbox`）。返信到着は id `reply-<request_id>`、ログイン切れは id `auth-error` で積む。ログイン切れの30分に1回までの抑制（`last_auth_notify_at`）はキューへ積む時点で判定する（従来通り）。
+- **受け渡し**: 新アクション `getPendingNotifications`（未送信一覧）と `ackNotifications`（受け渡し済み化）を追加。MEDIATOR_MESSAGE に手順5「通知の受け渡し」を追加し、仲介は全処理の最後に必ずこれを実行する: 未送信があれば各 text を一字も変えずに最終報告へ含め、ack で受け渡し済みにする。仲介の最終報告はメインのエージェントへ届くため、そこからユーザーのチャットへ通知される。返信・レビューの対象が空でも手順5は実行する（手順1の「空なら終了」を手順5へ進む形に変更）。
+- **起動の保証**: `runSignalAll` は、返信・レビューの対象が無くても通知キューに未送信があるだけで仲介を起動するよう変更した。1分間隔の定期の合図（signalall）で通知だけでも必ず流れる。
+- **廃止**: `spawnUserNotification`（spawnTask による通知タスク起動）は経路ごと削除した。全体設定の ON/OFF・文言・対象（返信到着＝設定 ON の時、ログイン切れ＝設定にかかわらず）は v2.1 の仕様通り維持。
+- **検証**: サンドボックスで実動作を確認: (1) 設定 ON で completeRequest → `reply-<id>` が正しい文面でキューに入る。(2) ackNotifications で取り除かれる。(3) failRequest(auth_error) → `auth-error` が積まれ、30分以内の2回目は重複しない。(4) 設定 OFF では返信通知が積まれない（ログイン切れは積まれる）。(5) 通知だけが残った状態で signalAll が正常に動作する。仲介の最終報告が実際のチャットへ届くところは、本番で次の返信が届いた時が実地確認となる。
+- **データ**: スキーマ変更なし（meta の新キー `notify_outbox` のみ追加）。
+
+## v3.4 変更（2026-11-25、Claude通知が届かない問題の再修正・配送を専用cronへ分離）
+- **事象**: v3.3（アウトボックス方式）の反映後も通知が届かない（利用者報告「通知来てないよね？」）。修正後に返信が3件完了（12:26「しのさテスト用キャラ」、12:46 長門有希、13:07 自動生成）しても通知は1件も表示されなかった。
+- **原因の確定**: 本番相当データで確認: 設定は ON、通知キュー（notify_outbox）は空。つまり通知文は正しく積まれ、仲介が手順5で受け取り ack 済みにしていた（キューが空に戻るのはその証拠）。欠けていたのは最後の一区間「仲介の最終報告→ユーザーのチャット表示」である。仲介はチャット配送を持たない定期実行（space_action の合図 chara-chat-signal-sweep、1分間隔）の中から spawnTask で起動されており、その最終報告がユーザーのチャットへ届く経路は実在しない。v3.3 の前提「仲介の最終報告はメインのエージェントへ届く」は成立していなかった。
+- **修正（配送経路の分離）**: 通知の受け渡しを仲介から完全に切り離し、チャット配送先を明示したエージェント型の定期実行を新設した。cron `chara-chat-notify-delivery`（所有者 space:kiyaratiyatuto、1分間隔、execution.kind=agent、delivery=ユーザーのメインチャット）: ワーカーが getPendingNotifications を呼び、空なら何も報告せずに終了し、あれば ackNotifications で受け渡し済みにした上で、各 text を原文のまま最終報告とする（その報告がスケジューラの配送でチャットへ表示される）。
+- **競合の除去**: MEDIATOR_MESSAGE から手順5（通知の受け渡し）を削除し、手順4で「getPendingNotifications / ackNotifications は呼ばないこと」と明記した（仲介が先に ack すると配送cronから通知が消えるため）。あわせて runSignalAll の「通知だけでも仲介を起動する」条件を撤去し、signalAll の説明も更新した。キューへ積む側（enqueueNotification / maybeNotifyReply / notifyAuthFailure、設定 ON/OFF・文言・30分抑制）は v3.3 のまま変更なし。
+- **検証**: (1) サンドボックスで postMessage → beginRequest → completeRequest の実動作により、`reply-<id>` が正しい文面でキューへ積まれること、getPendingNotifications で読めること、ackNotifications で取り除かれて空に戻ることを確認。(2) 配送cronを本番で1回手動実行し、本番キューが空の状態で「報告なし（result_summary=null）」で正常終了し、チャットへ余計なメッセージが出ないことを確認。キューに通知がある状態での実配送は、次に本番で返信が届いた時（最大で約1分遅れ）に確定する。
+- **データ**: スキーマ変更なし。運用追加: cron `chara-chat-notify-delivery`（アプリ所有のスケジュール。削除すると通知配送が止まる）。
+
+## v3.5 変更（2026-11-25、ナレーションが「分割できなかった出力」と表示される問題の修正）
+
+- **症状**: ナレーションONのグループ（本番ではグループ2「ライスシャワー・テスト用キャラ」）で、ナレーション部分が「分割できなかった出力」（kind=raw の赤枠）として表示された。
+- **原因**: 生成（リクエスト96）の生レスポンスが、ナレーション行に `` マーカーを付けず地の文のまま出力していた（冒頭「翌朝、三人は近くの山のふもとに来ていた。」と中間の「しばらくして、山頂。」）。分割処理はマーカー行しか narration と判定しないため、冒頭の地の文は話者なし・直前行なしで raw（異常）になり、出力全体が abnormal 扱いになった。中間の地の文は直前のキャラ発言（テスト用キャラ）の続きとして吹き出し内に取り込まれた。プロンプト側も、基本ルール「セリフ本文以外の行は出さない」とナレーション許可の関係が曖昧で、マーカー必須が弱かった。
+- **修正1（分割の救済、splitGroupOutput）**: ナレーション許可時のみ、コロン判定に当たらない非空行が「空行で区切られた段落の先頭」（出力冒頭を含む）に来た場合は、直前の発言の続きではなく narration として受ける。空行を挟まない行は従来通り直前の発言の続き（台詞内の改行を誤判定しない）。あわせてマーカー判定は行頭の空白を許容する。
+- **修正2（プロンプト強化）**: ナレーションルールに「書く時は必ず行頭にを付けること」「マーカー無しの地の文・ト書きは出さないこと」「基本ルールの例外はマーカー付きナレーション行だけであること」を明示した。
+- **修正3（既存データの修復、マイグレーション0015）**: ナレーション許可グループ内の kind='raw' 行のうち、話者行パターン（コロン）を含まず短いもの（＝マーカー無し地の文とみられる行）を kind='narration'・split_status='normal' へ付け替える。本番の該当は上記1行のみ。キャラの吹き出し内に取り込まれた地の文（「しばらくして、山頂。」）は seq を伴う分割が危険なため既存行はそのまま残し、今後の生成は修正1で正しく分かれる。
+- **検証（実施済み）**: サンドボックスで実動作確認。(1) リクエスト96と同型の出力を completeRequest へ投入 → 冒頭・中間の地の文が両方とも narration に分かれ、全行 split_status=normal、raw 無し。(2) マーカー付きナレーション＋空行なしの台詞継続行 → マーカー行は narration、継続行は直前の台詞へ正しく連結（誤判定なし）。(3) ナレーションOFFのグループへ同型の出力を投入 → 従来通り raw/abnormal（OFF時の挙動は不変）。(4) getWorkItems の組み立て済みプロンプトに強化したルール文が含まれることを確認。(5) マイグレーション0015をサンドボックスへ適用し、行552が kind=narration・split_status=normal へ修復され、raw 行が0件になったことを確認。
+
+## v3.6 変更（2026-11-25、冗長整理: プロンプト統合・ルール短縮・表示文簡潔化・互換経路の段階整理）
+
+精査＋Claude再レビューを経て利用者が承認した確定案の反映。生成の意味論（出力形式・発言数・1対1の長さ目安・なりきり2モードの違い・話題提供者条）は不変。既存データは変更していない。
+
+- **グループ用プロンプトの統合**: getWorkItems の systemPromptBase 3変種（なりきり・自分だけ／なりきり・AIも演じる／通常）を「共通骨格＋モード差分」へ統合。差分として明示的に保持するのは5点: (1) 導入文（「掛け合いを書きます」／「掛け合いの続きを書きます」）、(2) なりきり対象の扱い2条、(3) 名前表（自分だけ変種は対象を除外、他は全員）、(4) 発言数（なりきり両変種4〜10／通常6〜12、最低1発言の言い回しの差を含む）、(5) 通常変種だけにある話題提供者条。共通定数化は捏造禁止・口外禁止の趣旨部分（RULE_NO_FABRICATION / RULE_NO_DISCLOSURE）のみに限定し、出力形式条は用途ごと（1対1／グループ／レビュー）に残した。
+- **検証（プロンプト照合）**: 統合前後の組み立てコードを抽出し、「3モード×ゲスト（OFF／ON・候補あり／ON・候補なし）×モブ ON/OFF×ナレーション ON/OFF×背景情報あり/なし」の全72組合せで全文照合。OFF側はバイト単位で完全一致、ON側は差分がゲスト・モブ／ナレーションのルール節の中だけに限定されることを確認した。
+- **ルールの短縮**: ナレーションルール4条を1条へ集約（「セリフ本文以外の行は出さない」の例外宣言＝マーカー行だけが例外、は文中に保持。落とすと v3.5 で直した分割事故が再発するため）。ゲスト／モブは「必要な時だけ・毎回登場するとは限らない」を共通注記（ゲスト・モブ共通条）へ分離して各条を短縮。ゲスト固有の実質的内容（候補の設定に沿う、候補外の実在キャラも可）は保持。禁止事項の1条集約と関係条の捏造重なりは削減量が小さいため行っていない。
+- **表示文の簡潔化**: CharacterMenuSheet の5項目の description を1行の要点のみへ。設定編集フォーム冒頭（3文→1文）、画像変更シート冒頭（2文→1文）、表示名変更シート冒頭（2文→1文）、キャラ設定閲覧シート末尾の案内文（2文→1文）を圧縮。ExportSheet 冒頭は既に1文のため対象外。
+- **互換経路の整理（即削除なし・順序厳守）**: (1) beginRequest のプロンプト記録フォールバックは、現行仲介指示がプロンプトを渡さず手動呼び出しの形跡も無いことを確認し、削除候補として description とコメントに明記（コードは残置）。(2) kickInitialImport は requestImport と同じ実体 runRequestImport への委譲に変更（公開アクション名は両方残す）。(3) char_group_categories はクライアント未使用を確認し、返す側（listHome の応答項目）→保存側（saveListPrefs の任意項目と meta 書き込み）の順で撤去（meta の既存値 pref_char_group_categories はデータとして残置）。(4) categories の旧カラム二重同期は、まず読み側（categoryIdsByCharacter の旧カラムフォールバック）を除去し、除去前後の listHome 比較で全37キャラの割り当てが完全一致（実データの category_id と character_categories の一致）を確認した上で、書き側の同期（replaceCharacterCategories の先頭カテゴリ同期、deleteCategory の再同期）を停止した。旧カラムは移行時点の値を保持するだけになった。
+- **今回触らなかったもの**: listHome／runSignalAll の N+1 全走査、送信ごとの runSignalAll 再実行（v1.4.1 の事故対策）、sweepTimeouts、addAppLog の剪定方式、ゲスト候補設定抜粋（800字×全非参加キャラ）の計測、profileToParts のキャラ設定本文。
