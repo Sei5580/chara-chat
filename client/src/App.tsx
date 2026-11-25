@@ -17,6 +17,7 @@ const FIELDS = actionFields<typeof Actions>();
 
 type Home = ApiResponse<typeof api, "listHome">;
 type CharacterItem = Home["characters"][number];
+type GroupItem = Home["groups"][number];
 type ChatState = ApiResponse<typeof api, "getChatState">;
 type GroupState = ApiResponse<typeof api, "getGroupState">;
 type RequestInfo = ChatState["request"];
@@ -41,6 +42,7 @@ const FAIL_REASONS: Record<string, string> = {
   rate_limited: T.failReasons.rateLimited,
   auth_error: T.failReasons.authError,
   generation_error: T.failReasons.generationError,
+  pending_timeout: "返信の生成が始まらないまま時間切れになりました。時間をおいて再度お試しください",
 };
 
 function failReasonLabel(reason: string): string {
@@ -157,7 +159,10 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
   if (request.status === "failed") {
     return (
       <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--danger)" }} role="status">
-        {failReasonLabel(request.fail_reason)}{T.requestBanner.failedSuffix}
+        <p>{failReasonLabel(request.fail_reason)}{T.requestBanner.failedSuffix}</p>
+        {request.fail_detail ? (
+          <p className="mt-1 text-xs whitespace-pre-wrap break-words" style={{ color: "var(--dim)" }}>詳細: {request.fail_detail}</p>
+        ) : null}
       </div>
     );
   }
@@ -169,6 +174,115 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
       {request.status === "processing"
         ? T.requestBanner.generating(isGroup ? T.requestBanner.groupWord : T.requestBanner.replyWord, formatElapsed(elapsed))
         : T.requestBanner.waiting(isGroup ? T.requestBanner.groupWord : T.requestBanner.replyWord, formatElapsed(elapsed))}
+    </div>
+  );
+}
+
+/** 「自動」の議題の出所ラベル（ローカル改善#6: 上流リポジトリには無い）。 */
+const TOPIC_SOURCE_LABELS: Record<string, string> = {
+  news: "時事ネタ",
+  interest: "キャラの興味",
+  profile: "プロフィール",
+  muse: "Museの出来事",
+  context: "会話の流れ",
+  season: "季節・今日は何の日",
+  hypothetical: "もしも・二択",
+  contrast: "キャラ対比",
+};
+
+/** 「自動」の短い説明文（ローカル改善#6改訂）。ボタンのそばと設定シートで共用する。 */
+const AUTO_TOPIC_HINT =
+  "トークの前ならランダムな議題、トーク中なら会話にちなんだ議題を出します。たまに無関係な話も出ます。";
+
+/** 「自動」の議題の投稿カード（ローカル改善）。利用者の発言ともキャラの発言とも
+ *  区別できるよう、中央に「自動」と分かる形で表示する。 */
+function TopicCard({ body, source }: { body: string; source: string }) {
+  const label = TOPIC_SOURCE_LABELS[source];
+  return (
+    <div
+      className="w-full max-w-[92%] rounded-2xl px-4 py-3"
+      style={{ background: "var(--accent-soft)", border: "1.5px dashed var(--gold)" }}
+    >
+      <p className="text-xs font-black" style={{ color: "var(--gold)" }}>
+        自動{label ? `（${label}）` : ""}
+      </p>
+      <p className="mt-1 text-base whitespace-pre-wrap" style={{ color: "var(--text)" }}>{body}</p>
+    </div>
+  );
+}
+
+/** 「自動」の設定シート（ローカル改善）。各チャットの設定メニューから開く。
+ *  オンにすると、会話が一区切りして入力待ちのまま30分動きが無い時に、
+ *  議題が1つ自動で投稿されてキャラが反応する。 */
+function AutoTopicSheet({
+  targetKind,
+  targetId,
+  targetName,
+  currentEnabled,
+  onClose,
+}: {
+  targetKind: "chat" | "group";
+  targetId: number;
+  targetName: string;
+  currentEnabled: boolean;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [enabled, setEnabled] = useState(currentEnabled);
+  const [error, setError] = useState("");
+  const save = useMutation({
+    mutationFn: async () => await api.setAutoTopic({ target_kind: targetKind, target_id: targetId, enabled }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: [targetKind === "chat" ? "chat" : "group", targetId] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+  });
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="自動の設定">
+      <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>自動の設定</h2>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>{targetName}</p>
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+          「自動」は、話題を自動で出してくれる機能です。{AUTO_TOPIC_HINT}出所は、時事ネタ（人気記事から）・キャラのプロフィールや興味・季節や今日は何の日・もしもや二択・キャラ同士の対比などです。
+        </p>
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+          自動投稿をオンにすると、会話が一区切りして、あなたの入力待ちのまま30分動きがなかった時に、議題が1つ自動で投稿されてキャラクターが反応します。あなたの発言がないままの自動投稿は連続3回までで止まり、あなたが発言すると数え直します。生成中・返信待ちの間は投稿されません。
+        </p>
+        <div className="mt-4 flex flex-col gap-2">
+          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: enabled ? "var(--accent-soft)" : "var(--surface-alt)" }}>
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+              aria-label="自動の自動投稿をオンにする"
+              className="mt-0.5 h-5 w-5 shrink-0"
+            />
+            <span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>自動投稿</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+                入力待ちが30分続いたら、議題を自動で投稿します（既定はオフ）。
+              </span>
+            </span>
+          </label>
+        </div>
+        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <div className="mt-4 flex gap-3">
+          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            キャンセル
+          </button>
+          <button
+            type="button"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+            style={{ background: "var(--accent)" }}
+          >
+            {save.isPending ? "保存中…" : "保存する"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -643,6 +757,7 @@ function CharacterMenuSheet({
   onEditImage,
   onRename,
   onSetCategory,
+  onAutoTopic,
 }: {
   character: CharacterItem;
   onClose: () => void;
@@ -651,6 +766,7 @@ function CharacterMenuSheet({
   onEditImage: () => void;
   onRename: () => void;
   onSetCategory: () => void;
+  onAutoTopic: () => void;
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
     { label: T.characterMenu.viewSettings, description: T.characterMenu.viewSettingsDesc, onSelect: onViewSettings },
@@ -658,6 +774,7 @@ function CharacterMenuSheet({
     { label: T.characterMenu.editImage, description: T.characterMenu.editImageDesc, onSelect: onEditImage },
     { label: T.characterMenu.rename, description: T.characterMenu.renameDesc, onSelect: onRename },
     { label: T.characterMenu.setCategory, description: T.characterMenu.setCategoryDesc, onSelect: onSetCategory },
+    { label: "自動の設定", description: "トークの前ならランダム、トーク中なら会話にちなんだ議題を自動で出します。入力待ちが30分続いた時の自動投稿もここで設定します（このキャラとの会話だけの設定です）", onSelect: onAutoTopic },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.characterMenu.menuAria(character.display_name)}>
@@ -1854,7 +1971,12 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
               <p className="mt-2 text-xs font-bold" style={{ color: "var(--dim)" }}>{T.reviewHistory.feedbackHeading}</p>
               <p className="mt-0.5 text-sm whitespace-pre-wrap" style={{ color: "var(--text)" }}>{r.feedback}</p>
               {r.status === "failed" && (
-                <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{reviewFailLabel(r.fail_reason)}{T.reviewHistory.failedNoteSuffix}</p>
+                <>
+                  <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{reviewFailLabel(r.fail_reason)}{T.reviewHistory.failedNoteSuffix}</p>
+                  {r.fail_detail ? (
+                    <p className="mt-1 text-xs whitespace-pre-wrap break-words" style={{ color: "var(--dim)" }}>{T.reviewHistory.failDetailLabel(r.fail_detail)}</p>
+                  ) : null}
+                </>
               )}
               {r.status === "no_change" && (
                 <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.reviewHistory.noChangeNote}</p>
@@ -1993,18 +2115,62 @@ function sortCharactersBy(list: CharacterItem[], sort: CharSort): CharacterItem[
   });
 }
 
+/** グループ一覧の各行から開く小さなメニュー（ローカル改善: 上流リポジトリには無い）。
+ * 控えめなボトムシートで、赤字の「削除」だけを置く。実際の削除は呼び出し側が
+ * 既存の確認ダイアログを挟んでから deleteGroup を呼ぶ。 */
+function GroupListMenuSheet({
+  group,
+  onClose,
+  onDelete,
+}: {
+  group: GroupItem;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.home.groupMenuAria(group.name)}>
+      <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <h2 className="font-display min-w-0 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{T.home.groupMenuTitle(group.name)}</h2>
+        <div className="mt-4 flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={onDelete}
+            className="w-full rounded-2xl px-4 py-3 text-left"
+            style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+          >
+            <span className="block font-bold" style={{ color: "var(--danger)" }}>{T.home.groupDelete}</span>
+            <span className="mt-0.5 block text-xs" style={{ color: "var(--dim)" }}>{T.home.groupDeleteDesc}</span>
+          </button>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-4 w-full rounded-full px-4 py-2.5 font-bold"
+          style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+        >
+          {T.common.close}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function HomeView({ go }: { go: (v: View) => void }) {
   const queryClient = useQueryClient();
   const home = useQuery({ queryKey: ["home"], queryFn: () => api.listHome({}), refetchInterval: 20000 });
   const [showImport, setShowImport] = useState(false);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [confirmDeleteChar, setConfirmDeleteChar] = useState<CharacterItem | null>(null);
+  const [menuGroup, setMenuGroup] = useState<GroupItem | null>(null);
+  const [confirmDeleteGroup, setConfirmDeleteGroup] = useState<GroupItem | null>(null);
+  const [deleteGroupError, setDeleteGroupError] = useState("");
   const [imageEditChar, setImageEditChar] = useState<CharacterItem | null>(null);
   const [menuChar, setMenuChar] = useState<CharacterItem | null>(null);
   const [viewSettingsChar, setViewSettingsChar] = useState<CharacterItem | null>(null);
   const [editSettingsChar, setEditSettingsChar] = useState<CharacterItem | null>(null);
   const [renameChar, setRenameChar] = useState<CharacterItem | null>(null);
   const [categoryAssignChar, setCategoryAssignChar] = useState<CharacterItem | null>(null);
+  const [autoTopicChar, setAutoTopicChar] = useState<CharacterItem | null>(null);
   const [showCategoryManage, setShowCategoryManage] = useState(false);
   // カテゴリ絞り込み: "all" = 全て表示 / "none" = 未分類のみ / 数値 = そのカテゴリのみ。
   const [categoryFilter, setCategoryFilter] = useState<"all" | "none" | number>("all");
@@ -2098,10 +2264,74 @@ function HomeView({ go }: { go: (v: View) => void }) {
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
+  // グループ一覧からの削除（ローカル改善: 上流リポジトリには無い）。
+  // 実処理は既存の deleteGroup を使う。生成中などサーバ側の制約で削除できない
+  // 場合は、そのエラーを確認ダイアログの下ではなく一覧付近に表示して分かるようにする。
+  const deleteGroupFromList = useMutation({
+    mutationFn: async (id: number) => await api.deleteGroup({ group_id: id }),
+    onSuccess: () => {
+      setConfirmDeleteGroup(null);
+      setMenuGroup(null);
+      setDeleteGroupError("");
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+    onError: (e) => {
+      setConfirmDeleteGroup(null);
+      setDeleteGroupError(e instanceof Error ? e.message : T.home.groupDeleteFailed);
+    },
+  });
+  // グループの「今すぐランダム作成」（ローカル改善#7改訂: 上流リポジトリには無い）。
+  // 抽選・人数決定・ゲスト/モブ/ナレーションのフラグ・自動命名はサーバ側の
+  // 共通経路（スケジュールの新規チャット型と同じ createRandomGroup）に任せ、
+  // クライアント側では抽選しない。作成のみで生成は開始しない。
+  // 成功したらそのグループ画面へ遷移する。
+  const [autoCreateError, setAutoCreateError] = useState("");
+  const autoCreateGroup = useMutation({
+    mutationFn: async () => await api.createRandomGroupNow({}),
+    onSuccess: (r) => {
+      setAutoCreateError("");
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      openView({ kind: "group", groupId: r.id, unreadFromSeq: null });
+    },
+    onError: (e) => setAutoCreateError(e instanceof Error ? e.message : "グループの作成に失敗しました"),
+  });
+  // 「スケジュールで自動作成」ボタン: 同じグループタブ内にあるスケジュール
+  // 管理セクションへのスクロール先。
+  const scheduleSectionRef = useRef<HTMLDivElement>(null);
   const importKick = useMutation({
     mutationFn: async () => await api.requestImport({}),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: ["import-status"] });
+    },
   });
-
+  // 一括取り込みのステータス（ローカル改善4の復元）: 状態をポーリングし、
+  // 取り込み中はバナーを出し、完了・失敗したら一覧を再取得して結果バナーを出す。
+  const importStatus = useQuery({
+    queryKey: ["import-status"],
+    queryFn: () => api.getImportStatus({}),
+    refetchInterval: (q) => (q.state.data?.state === "running" ? 5000 : 15000),
+  });
+  const [importBannerDismissedFor, setImportBannerDismissedFor] = useState<string | null>(null);
+  const importFinishedKey = importStatus.data?.finished_at ?? null;
+  const prevImportStateRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const st = importStatus.data?.state;
+    if (!st) return;
+    const prev = prevImportStateRef.current;
+    prevImportStateRef.current = st;
+    if ((st === "done" || st === "failed") && prev === "running") {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+    }
+  }, [importStatus.data?.state, queryClient]);
+  // 取り込み中の経過時間表示用に現在時刻を定期更新する。
+  const [importNow, setImportNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (importStatus.data?.state !== "running") return;
+    const t = setInterval(() => setImportNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, [importStatus.data?.state]);
   if (home.isPending) {
     return <p className="px-4 py-12 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>;
   }
@@ -2142,6 +2372,18 @@ function HomeView({ go }: { go: (v: View) => void }) {
     if (categoryFilter !== "all") return sortCharactersBy(characters.filter((c) => charMatchesCategory(c, categories, categoryFilter)), sort);
     return sortCharactersBy(characters, sort);
   })();
+
+  // 「今すぐランダム作成」の実行（ローカル改善#7改訂）。キャラが3人未満なら
+  // 作成せず、理由と現在の人数を表示する（サーバ側でも同じ文言で弾く）。
+  // 3人以上ならサーバ側の共通経路で即作成する（抽選はサーバ側）。
+  const handleAutoCreateGroup = () => {
+    if (characters.length < 3) {
+      setAutoCreateError(`グループを自動作成するにはキャラクターが3人以上必要です（現在${characters.length}人）。キャラを追加してください。`);
+      return;
+    }
+    setAutoCreateError("");
+    autoCreateGroup.mutate();
+  };
 
   // キャラ1件の描画（簡易表示の行／カード表示）。
   const renderCharRow = (c: CharacterItem, showChip: boolean = true) => (
@@ -2292,6 +2534,25 @@ function HomeView({ go }: { go: (v: View) => void }) {
           </button>
         ))}
       </div>
+      {importStatus.data?.state === "running" && (
+        <div className="mt-3 rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
+          {T.importStatus.runningBanner(
+            importStatus.data.started_at
+              ? formatElapsed(Math.max(0, Math.floor((importNow - new Date(importStatus.data.started_at).getTime()) / 1000)))
+              : "",
+          )}
+        </div>
+      )}
+      {importStatus.data && (importStatus.data.state === "done" || importStatus.data.state === "failed") && importFinishedKey && importBannerDismissedFor !== importFinishedKey && importStatus.data.finished_at && Date.now() - new Date(importStatus.data.finished_at).getTime() < 10 * 60 * 1000 && (
+        <div className="mt-3 flex items-start gap-2 rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)", color: importStatus.data.state === "failed" ? "var(--danger)" : "var(--text)" }} role="status">
+          <p className="min-w-0 flex-1">
+            {importStatus.data.state === "done" ? T.importStatus.doneBanner(importStatus.data.note) : T.importStatus.failedBanner(importStatus.data.note)}
+          </p>
+          <button type="button" onClick={() => setImportBannerDismissedFor(importFinishedKey)} aria-label={T.importStatus.dismissAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>
+            ×
+          </button>
+        </div>
+      )}
       {homeTab === "personal" && (
       <section aria-label={T.home.charactersSectionAria}>
         <div className="mt-4 flex items-center justify-between">
@@ -2370,13 +2631,22 @@ function HomeView({ go }: { go: (v: View) => void }) {
               <button
                 type="button"
                 onClick={() => importKick.mutate()}
-                disabled={importKick.isPending}
+                disabled={importKick.isPending || importStatus.data?.state === "running"}
                 className="rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
                 style={{ background: "var(--accent)" }}
               >
-                {T.home.bulkImport}
+                {importStatus.data?.state === "running" ? T.importStatus.running : T.home.bulkImport}
               </button>
-              {importKick.isSuccess && (
+              {importStatus.data?.state === "running" && (
+                <p className="text-xs" style={{ color: "var(--dim)" }}>{T.importStatus.runningNote}</p>
+              )}
+              {importStatus.data?.state === "done" && importStatus.data.note && (
+                <p className="text-xs" style={{ color: "var(--dim)" }}>{T.importStatus.doneNote(importStatus.data.note)}</p>
+              )}
+              {importStatus.data?.state === "failed" && (
+                <p className="text-xs" style={{ color: "var(--danger)" }}>{T.importStatus.failedNote(importStatus.data.note)}</p>
+              )}
+              {importKick.isSuccess && importStatus.data?.state !== "running" && !importStatus.data?.note && (
                 <p className="text-xs" style={{ color: "var(--dim)" }}>{T.home.importStarted}</p>
               )}
               <button
@@ -2410,15 +2680,51 @@ function HomeView({ go }: { go: (v: View) => void }) {
       <section aria-label={T.home.groupsSectionAria}>
         <div className="mt-4 flex items-center justify-between">
           <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>{T.home.groupsHeading}</h2>
+        </div>
+        {/* 作成エリア（ローカル改善#7改訂）: 手動作成の「グループを作る」を主役
+            として一番大きく一番上に置き、その下に自動作成の段として一段小さい
+            ボタンを2つ横並び・同格で置く（即座／スケジュールの2パターン）。 */}
+        <div className="mt-3 rounded-3xl p-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
           <button
             type="button"
             onClick={() => setShowCreateGroup(true)}
             disabled={characters.length < 1}
-            className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
-            style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+            className="w-full rounded-full px-4 py-3 text-base font-bold text-white disabled:opacity-40"
+            style={{ background: "var(--accent)" }}
           >
             {T.home.createGroup}
           </button>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={handleAutoCreateGroup}
+              disabled={autoCreateGroup.isPending}
+              className="rounded-2xl px-3 py-2.5 text-left disabled:opacity-50"
+              style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+              aria-label="今すぐランダム作成"
+            >
+              <span className="block text-sm font-bold">{autoCreateGroup.isPending ? "作成中…" : "今すぐランダム作成"}</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>押した瞬間に、ランダムな顔ぶれで作ります</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => scheduleSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
+              className="rounded-2xl px-3 py-2.5 text-left"
+              style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+              aria-label="スケジュールで自動作成"
+            >
+              <span className="block text-sm font-bold">スケジュールで自動作成</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>決めた時刻に、自動で作り続けます</span>
+            </button>
+          </div>
+          {characters.length < 3 && (
+            <p className="mt-2 text-sm leading-relaxed" role="status" style={{ color: "var(--danger)" }}>
+              グループを自動作成するにはキャラクターが3人以上必要です（現在{characters.length}人）。キャラを追加してください。
+            </p>
+          )}
+          {autoCreateError && characters.length >= 3 && (
+            <p className="mt-2 text-sm" role="alert" style={{ color: "var(--danger)" }}>{autoCreateError}</p>
+          )}
         </div>
         {groups.length === 0 ? (
           <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>
@@ -2426,45 +2732,61 @@ function HomeView({ go }: { go: (v: View) => void }) {
           </p>
         ) : (
           <>
+          {deleteGroupError && (
+            <p className="mt-3 text-sm" role="alert" style={{ color: "var(--danger)" }}>{deleteGroupError}</p>
+          )}
           <div className="mt-3 flex flex-col gap-3">
             {pageGroups.map((g) => (
-              <button
+              <div
                 key={g.id}
-                type="button"
-                onClick={() => openView({ kind: "group", groupId: g.id, unreadFromSeq: g.first_unread_seq })}
-                className="relative flex w-full items-center gap-3 rounded-3xl p-4 text-left"
+                className="relative flex w-full items-center gap-2 rounded-3xl p-4"
                 style={{ background: "var(--surface)" }}
-                aria-label={T.home.openGroupAria(g.name, g.unread_count)}
               >
                 {g.unread_count > 0 && (
                   <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 rounded-t-3xl" style={{ background: "var(--danger)" }} />
                 )}
-                <span className="flex -space-x-3">
-                  {g.member_image_urls.slice(0, 3).map((url, i) => (
-                    <Avatar key={i} imageUrl={url} name={g.member_names[i] ?? "?"} themeColor="" size={40} />
-                  ))}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="font-display block truncate font-bold" style={{ color: "var(--text)" }}>{g.name}</span>
-                  <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
-                    {g.status === "dissolved" ? T.home.groupDissolved : g.member_names.join("・")}
+                <button
+                  type="button"
+                  onClick={() => openView({ kind: "group", groupId: g.id, unreadFromSeq: g.first_unread_seq })}
+                  className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                  aria-label={T.home.openGroupAria(g.name, g.unread_count)}
+                >
+                  <span className="flex shrink-0 -space-x-3">
+                    {g.member_image_urls.slice(0, 3).map((url, i) => (
+                      <Avatar key={i} imageUrl={url} name={g.member_names[i] ?? "?"} themeColor="" size={40} />
+                    ))}
                   </span>
-                </span>
-                {g.unread_count > 0 && (
-                  <span
-                    className="flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full px-1 text-xs font-black text-white"
-                    style={{ background: "var(--danger)" }}
-                  >
-                    {g.unread_count}
+                  <span className="min-w-0 flex-1">
+                    <span className="font-display block truncate font-bold" style={{ color: "var(--text)" }}>{g.name}</span>
+                    <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
+                      {g.status === "dissolved" ? T.home.groupDissolved : g.member_names.join("・")}
+                    </span>
                   </span>
-                )}
-                <StatusBadge status={g.request_status} />
-                {g.unreplied_count > 0 && g.request_status === "none" && (
-                  <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>
-                    {T.status.unreplied(g.unreplied_count)}
-                  </span>
-                )}
-              </button>
+                  {g.unread_count > 0 && (
+                    <span
+                      className="flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full px-1 text-xs font-black text-white"
+                      style={{ background: "var(--danger)" }}
+                    >
+                      {g.unread_count}
+                    </span>
+                  )}
+                  <StatusBadge status={g.request_status} />
+                  {g.unreplied_count > 0 && g.request_status === "none" && (
+                    <span className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>
+                      {T.status.unreplied(g.unreplied_count)}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setDeleteGroupError(""); setMenuGroup(g); }}
+                  aria-label={T.home.groupMenuAria(g.name)}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-base leading-none"
+                  style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
+                >
+                  ⋯
+                </button>
+              </div>
             ))}
           </div>
           {groupPageCount > 1 && (
@@ -2498,6 +2820,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         )}
       </section>
 
+      <div ref={scheduleSectionRef} className="scroll-mt-4">
       <SchedulingSection
         data={schedulesQuery.data}
         isPending={schedulesQuery.isPending}
@@ -2506,6 +2829,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         onCreate={() => setScheduleSheet({ mode: "create" })}
         onEdit={(s) => setScheduleSheet({ mode: "edit", schedule: s })}
       />
+      </div>
       </>
       )}
 
@@ -2574,6 +2898,16 @@ function HomeView({ go }: { go: (v: View) => void }) {
           onEditImage={() => { setImageEditChar(menuChar); setMenuChar(null); }}
           onRename={() => { setRenameChar(menuChar); setMenuChar(null); }}
           onSetCategory={() => { setCategoryAssignChar(menuChar); setMenuChar(null); }}
+          onAutoTopic={() => { setAutoTopicChar(menuChar); setMenuChar(null); }}
+        />
+      )}
+      {autoTopicChar && (
+        <AutoTopicSheet
+          targetKind="chat"
+          targetId={autoTopicChar.id}
+          targetName={`${autoTopicChar.display_name}とのチャット`}
+          currentEnabled={autoTopicChar.auto_topic_enabled}
+          onClose={() => setAutoTopicChar(null)}
         />
       )}
       {categoryAssignChar && (
@@ -2610,8 +2944,44 @@ function HomeView({ go }: { go: (v: View) => void }) {
           onConfirm={() => deleteChar.mutate(confirmDeleteChar.id)}
         />
       )}
+      {menuGroup && (
+        <GroupListMenuSheet
+          group={menuGroup}
+          onClose={() => setMenuGroup(null)}
+          onDelete={() => { setConfirmDeleteGroup(menuGroup); setMenuGroup(null); }}
+        />
+      )}
+      {confirmDeleteGroup && (
+        <ConfirmSheet
+          title={T.group.deleteConfirmTitle}
+          body={T.group.deleteConfirmBody}
+          confirmLabel={T.common.deleteConfirm}
+          busy={deleteGroupFromList.isPending}
+          onCancel={() => setConfirmDeleteGroup(null)}
+          onConfirm={() => deleteGroupFromList.mutate(confirmDeleteGroup.id)}
+        />
+      )}
     </main>
   );
+}
+
+/** 書き出しJSONから代表画像のURLを取り出す（サーバ側が直接取得して保存する）。 */
+function extractProfileImageUrl(text: string): string | undefined {
+  try {
+    const p = JSON.parse(text) as {
+      images?: { file?: unknown; url?: unknown; is_primary?: unknown }[];
+      image_base?: { image_ref?: unknown };
+    };
+    const imgs = Array.isArray(p.images) ? p.images : [];
+    const primary = imgs.find((i) => i?.is_primary) ?? imgs[0];
+    const candidates = [primary?.url, primary?.file, p.image_base?.image_ref];
+    for (const c of candidates) {
+      if (typeof c === "string" && /^https?:\/\//.test(c)) return c;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ------------------------------------------------------------------ scheduling (v2.0 / B)
@@ -2715,7 +3085,11 @@ function SchedulingSection({
             <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{scheduleSummary(s)}</p>
             {(() => {
               const parts = [
-                s.target_type === "new" ? T.schedule.drawFromCategories(s.min_members, s.max_members) : "",
+                s.target_type === "new"
+                  ? s.category_ids.length === 0
+                    ? T.schedule.drawFromAll(s.min_members, s.max_members)
+                    : T.schedule.drawFromCategories(s.min_members, s.max_members)
+                  : "",
                 s.allow_guests ? T.schedule.guestsOn : "",
                 s.allow_mobs ? T.schedule.mobsOn : "",
                 s.target_type === "new" && s.allow_narration ? T.schedule.narrationOn : "",
@@ -2822,7 +3196,7 @@ function ScheduleEditSheet({
     if (times.map((t) => t.trim()).filter(Boolean).length === 0) { setError(T.scheduleEdit.timeRequired); return; }
     if (frequency === "weekly" && weekdays.length === 0) { setError(T.scheduleEdit.weekdayRequired); return; }
     if (targetType === "existing" && targetGroupId == null) { setError(T.scheduleEdit.targetGroupRequired); return; }
-    if (targetType === "new" && categoryIds.length === 0) { setError(T.scheduleEdit.categoryRequired); return; }
+    // ローカル改善: 新規チャット型でカテゴリ未指定の場合は全キャラが対象になるため、未指定でも保存できる。
     if (minMembers > maxMembers) { setError(T.scheduleEdit.membersRangeError); return; }
     setError("");
     save.mutate();
@@ -2994,7 +3368,7 @@ function ScheduleEditSheet({
               {T.scheduleEdit.drawCategoriesNote}
             </p>
             {categories.length === 0 && (
-              <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.common.noCategoriesYet}</p>
+              <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.scheduleEdit.noCategorySelected}</p>
             )}
             <div className="mt-2 flex flex-col gap-2" role="group" aria-label={T.common.categoryFilterGroupAria}>
               {categoryTreeEntries(categories).map(({ cat, depth }) => {
@@ -3028,6 +3402,11 @@ function ScheduleEditSheet({
                 );
               })}
             </div>
+            {categories.length > 0 && categoryIds.length === 0 && (
+              <p className="mt-2 rounded-2xl px-3 py-2 text-xs font-bold" role="status" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                {T.scheduleEdit.noCategorySelected}
+              </p>
+            )}
             <div className="mt-3 flex items-center gap-3">
               <label className="text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-min-members">{T.scheduleEdit.membersLabel}</label>
               <select
@@ -3197,7 +3576,7 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const importChar = useMutation({
-    mutationFn: async (text: string) => await api.importCharacter({ json: text }),
+    mutationFn: async (text: string) => await api.importCharacter({ json: text, image_url: extractProfileImageUrl(text) }),
     onSuccess: (r) => {
       setDone(r.is_new ? T.importSheet.addedNotice(r.display_name) : T.importSheet.updatedNotice(r.display_name));
       setJson("");
@@ -3205,8 +3584,36 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
     },
     onError: (e) => setError(e instanceof Error ? e.message : T.importSheet.importFailed),
   });
-  const importKick = useMutation({ mutationFn: async () => await api.requestImport({}) });
-
+  const importKick = useMutation({
+    mutationFn: async () => await api.requestImport({}),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: ["import-status"] });
+    },
+  });
+  // 一括取り込みのステータス（ローカル改善4の復元）: シートを開いている間も
+  // ポーリングし、閉じて開き直してもサーバ側の状態がそのまま分かる。
+  const importStatus = useQuery({
+    queryKey: ["import-status"],
+    queryFn: () => api.getImportStatus({}),
+    refetchInterval: (q) => (q.state.data?.state === "running" ? 5000 : 15000),
+  });
+  const prevSheetImportStateRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const st = importStatus.data?.state;
+    if (!st) return;
+    const prev = prevSheetImportStateRef.current;
+    prevSheetImportStateRef.current = st;
+    if ((st === "done" || st === "failed") && prev === "running") {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+    }
+  }, [importStatus.data?.state, queryClient]);
+  const [sheetNow, setSheetNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (importStatus.data?.state !== "running") return;
+    const t = setInterval(() => setSheetNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, [importStatus.data?.state]);
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.importSheet.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
@@ -3250,13 +3657,28 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
           <button
             type="button"
             onClick={() => importKick.mutate()}
-            disabled={importKick.isPending}
+            disabled={importKick.isPending || importStatus.data?.state === "running"}
             className="w-full rounded-full px-4 py-2.5 font-bold disabled:opacity-50"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            {T.importSheet.bulkImportWithImages}
+            {importStatus.data?.state === "running" ? T.importStatus.running : T.importSheet.bulkImportWithImages}
           </button>
-          {importKick.isSuccess && (
+          {importStatus.data?.state === "running" && (
+            <p className="mt-2 text-xs" style={{ color: "var(--dim)" }} role="status">
+              {T.importStatus.runningBanner(
+                importStatus.data.started_at
+                  ? formatElapsed(Math.max(0, Math.floor((sheetNow - new Date(importStatus.data.started_at).getTime()) / 1000)))
+                  : "",
+              )} {T.importStatus.runningNote}
+            </p>
+          )}
+          {importStatus.data?.state === "done" && (
+            <p className="mt-2 text-xs" style={{ color: "var(--dim)" }} role="status">{T.importStatus.doneBanner(importStatus.data.note)}</p>
+          )}
+          {importStatus.data?.state === "failed" && (
+            <p className="mt-2 text-xs" style={{ color: "var(--danger)" }} role="alert">{T.importStatus.failedBanner(importStatus.data.note)}</p>
+          )}
+          {importKick.isSuccess && importStatus.data?.state !== "running" && importStatus.data?.state !== "done" && importStatus.data?.state !== "failed" && (
             <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>{T.home.importStartedShort}</p>
           )}
         </div>
@@ -3427,6 +3849,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
   });
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState("");
+  const [topicError, setTopicError] = useState("");
   const [failNotice, setFailNotice] = useState("");
   const [cancelNotice, setCancelNotice] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
@@ -3492,6 +3915,16 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
     onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
+  });
+  // 「自動」ボタン（ローカル改善）: 押すと議題の仲介が起動し、少し遅れて
+  // 議題が投稿される。投稿されれば既存の経路で返信生成が始まる。
+  const topic = useMutation({
+    mutationFn: async () => await api.requestTopic({ target_kind: "chat", target_id: characterId }),
+    onSuccess: () => {
+      setTopicError("");
+      queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
+    },
+    onError: (e) => setTopicError(e instanceof Error ? e.message : "議題の投下に失敗しました"),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "chat", target_id: characterId }),
@@ -3650,6 +4083,13 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
       {req && <RequestBanner request={req} />}
 
+      {data?.topic_pending && (
+        <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
+          議題を準備中です…少し待つと議題が投稿されます。
+        </div>
+      )}
+
+
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none py-3">
         {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>}
@@ -3674,7 +4114,24 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                   <NewMessageDivider />
                 </div>
               )}
-              {m.speaker === "user" ? (
+              {m.is_topic ? (
+              <div className="flex flex-col items-center">
+                <TopicCard body={m.body} source={m.topic_source} />
+                <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
+                {m.id === cancelTargetId && (
+                  <button
+                    type="button"
+                    onClick={() => cancelSend.mutate()}
+                    disabled={cancelSend.isPending}
+                    aria-label="この送信を取り消す"
+                    className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+                    style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
+                  >
+                    送信を取り消す
+                  </button>
+                )}
+              </div>
+            ) : m.speaker === "user" ? (
               <div className="flex flex-col items-end">
                 <div className="max-w-[82%] rounded-3xl rounded-br-md px-4 py-2.5 text-base whitespace-pre-wrap text-white" style={{ background: "var(--accent)" }}>
                   {m.body}
@@ -3759,7 +4216,20 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
             <button type="button" onClick={() => setCancelNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
           </div>
         )}
+        <p className="mb-1.5 px-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+          「自動」: {AUTO_TOPIC_HINT}
+        </p>
         <div className="flex items-end gap-2 pb-2">
+          <button
+            type="button"
+            disabled={waiting || !!data?.topic_pending || topic.isPending}
+            onClick={() => topic.mutate()}
+            aria-label="自動で議題を投下する"
+            className="shrink-0 rounded-full px-3 py-2.5 text-sm font-bold disabled:opacity-50"
+            style={{ background: "var(--surface)", color: "var(--accent)", border: "1.5px solid var(--accent)" }}
+          >
+            自動
+          </button>
           <label className="sr-only" htmlFor="chat-input">{T.chat.inputLabel}</label>
           <textarea
             id="chat-input"
@@ -3791,6 +4261,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
           </button>
         </div>
         {sendError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{sendError}</p>}
+        {topicError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{topicError}</p>}
       </div>
 
       {showImageEdit && data && (
@@ -3958,7 +4429,7 @@ function RoleplaySheet({
   );
 }
 
-/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「背景情報を編集する」「グループを削除」の5つ。履歴の使用設定は設定一覧には無く、グループ画面上部のタブで切り替える。 */
+/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「背景情報を編集する」「自動の設定」「グループを削除」の6つ。履歴の使用設定は設定一覧には無く、グループ画面上部のタブで切り替える。 */
 function GroupMenuSheet({
   groupName,
   onClose,
@@ -3966,6 +4437,7 @@ function GroupMenuSheet({
   onEditMembers,
   onGuestMob,
   onBackground,
+  onAutoTopic,
   onDelete,
 }: {
   groupName: string;
@@ -3974,6 +4446,7 @@ function GroupMenuSheet({
   onEditMembers: () => void;
   onGuestMob: () => void;
   onBackground: () => void;
+  onAutoTopic: () => void;
   onDelete: () => void;
 }) {
   const items: { label: string; description: string; danger?: boolean; onSelect: () => void }[] = [
@@ -3981,6 +4454,7 @@ function GroupMenuSheet({
     { label: T.groupMenu.editMembers, description: T.groupMenu.editMembersDesc, onSelect: onEditMembers },
     { label: T.groupMenu.guestMob, description: T.groupMenu.guestMobDesc, onSelect: onGuestMob },
     { label: T.groupMenu.background, description: T.groupMenu.backgroundDesc, onSelect: onBackground },
+    { label: T.groupMenu.autoTopic, description: T.groupMenu.autoTopicDesc, onSelect: onAutoTopic },
     { label: T.groupMenu.deleteGroup, description: T.groupMenu.deleteGroupDesc, danger: true, onSelect: onDelete },
   ];
   return (
@@ -4405,6 +4879,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   });
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState("");
+  const [topicError, setTopicError] = useState("");
   const [failNotice, setFailNotice] = useState("");
   const [cancelNotice, setCancelNotice] = useState("");
   const [confirm, setConfirm] = useState<"delete" | null>(null);
@@ -4415,6 +4890,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   const [showEditMembers, setShowEditMembers] = useState(false);
   const [showGuestMob, setShowGuestMob] = useState(false);
   const [showBackground, setShowBackground] = useState(false);
+  const [showGroupAutoTopic, setShowGroupAutoTopic] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
   const [selectedReviewId, setSelectedReviewId] = useState<number | null>(null);
   const [reviewError, setReviewError] = useState("");
@@ -4473,6 +4949,16 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
     onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
+  });
+  // 「自動」ボタン（ローカル改善）: 1対1と同じく、押すと議題の仲介が
+  // 起動し、少し遅れて議題が投稿され、掛け合い生成が始まる。
+  const topic = useMutation({
+    mutationFn: async () => await api.requestTopic({ target_kind: "group", target_id: groupId }),
+    onSuccess: () => {
+      setTopicError("");
+      queryClient.invalidateQueries({ queryKey: ["group", groupId] });
+    },
+    onError: (e) => setTopicError(e instanceof Error ? e.message : "議題の投下に失敗しました"),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "group", target_id: groupId }),
@@ -4668,6 +5154,13 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
 
       {req && <RequestBanner request={req} isGroup />}
 
+      {data?.topic_pending && (
+        <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
+          議題を準備中です…少し待つと議題が投稿されます。
+        </div>
+      )}
+
+
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none py-3">
         {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>}
@@ -4690,6 +5183,29 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                 <NewMessageDivider />
               </div>
             ) : null;
+            if (m.kind === "user" && m.is_topic) {
+              return (
+                <Fragment key={m.id}>
+                  {divider}
+                  <div className="flex flex-col items-center">
+                    <TopicCard body={m.body} source={m.topic_source} />
+                    <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
+                    {m.id === cancelTargetId && (
+                      <button
+                        type="button"
+                        onClick={() => cancelSend.mutate()}
+                        disabled={cancelSend.isPending}
+                        aria-label="この送信を取り消す"
+                        className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+                        style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
+                      >
+                        送信を取り消す
+                      </button>
+                    )}
+                  </div>
+                </Fragment>
+              );
+            }
             // 区間の区切りはフレームの途切れと帯で示す（設計書 v3.3）。発言単位の
             // 区切り線は出さないため、historyDivider は常に null（各分岐の置き場は
             // 従来の構造を保つために残してある）。
@@ -4844,7 +5360,20 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
               <button type="button" onClick={() => setCancelNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
             </div>
           )}
+          <p className="mb-1.5 px-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+            「自動」: {AUTO_TOPIC_HINT}
+          </p>
           <div className="flex items-end gap-2 pb-2">
+            <button
+              type="button"
+              disabled={waiting || !!data?.topic_pending || topic.isPending}
+              onClick={() => topic.mutate()}
+              aria-label="自動で議題を投下する"
+              className="shrink-0 rounded-full px-3 py-2.5 text-sm font-bold disabled:opacity-50"
+              style={{ background: "var(--surface)", color: "var(--accent)", border: "1.5px solid var(--accent)" }}
+            >
+              自動
+            </button>
             <label className="sr-only" htmlFor="group-input">{T.group.inputLabel}</label>
             <textarea
               id="group-input"
@@ -4882,6 +5411,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             </button>
           </div>
           {sendError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{sendError}</p>}
+          {topicError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{topicError}</p>}
         </div>
       )}
 
@@ -4923,10 +5453,24 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             setShowGroupMenu(false);
             setShowBackground(true);
           }}
+          onAutoTopic={() => {
+            setShowGroupMenu(false);
+            setShowGroupAutoTopic(true);
+          }}
           onDelete={() => {
             setShowGroupMenu(false);
             setConfirm("delete");
           }}
+        />
+      )}
+
+      {showGroupAutoTopic && data && (
+        <AutoTopicSheet
+          targetKind="group"
+          targetId={groupId}
+          targetName={`グループ「${data.group.name}」`}
+          currentEnabled={data.auto_topic_enabled}
+          onClose={() => setShowGroupAutoTopic(false)}
         />
       )}
 

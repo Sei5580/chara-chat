@@ -263,6 +263,21 @@ export const TEXTS = {
     setFailed: "設定に失敗しました",
   },
 
+  // ------------------------------------------------------------ 一括取り込みのステータス（ローカル改善4の復元）
+  importStatus: {
+    running: "取り込み中…",
+    runningBanner: (elapsed: string) =>
+      elapsed ? `アバター管理から一括取り込み中です…（${elapsed}経過）` : "アバター管理から一括取り込み中です…",
+    runningNote: "取り込み中です。完了するまでしばらくお待ちください。このシートを閉じても取り込みは続きます。",
+    doneBanner: (note: string) => (note ? `取り込みが完了しました。${note}` : "取り込みが完了しました。"),
+    failedBanner: (note: string) => (note ? `取り込みに失敗しました。${note}` : "取り込みに失敗しました。"),
+    doneNote: (note: string) => (note ? note : "取り込みが完了しました。"),
+    failedNote: (note: string) => (note ? note : "取り込みに失敗しました。"),
+    dismiss: "閉じる",
+    dismissAria: "取り込み結果の表示を閉じる",
+    timeoutNote: "取り込みが20分以上終わらなかったため、時間切れとして終了しました。もう一度お試しください。",
+  },
+
   // ------------------------------------------------------------ レビュー
   review: {
     statusLabels: {
@@ -274,6 +289,8 @@ export const TEXTS = {
     } as Record<string, string>,
     failReasons: {
       timeout: "タイムアウト（10分以内に見直しが終わりませんでした）",
+      pending_timeout: "見直しが始まらないまま時間切れになりました",
+      auth_error: "生成に使うClaudeのログインセッションが切れています。再ログインすると直ります",
       rate_limited: "Claudeの利用上限に達しました",
       generation_error: "生成に失敗しました",
       invalid_json: "見直し結果がJSONとして読み取れませんでした",
@@ -325,6 +342,7 @@ export const TEXTS = {
     targetHeading: "対象の発言",
     feedbackHeading: "指摘",
     failedNoteSuffix: "（設定は変更されていません）",
+    failDetailLabel: (detail: string) => `詳細: ${detail}`,
     noChangeNote: "見直しの結果、設定の変更はありませんでした。",
     diffHeading: (n: number) => `設定の差分（${n}件）`,
     diffBefore: "変更前: ",
@@ -373,6 +391,11 @@ export const TEXTS = {
       "キャラ同士の掛け合いを楽しむグループは、まだありません。1人から作れて、なりきり機能で自分も参加できます。",
     openGroupAria: (name: string, unread: number) =>
       `グループ「${name}」を開く${unread > 0 ? `（未読の返信${unread}件）` : ""}`,
+    groupMenuAria: (name: string) => `グループ「${name}」のメニュー`,
+    groupMenuTitle: (name: string) => `グループ「${name}」`,
+    groupDelete: "削除",
+    groupDeleteDesc: "このグループと掛け合いログを全て削除します。元には戻せません",
+    groupDeleteFailed: "グループの削除に失敗しました",
     groupDissolved: "解散済み（ログの閲覧のみ）",
     prevPage: "前のページ",
     nextPage: "次のページ",
@@ -401,6 +424,7 @@ export const TEXTS = {
     targetMissing: "（対象グループなし）",
     targetNew: "毎回新規チャット",
     drawFromCategories: (min: number, max: number) => `カテゴリから${min}〜${max}人を抽選`,
+    drawFromAll: (min: number, max: number) => `全キャラから${min}〜${max}人を抽選`,
     guestsOn: "ゲストあり",
     mobsOn: "モブあり",
     narrationOn: "ナレーションあり",
@@ -451,9 +475,10 @@ export const TEXTS = {
       "なりきり設定が有効なグループは対象にできません。背景情報はグループ側の設定を使います。",
     targetGroupUnavailable: (name: string) => `${name}（現在は対象に選べません）`,
     unknownGroup: "（不明なグループ）",
-    drawCategoriesHeading: "抽選するカテゴリ（複数選択可）",
+    drawCategoriesHeading: "抽選するカテゴリ（複数選択可・任意）",
     drawCategoriesNote:
-      "選んだカテゴリ（子カテゴリを含む）に属するキャラクターの中から抽選します。未分類のキャラクターは対象になりません。",
+      "指定なし＝全キャラが対象です。カテゴリを選んだ場合は、そのカテゴリ（子カテゴリを含む）に属するキャラクターの中から抽選します。",
+    noCategorySelected: "指定なし＝全キャラが対象です",
     membersLabel: "人数",
     minMembersAria: "人数の最小",
     maxMembersAria: "人数の最大",
@@ -596,6 +621,9 @@ export const TEXTS = {
     background: "背景情報を編集する",
     backgroundDesc:
       "このグループの生成（通常・自動の両方）に常に添える背景情報（場所や状況など）を書きます。一度書けば使われ続けます",
+    autoTopic: "自動の設定",
+    autoTopicDesc:
+      "トークの前ならランダム、トーク中なら会話にちなんだ議題を自動で出します。入力待ちが30分続いた時の自動投稿もここで設定します（このグループだけの設定です）",
     deleteGroup: "グループを削除",
     deleteGroupDesc: "このグループと掛け合いログを全て削除します。元には戻せません",
   },
