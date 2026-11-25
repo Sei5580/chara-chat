@@ -4,19 +4,19 @@ import { SafeAreaTopScrim, setFailureNoticeText } from "@hatch/space-sdk/client"
 import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
 import type { Actions } from "../../server/src/actions";
 import { api, type ApiResponse } from "./api";
+import { TEXTS as T } from "./display-texts";
 
 setFailureNoticeText((error) => {
   const e = error as { issues?: unknown; message?: string } | null;
-  if (e && Array.isArray(e.issues)) return "入力内容を確認してください。";
+  if (e && Array.isArray(e.issues)) return T.notice.inputCheck;
   if (e?.message) return e.message;
-  return "うまくいきませんでした。もう一度お試しください。";
+  return T.notice.genericFailure;
 });
 
 const FIELDS = actionFields<typeof Actions>();
 
 type Home = ApiResponse<typeof api, "listHome">;
 type CharacterItem = Home["characters"][number];
-type GroupItem = Home["groups"][number];
 type ChatState = ApiResponse<typeof api, "getChatState">;
 type GroupState = ApiResponse<typeof api, "getGroupState">;
 type RequestInfo = ChatState["request"];
@@ -27,17 +27,24 @@ type View =
   // 一覧（listHome）が計算した値を遷移時に固定して渡し、開いている間に
   // 到着した返信では区切り位置が動かないようにする。未読が無ければ null。
   | { kind: "chat"; characterId: number; unreadFromSeq: number | null }
-  | { kind: "group"; groupId: number; unreadFromSeq: number | null };
+  | { kind: "group"; groupId: number; unreadFromSeq: number | null }
+  // 全体ログ（履歴ページ、設計書 v2.0 / D）。入口はホーム下部の目立たないリンク。
+  | { kind: "logs" };
+
+type SchedulesData = ApiResponse<typeof api, "listSchedules">;
+type ScheduleItem = SchedulesData["schedules"][number];
+type AppLogsData = ApiResponse<typeof api, "listAppLogs">;
+type AppLogItem = AppLogsData["logs"][number];
 
 const FAIL_REASONS: Record<string, string> = {
-  timeout: "タイムアウト（10分以内に生成が終わりませんでした）",
-  rate_limited: "Claudeの利用上限に達しました。時間をおいて再度お試しください",
-  auth_error: "生成に使うClaudeのログインセッションが切れています。再ログインすると直ります",
-  generation_error: "生成に失敗しました",
+  timeout: T.failReasons.timeout,
+  rate_limited: T.failReasons.rateLimited,
+  auth_error: T.failReasons.authError,
+  generation_error: T.failReasons.generationError,
 };
 
 function failReasonLabel(reason: string): string {
-  return FAIL_REASONS[reason] ?? (reason ? `生成に失敗しました（${reason}）` : "生成に失敗しました");
+  return FAIL_REASONS[reason] ?? (reason ? T.failReasons.withDetail(reason) : T.failReasons.fallback);
 }
 
 function formatClock(iso: string): string {
@@ -54,10 +61,10 @@ function isTouchPrimary(): boolean {
 }
 
 function formatElapsed(totalSeconds: number): string {
-  if (totalSeconds < 60) return `${totalSeconds}秒`;
+  if (totalSeconds < 60) return T.elapsed.seconds(totalSeconds);
   const m = Math.floor(totalSeconds / 60);
-  if (m < 60) return `${m}分`;
-  return `${Math.floor(m / 60)}時間${m % 60}分`;
+  if (m < 60) return T.elapsed.minutes(m);
+  return T.elapsed.hoursMinutes(Math.floor(m / 60), m % 60);
 }
 
 // チャット画面のレイアウト固定（v1.16 で整理）: 対策は次の2つだけに絞る。
@@ -131,11 +138,11 @@ function Avatar({
 
 function StatusBadge({ status }: { status: string }) {
   if (status === "pending")
-    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>返信待ち</span>;
+    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>{T.status.pending}</span>;
   if (status === "processing")
-    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>生成中</span>;
+    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{T.status.processing}</span>;
   if (status === "failed")
-    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--danger)" }}>失敗</span>;
+    return <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--danger)" }}>{T.status.failed}</span>;
   return null;
 }
 
@@ -150,7 +157,7 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
   if (request.status === "failed") {
     return (
       <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--danger)" }} role="status">
-        {failReasonLabel(request.fail_reason)}。送った文章は入力欄に戻してあります。
+        {failReasonLabel(request.fail_reason)}{T.requestBanner.failedSuffix}
       </div>
     );
   }
@@ -160,8 +167,8 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
   return (
     <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
       {request.status === "processing"
-        ? `${isGroup ? "掛け合い" : "返信"}を生成中です…（${formatElapsed(elapsed)}経過）`
-        : `${isGroup ? "掛け合い" : "返信"}待ちです（発言から${formatElapsed(elapsed)}）。生成には数分かかることがあります。`}
+        ? T.requestBanner.generating(isGroup ? T.requestBanner.groupWord : T.requestBanner.replyWord, formatElapsed(elapsed))
+        : T.requestBanner.waiting(isGroup ? T.requestBanner.groupWord : T.requestBanner.replyWord, formatElapsed(elapsed))}
     </div>
   );
 }
@@ -169,12 +176,74 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
 /** チャット画面内の「新着」区切り（LINE風、設計書 v1.8 / 4.9章）。未読の先頭発言の直前に置く。 */
 function NewMessageDivider() {
   return (
-    <div className="flex items-center gap-3 py-1" role="separator" aria-label="ここから新着の返信です">
+    <div className="flex items-center gap-3 py-1" role="separator" aria-label={T.divider.newMessagesAria}>
       <span aria-hidden="true" className="h-0.5 flex-1 rounded-full" style={{ background: "var(--danger)" }} />
-      <span className="text-xs font-black tracking-widest" style={{ color: "var(--danger)" }}>新着</span>
+      <span className="text-xs font-black tracking-widest" style={{ color: "var(--danger)" }}>{T.divider.newMessages}</span>
       <span aria-hidden="true" className="h-0.5 flex-1 rounded-full" style={{ background: "var(--danger)" }} />
     </div>
   );
+}
+
+/** 区間の帯: 区間と区間の間に置く、その区間で最初に生成された掛け合いの
+ * 生成日時（JST、日付＋時分）を載せる帯。帯の地は区間フレームより更に暗い色
+ * （--segment-band）で、上下のフレームの角丸の裏側まで回り込む（負マージンで
+ * フレームの下へ潜らせる）。フレームはこの帯の所でのみ角丸で「閉じて」見え、
+ * それ以外の場所では横幅いっぱいに通常の背景と連続する。 */
+function SegmentBand({ date }: { date: string | null }) {
+  return (
+    <div
+      className="relative z-0 -my-6 flex items-center justify-center py-9"
+      style={{ background: "var(--segment-band)" }}
+      role="separator"
+      aria-label={T.segment.bandAria(date)}
+    >
+      {date && (
+        <span className="text-xs font-bold tracking-wider" style={{ color: "var(--text)" }}>
+          {date}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** ISO日時を JST の "YYYY/MM/DD HH:MM" に整形する（区間の帯の日時用）。 */
+function formatSegmentDateTime(iso: string): string {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(iso));
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${get("year")}/${get("month")}/${get("day")} ${get("hour")}:${get("minute")}`;
+}
+
+type SegmentGroup<M> = { segmentNo: number; date: string | null; messages: M[] };
+
+/** 発言列を区間（segment_no の連続した並び）ごとにまとめる（設計書 v3.3）。
+ * 帯に載せる日時 date は、その区間の segment_date（サーバが付けた、その区間で
+ * 最初に履歴なし生成された掛け合いの生成日時）を優先し、区間に履歴なし生成が
+ * 無い場合は区間先頭の発言の作成日時（JST）を使う。 */
+function groupIntoSegments<M extends { segment_no: number; segment_date: string | null; created_at: string }>(
+  messages: M[],
+): SegmentGroup<M>[] {
+  const groups: SegmentGroup<M>[] = [];
+  for (const m of messages) {
+    const last = groups[groups.length - 1];
+    if (last && last.segmentNo === m.segment_no) {
+      last.messages.push(m);
+    } else {
+      groups.push({ segmentNo: m.segment_no, date: null, messages: [m] });
+    }
+  }
+  for (const g of groups) {
+    const first = g.messages[0];
+    g.date = g.messages.find((m) => m.segment_date)?.segment_date ?? (first ? formatSegmentDateTime(first.created_at) : null);
+  }
+  return groups;
 }
 
 /** チャット全文出力シート（設計書 v1.8 / 4.12章）。全履歴をプレーンテキストで表示し、全文コピーできる。 */
@@ -211,7 +280,7 @@ function ExportSheet({
           <button
             type="button"
             onClick={onClose}
-            aria-label="全文出力を閉じる"
+            aria-label={T.exportSheet.closeAria}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
             style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
           >
@@ -219,20 +288,20 @@ function ExportSheet({
           </button>
         </div>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-          このチャットの全履歴を「発言者名:内容」の形で時系列順に並べたプレーンテキストです。
+          {T.exportSheet.description}
         </p>
-        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {q.error && (
           <div className="mt-3">
-            <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+            <p className="text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>
             <button type="button" onClick={() => q.refetch()} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-              再読み込み
+              {T.common.reload}
             </button>
           </div>
         )}
         {q.data && (
           <>
-            <label className="sr-only" htmlFor="export-text">チャット全文</label>
+            <label className="sr-only" htmlFor="export-text">{T.exportSheet.textLabel}</label>
             <textarea
               id="export-text"
               readOnly
@@ -242,7 +311,7 @@ function ExportSheet({
               style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
             />
             {copyFailed && (
-              <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>コピーできませんでした。上のテキストを長押し（または全選択）してコピーしてください。</p>
+              <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{T.exportSheet.copyFailed}</p>
             )}
             <button
               type="button"
@@ -250,7 +319,7 @@ function ExportSheet({
               className="mt-3 w-full rounded-full px-4 py-2.5 font-bold text-white"
               style={{ background: "var(--accent)" }}
             >
-              {copied ? "コピーしました" : "全文をコピー"}
+              {copied ? T.exportSheet.copied : T.exportSheet.copy}
             </button>
           </>
         )}
@@ -286,7 +355,7 @@ function ConfirmSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -335,7 +404,7 @@ function useDraftRestore(
       const key = `${draft.body}\n${draft.fail_reason}`;
       if (noticedRef.current !== key) {
         noticedRef.current = key;
-        setNotice(`返信に失敗しました（${failReasonLabel(draft.fail_reason)}）。文章を入力欄に戻しました。そのまま、または直して再送信できます。`);
+        setNotice(T.draftRestore.failedNotice(failReasonLabel(draft.fail_reason)));
       }
     }
   }, [draft, setDraftText, setNotice]);
@@ -370,7 +439,7 @@ function ImageEditSheet({
       queryClient.invalidateQueries({ queryKey: ["group"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
   });
 
   const baseScale = img ? Math.max(CROP_VIEW / img.naturalWidth, CROP_VIEW / img.naturalHeight) : 1;
@@ -390,7 +459,7 @@ function ImageEditSheet({
   const onFile = (file: File | undefined) => {
     if (!file) return;
     if (!file.type.startsWith("image/")) {
-      setError("画像ファイルを選んでください。");
+      setError(T.imageEdit.notImageFile);
       return;
     }
     const url = URL.createObjectURL(file);
@@ -404,7 +473,7 @@ function ImageEditSheet({
     };
     image.onerror = () => {
       URL.revokeObjectURL(url);
-      setError("画像を読み込めませんでした。別のファイルをお試しください。");
+      setError(T.imageEdit.loadImageFailed);
     };
     image.src = url;
   };
@@ -416,7 +485,7 @@ function ImageEditSheet({
     canvas.height = CROP_OUT;
     const cx = canvas.getContext("2d");
     if (!cx) {
-      setError("画像の処理に失敗しました。");
+      setError(T.imageEdit.processFailed);
       return;
     }
     // プレビューで見えている範囲（元画像上の正方形の矩形）をそのまま切り取って
@@ -430,18 +499,18 @@ function ImageEditSheet({
     const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
     const base64 = dataUrl.split(",")[1] ?? "";
     if (!base64) {
-      setError("画像の処理に失敗しました。");
+      setError(T.imageEdit.processFailed);
       return;
     }
     save.mutate({ image_base64: base64, image_mime: "image/jpeg" });
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${characterName}の画像を変更`}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.imageEdit.title(characterName)}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{characterName}の画像を変更</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.imageEdit.title(characterName)}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          画像ファイルを選んで、正方形にトリミングして保存します。保存すると一覧・チャット・グループの表示にすぐ反映されます。
+          {T.imageEdit.description}
         </p>
 
         <input
@@ -449,7 +518,7 @@ function ImageEditSheet({
           type="file"
           accept="image/*"
           className="hidden"
-          aria-label="画像ファイルを選ぶ"
+          aria-label={T.imageEdit.fileInputAria}
           onChange={(e) => {
             onFile(e.target.files?.[0]);
             e.target.value = "";
@@ -461,7 +530,7 @@ function ImageEditSheet({
           className="mt-4 w-full rounded-full px-4 py-2.5 font-bold"
           style={{ background: "var(--surface-alt)", color: "var(--text)" }}
         >
-          {img ? "別の画像を選ぶ" : "画像ファイルを選ぶ"}
+          {img ? T.imageEdit.chooseAnother : T.imageEdit.chooseFile}
         </button>
         {imgName && <p className="mt-1 truncate text-xs" style={{ color: "var(--dim)" }}>{imgName}</p>}
 
@@ -471,7 +540,7 @@ function ImageEditSheet({
               className="relative mx-auto mt-4 overflow-hidden rounded-2xl"
               style={{ width: CROP_VIEW, height: CROP_VIEW, background: "var(--surface-alt)", touchAction: "none", cursor: "grab" }}
               role="application"
-              aria-label="トリミング範囲。ドラッグで位置を調整できます"
+              aria-label={T.imageEdit.cropAreaAria}
               onPointerDown={(e) => {
                 (e.target as HTMLElement).setPointerCapture(e.pointerId);
                 dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: offset.x, baseY: offset.y };
@@ -486,7 +555,7 @@ function ImageEditSheet({
             >
               <img
                 src={img.src}
-                alt="トリミング中の画像"
+                alt={T.imageEdit.croppingAlt}
                 draggable={false}
                 className="absolute select-none"
                 style={{
@@ -506,7 +575,7 @@ function ImageEditSheet({
               />
             </div>
             <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="crop-zoom">
-              拡大・縮小
+              {T.imageEdit.zoom}
             </label>
             <input
               id="crop-zoom"
@@ -521,15 +590,15 @@ function ImageEditSheet({
                 setOffset((o) => clampOffset(o.x, o.y, z, img));
               }}
               className="mt-1 w-full"
-              aria-label="拡大・縮小"
+              aria-label={T.imageEdit.zoom}
             />
-            <p className="text-xs" style={{ color: "var(--dim)" }}>プレビューは上の枠の通りです。ドラッグで位置を調整できます。</p>
+            <p className="text-xs" style={{ color: "var(--dim)" }}>{T.imageEdit.previewNote}</p>
           </>
         ) : (
           currentImageUrl && (
             <div className="mt-4 flex items-center gap-3">
-              <img src={currentImageUrl} alt={`${characterName}の現在の画像`} width={64} height={64} className="rounded-full object-cover" style={{ width: 64, height: 64 }} />
-              <p className="text-sm" style={{ color: "var(--dim)" }}>現在の画像です。新しい画像を選ぶと差し替わります。</p>
+              <img src={currentImageUrl} alt={T.imageEdit.currentAlt(characterName)} width={64} height={64} className="rounded-full object-cover" style={{ width: 64, height: 64 }} />
+              <p className="text-sm" style={{ color: "var(--dim)" }}>{T.imageEdit.currentNote}</p>
             </div>
           )
         )}
@@ -537,7 +606,7 @@ function ImageEditSheet({
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -546,7 +615,7 @@ function ImageEditSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {save.isPending ? "保存中…" : "トリミングして保存"}
+            {save.isPending ? T.common.saving : T.imageEdit.saveCropped}
           </button>
         </div>
       </div>
@@ -584,18 +653,18 @@ function CharacterMenuSheet({
   onSetCategory: () => void;
 }) {
   const items: { label: string; description: string; onSelect: () => void }[] = [
-    { label: "概要を確認する", description: "生成に使われている設定本文と、関係・呼び方を確認します", onSelect: onViewSettings },
-    { label: "設定を編集する", description: "設定を項目ごとの入力欄で書き換えます（次の返信から反映されます）", onSelect: onEditSettings },
-    { label: "画像を変更", description: "画像ファイルを選んで正方形にトリミングして差し替えます", onSelect: onEditImage },
-    { label: "表示名を変更", description: "一覧やチャットで表示される名前だけを変えます（設定には影響しません）", onSelect: onRename },
-    { label: "カテゴリを設定", description: "登録済みカテゴリから選んで分類します（複数選択できます。同じカテゴリは複数のキャラにも設定できます）", onSelect: onSetCategory },
+    { label: T.characterMenu.viewSettings, description: T.characterMenu.viewSettingsDesc, onSelect: onViewSettings },
+    { label: T.characterMenu.editSettings, description: T.characterMenu.editSettingsDesc, onSelect: onEditSettings },
+    { label: T.characterMenu.editImage, description: T.characterMenu.editImageDesc, onSelect: onEditImage },
+    { label: T.characterMenu.rename, description: T.characterMenu.renameDesc, onSelect: onRename },
+    { label: T.characterMenu.setCategory, description: T.characterMenu.setCategoryDesc, onSelect: onSetCategory },
   ];
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${character.display_name}の設定メニュー`}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.characterMenu.menuAria(character.display_name)}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-center gap-3">
           <Avatar imageUrl={character.image_url} name={character.display_name} themeColor={character.theme_color} size={40} />
-          <h2 className="font-display min-w-0 flex-1 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{character.display_name}の設定</h2>
+          <h2 className="font-display min-w-0 flex-1 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{T.characterMenu.title(character.display_name)}</h2>
         </div>
         <div className="mt-4 flex flex-col gap-2">
           {items.map((item) => (
@@ -617,7 +686,7 @@ function CharacterMenuSheet({
           className="mt-4 w-full rounded-full px-4 py-2.5 font-bold"
           style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
         >
-          閉じる
+          {T.common.close}
         </button>
       </div>
     </div>
@@ -632,26 +701,26 @@ function CharacterSettingsSheet({ characterId, onClose }: { characterId: number;
   });
   const d = q.data;
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="キャラ設定">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.characterSettings.title}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-start justify-between gap-3">
-          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>キャラ設定</h2>
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.characterSettings.title}</h2>
           <button
             type="button"
             onClick={onClose}
-            aria-label="閉じる"
+            aria-label={T.common.close}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
             style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
           >
             ×
           </button>
         </div>
-        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {q.error && (
           <div className="mt-3">
-            <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+            <p className="text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>
             <button type="button" onClick={() => q.refetch()} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-              再読み込み
+              {T.common.reload}
             </button>
           </div>
         )}
@@ -659,40 +728,40 @@ function CharacterSettingsSheet({ characterId, onClose }: { characterId: number;
           <div className="mt-3 flex flex-col gap-4">
             <dl className="flex flex-col gap-1.5 text-sm">
               <div className="flex gap-2">
-                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>表示名</dt>
+                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>{T.characterSettings.displayName}</dt>
                 <dd style={{ color: "var(--text)" }}>{d.display_name}</dd>
               </div>
               <div className="flex gap-2">
-                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>元の名前</dt>
+                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>{T.characterSettings.originalName}</dt>
                 <dd style={{ color: "var(--text)" }}>{d.name}</dd>
               </div>
               {d.source_profile_id && (
                 <div className="flex gap-2">
-                  <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>取り込み元ID</dt>
+                  <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>{T.characterSettings.sourceProfileId}</dt>
                   <dd className="break-all" style={{ color: "var(--text)" }}>{d.source_profile_id}</dd>
                 </div>
               )}
               <div className="flex gap-2">
-                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>登録日時</dt>
+                <dt className="w-24 shrink-0 font-bold" style={{ color: "var(--dim)" }}>{T.characterSettings.createdAt}</dt>
                 <dd style={{ color: "var(--text)" }}>{new Date(d.created_at).toLocaleString("ja-JP")}</dd>
               </div>
             </dl>
             <div>
-              <h3 className="text-sm font-bold" style={{ color: "var(--text)" }}>設定本文（生成に使われる内容）</h3>
+              <h3 className="text-sm font-bold" style={{ color: "var(--text)" }}>{T.characterSettings.settingsTextHeading}</h3>
               <p className="mt-1.5 rounded-2xl p-3 text-sm leading-relaxed whitespace-pre-wrap" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
                 {d.settings_text}
               </p>
             </div>
             {d.relation_text && (
               <div>
-                <h3 className="text-sm font-bold" style={{ color: "var(--text)" }}>関係・呼び方</h3>
+                <h3 className="text-sm font-bold" style={{ color: "var(--text)" }}>{T.characterSettings.relationTextHeading}</h3>
                 <p className="mt-1.5 rounded-2xl p-3 text-sm leading-relaxed whitespace-pre-wrap" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
                   {d.relation_text}
                 </p>
               </div>
             )}
             <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-              設定を書き換える時は、設定メニューの「設定を編集する」から行えます。発言への指摘による見直しは、チャット画面のレビューモードから行えます。
+              {T.characterSettings.footerNote}
             </p>
           </div>
         )}
@@ -801,6 +870,9 @@ function CharacterSettingsEditForm({
   const [backgroundText, setBackgroundText] = useState(initial.background_text);
   const [linksText, setLinksText] = useState(initial.background_links.join("\n"));
   const [linkSummary, setLinkSummary] = useState(initial.link_summary);
+  const [portrayalFocus, setPortrayalFocus] = useState(initial.portrayal_focus);
+  const [videoUrlsText, setVideoUrlsText] = useState(initial.video_urls.join("\n"));
+  const [videoNotes, setVideoNotes] = useState(initial.video_notes);
   const [userRelationship, setUserRelationship] = useState(initial.user_relationship);
   const [callUserAs, setCallUserAs] = useState(initial.call_user_as);
   const [speechStyle, setSpeechStyle] = useState(initial.speech_style);
@@ -825,6 +897,9 @@ function CharacterSettingsEditForm({
         background_text: backgroundText,
         background_links: linksText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
         link_summary: linkSummary,
+        portrayal_focus: portrayalFocus,
+        video_urls: videoUrlsText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+        video_notes: videoNotes,
         user_relationship: userRelationship,
         call_user_as: callUserAs,
         speech_style: speechStyle,
@@ -849,12 +924,12 @@ function CharacterSettingsEditForm({
       queryClient.invalidateQueries({ queryKey: ["character-settings-form", character.id] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
   });
 
   const submit = () => {
     if (!name.trim()) {
-      setError("名前を入力してください。");
+      setError(T.settingsEdit.nameRequired);
       return;
     }
     setError("");
@@ -869,58 +944,61 @@ function CharacterSettingsEditForm({
   return (
     <div className="flex flex-col gap-5">
       <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-        保存すると、このアプリ内の設定が書き換わり、次の返信から新しい設定で生成されます。アバター管理ツールの設定は変わりません。一覧の表示名はここでは変わりません（表示名の変更は別の項目です）。
+        {T.settingsEdit.intro}
       </p>
 
-      <EditSection title="基本">
-        <EditTextField label="名前" fieldProps={F.name} value={name} onChange={setName} />
-        <EditAreaField label="概要" fieldProps={F.summary} value={summary} onChange={setSummary} rows={3} />
-        <EditAreaField label="挨拶の例" fieldProps={F.greeting} value={greeting} onChange={setGreeting} rows={3} />
-        <EditAreaField label="固有の記憶" fieldProps={F.avatar_memory} value={avatarMemory} onChange={setAvatarMemory} rows={3} />
+      <EditSection title={T.settingsEdit.sectionBasic}>
+        <EditTextField label={T.settingsEdit.labelName} fieldProps={F.name} value={name} onChange={setName} />
+        <EditAreaField label={T.settingsEdit.labelSummary} fieldProps={F.summary} value={summary} onChange={setSummary} rows={3} />
+        <EditAreaField label={T.settingsEdit.labelGreeting} fieldProps={F.greeting} value={greeting} onChange={setGreeting} rows={3} />
+        <EditAreaField label={T.settingsEdit.labelAvatarMemory} fieldProps={F.avatar_memory} value={avatarMemory} onChange={setAvatarMemory} rows={3} />
       </EditSection>
 
-      <EditSection title="背景">
-        <EditAreaField label="背景（本文）" fieldProps={F.background_text} value={backgroundText} onChange={setBackgroundText} rows={8} />
-        <EditAreaField label="関連リンク" value={linksText} onChange={setLinksText} rows={3} hint="1行に1件ずつ入力してください。" />
-        <EditAreaField label="つながりの要約" fieldProps={F.link_summary} value={linkSummary} onChange={setLinkSummary} rows={4} />
+      <EditSection title={T.settingsEdit.sectionBackground}>
+        <EditAreaField label={T.settingsEdit.labelBackgroundText} fieldProps={F.background_text} value={backgroundText} onChange={setBackgroundText} rows={8} />
+        <EditAreaField label={T.settingsEdit.labelLinks} value={linksText} onChange={setLinksText} rows={3} hint={T.settingsEdit.hintOnePerLine} />
+        <EditAreaField label={T.settingsEdit.labelLinkSummary} fieldProps={F.link_summary} value={linkSummary} onChange={setLinkSummary} rows={4} />
+        <EditAreaField label={T.settingsEdit.labelPortrayalFocus} fieldProps={F.portrayal_focus} value={portrayalFocus} onChange={setPortrayalFocus} rows={3} hint={T.settingsEdit.hintPortrayalFocus} />
+        <EditAreaField label={T.settingsEdit.labelVideoUrls} value={videoUrlsText} onChange={setVideoUrlsText} rows={3} hint={T.settingsEdit.hintOnePerLine} />
       </EditSection>
 
-      <EditSection title="話し方">
-        <EditAreaField label="話し方の説明" fieldProps={F.speech_style} value={speechStyle} onChange={setSpeechStyle} rows={4} />
-        <EditTextField label="一人称" fieldProps={F.speech_first_person} value={firstPerson} onChange={setFirstPerson} />
-        <EditTextField label="二人称" fieldProps={F.speech_second_person} value={secondPerson} onChange={setSecondPerson} />
-        <EditAreaField label="口癖" fieldProps={F.speech_catchphrase} value={catchphrase} onChange={setCatchphrase} rows={2} />
-        <EditAreaField label="話し方のメモ" fieldProps={F.speech_memo} value={speechMemo} onChange={setSpeechMemo} rows={3} />
+      <EditSection title={T.settingsEdit.sectionSpeech}>
+        <EditAreaField label={T.settingsEdit.labelSpeechStyle} fieldProps={F.speech_style} value={speechStyle} onChange={setSpeechStyle} rows={4} />
+        <EditTextField label={T.settingsEdit.labelFirstPerson} fieldProps={F.speech_first_person} value={firstPerson} onChange={setFirstPerson} />
+        <EditTextField label={T.settingsEdit.labelSecondPerson} fieldProps={F.speech_second_person} value={secondPerson} onChange={setSecondPerson} />
+        <EditAreaField label={T.settingsEdit.labelCatchphrase} fieldProps={F.speech_catchphrase} value={catchphrase} onChange={setCatchphrase} rows={2} />
+        <EditAreaField label={T.settingsEdit.labelSpeechMemo} fieldProps={F.speech_memo} value={speechMemo} onChange={setSpeechMemo} rows={3} />
+        <EditAreaField label={T.settingsEdit.labelVideoNotes} fieldProps={F.video_notes} value={videoNotes} onChange={setVideoNotes} rows={4} hint={T.settingsEdit.hintVideoNotes} />
       </EditSection>
 
-      <EditSection title="相手との関係">
-        <EditAreaField label="相手との関係" fieldProps={F.user_relationship} value={userRelationship} onChange={setUserRelationship} rows={3} />
-        <EditTextField label="相手の呼び方" fieldProps={F.call_user_as} value={callUserAs} onChange={setCallUserAs} />
+      <EditSection title={T.settingsEdit.sectionRelation}>
+        <EditAreaField label={T.settingsEdit.labelUserRelationship} fieldProps={F.user_relationship} value={userRelationship} onChange={setUserRelationship} rows={3} />
+        <EditTextField label={T.settingsEdit.labelCallUserAs} fieldProps={F.call_user_as} value={callUserAs} onChange={setCallUserAs} />
       </EditSection>
 
-      <EditSection title="見た目の要素">
+      <EditSection title={T.settingsEdit.sectionAppearance}>
         <div className="flex flex-col gap-2">
           {elements.map((el, i) => (
             <div key={i} className="flex items-start gap-2">
               <input
-                aria-label={`見た目の要素${i + 1}の項目名`}
+                aria-label={T.settingsEdit.elementKeyAria(i)}
                 value={el.key}
                 onChange={(e) => updateElement(i, { key: e.target.value })}
-                placeholder="項目名（例: 髪）"
+                placeholder={T.settingsEdit.elementKeyPlaceholder}
                 className="w-28 shrink-0 rounded-2xl px-3 py-2.5 text-sm"
                 style={editInputStyle}
               />
               <input
-                aria-label={`見た目の要素${i + 1}の内容`}
+                aria-label={T.settingsEdit.elementValueAria(i)}
                 value={el.value}
                 onChange={(e) => updateElement(i, { value: e.target.value })}
-                placeholder="内容"
+                placeholder={T.settingsEdit.elementValuePlaceholder}
                 className="min-w-0 flex-1 rounded-2xl px-3 py-2.5 text-sm"
                 style={editInputStyle}
               />
               <button
                 type="button"
-                aria-label={`見た目の要素${i + 1}を削除`}
+                aria-label={T.settingsEdit.elementDeleteAria(i)}
                 onClick={() => setElements((prev) => prev.filter((_, j) => j !== i))}
                 className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base"
                 style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
@@ -935,27 +1013,27 @@ function CharacterSettingsEditForm({
             className="self-start rounded-full px-4 py-2 text-sm font-bold"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            ＋ 要素を追加
+            {T.settingsEdit.addElement}
           </button>
         </div>
       </EditSection>
 
-      <EditSection title="フレーバー特性">
+      <EditSection title={T.settingsEdit.sectionTraits}>
         <div className="flex flex-col gap-3">
           {traits.map((t, i) => (
             <div key={i} className="rounded-2xl p-3" style={{ background: "var(--surface-alt)" }}>
               <div className="flex items-center gap-2">
                 <input
-                  aria-label={`フレーバー特性${i + 1}の名前`}
+                  aria-label={T.settingsEdit.traitNameAria(i)}
                   value={t.label}
                   onChange={(e) => updateTrait(i, { label: e.target.value })}
-                  placeholder="特性の名前"
+                  placeholder={T.settingsEdit.traitNamePlaceholder}
                   className="min-w-0 flex-1 rounded-xl px-3 py-2 text-sm font-bold"
                   style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
                 />
                 <button
                   type="button"
-                  aria-label={`フレーバー特性${i + 1}を削除`}
+                  aria-label={T.settingsEdit.traitDeleteAria(i)}
                   onClick={() => setTraits((prev) => prev.filter((_, j) => j !== i))}
                   className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
                   style={{ background: "var(--surface)", color: "var(--danger)" }}
@@ -964,7 +1042,7 @@ function CharacterSettingsEditForm({
                 </button>
               </div>
               <label className="mt-2 block text-xs font-bold" style={{ color: "var(--dim)" }}>
-                例（1行に1件）
+                {T.settingsEdit.traitExamplesLabel}
                 <textarea
                   value={t.examplesText}
                   onChange={(e) => updateTrait(i, { examplesText: e.target.value })}
@@ -980,7 +1058,7 @@ function CharacterSettingsEditForm({
                   onChange={(e) => updateTrait(i, { enabled: e.target.checked })}
                   className="h-5 w-5"
                 />
-                この特性を有効にする
+                {T.settingsEdit.traitEnabled}
               </label>
             </div>
           ))}
@@ -990,7 +1068,7 @@ function CharacterSettingsEditForm({
             className="self-start rounded-full px-4 py-2 text-sm font-bold"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            ＋ 特性を追加
+            {T.settingsEdit.addTrait}
           </button>
         </div>
       </EditSection>
@@ -998,7 +1076,7 @@ function CharacterSettingsEditForm({
       {error && <p className="text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
       <div className="flex gap-3">
         <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-          キャンセル
+          {T.common.cancel}
         </button>
         <button
           type="button"
@@ -1007,7 +1085,7 @@ function CharacterSettingsEditForm({
           className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
           style={{ background: "var(--accent)" }}
         >
-          {save.isPending ? "保存中…" : "保存する"}
+          {save.isPending ? T.common.saving : T.common.save}
         </button>
       </div>
     </div>
@@ -1021,32 +1099,32 @@ function CharacterSettingsEditSheet({ character, onClose }: { character: Charact
     queryFn: () => api.getCharacterSettingsForm({ character_id: character.id }),
   });
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${character.display_name}の設定を編集する`}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.settingsEdit.sheetAria(character.display_name)}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-start justify-between gap-3">
-          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>設定を編集する</h2>
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.settingsEdit.title}</h2>
           <button
             type="button"
             onClick={onClose}
-            aria-label="閉じる"
+            aria-label={T.common.close}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
             style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
           >
             ×
           </button>
         </div>
-        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+        {q.isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {q.error && (
           <div className="mt-3">
-            <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+            <p className="text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>
             <button type="button" onClick={() => q.refetch()} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-              再読み込み
+              {T.common.reload}
             </button>
           </div>
         )}
         {q.data && !q.data.editable && (
           <p className="mt-3 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-            このキャラクターは設定データ（avatar-profile形式）を保持していないため、ここからは編集できません。
+            {T.settingsEdit.notEditable}
           </p>
         )}
         {q.data && q.data.editable && (
@@ -1072,12 +1150,12 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
       queryClient.invalidateQueries({ queryKey: ["group"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "変更に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
   });
   const submit = () => {
     const v = name.trim();
     if (!v) {
-      setError("表示名を入力してください。");
+      setError(T.renameCharacter.nameRequired);
       return;
     }
     if (v === character.display_name) {
@@ -1088,14 +1166,14 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
     rename.mutate(v);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="表示名を変更">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.renameCharacter.title}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>表示名を変更</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.renameCharacter.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          一覧やチャットで表示される名前だけを変えます。生成に使う設定や会話履歴には影響しません。
+          {T.renameCharacter.description}
         </p>
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="rename-display-name">
-          表示名
+          {T.renameCharacter.label}
         </label>
         <input
           id="rename-display-name"
@@ -1108,7 +1186,7 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -1117,7 +1195,7 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {rename.isPending ? "保存中…" : "変更する"}
+            {rename.isPending ? T.common.saving : T.common.change}
           </button>
         </div>
       </div>
@@ -1245,7 +1323,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setError("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "追加に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.categoryManage.addFailed),
   });
   const update = useMutation({
     mutationFn: async (v: { category_id: number; name: string; parent_id: number | null }) =>
@@ -1255,7 +1333,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setError("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
   });
   const del = useMutation({
     mutationFn: async (id: number) => await api.deleteCategory({ category_id: id }),
@@ -1263,11 +1341,11 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setConfirmDelete(null);
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "削除に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.deleteFailed),
   });
   const submit = () => {
     const v = name.trim();
-    if (!v) { setError("カテゴリ名を入力してください。"); return; }
+    if (!v) { setError(T.categoryManage.nameRequired); return; }
     setError("");
     create.mutate({ name: v, parent_id: parentId });
   };
@@ -1281,7 +1359,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
   const submitEdit = () => {
     if (!editing) return;
     const v = editName.trim();
-    if (!v) { setError("カテゴリ名を入力してください。"); return; }
+    if (!v) { setError(T.categoryManage.nameRequired); return; }
     setError("");
     update.mutate({ category_id: editing.id, name: v, parent_id: editParentId });
   };
@@ -1289,14 +1367,14 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
   const editBlockedIds = editing ? categoryDescendantIdSet(categories, editing.id) : new Set<number>();
   const childCountOf = (id: number) => categories.filter((c) => c.parent_id === id).length;
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="カテゴリ管理">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.categoryManage.title}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-start justify-between gap-3">
-          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>カテゴリ管理</h2>
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.categoryManage.title}</h2>
           <button
             type="button"
             onClick={onClose}
-            aria-label="カテゴリ管理を閉じる"
+            aria-label={T.categoryManage.closeAria}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
             style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
           >
@@ -1304,11 +1382,11 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
           </button>
         </div>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-          カテゴリはキャラ一覧の絞り込みに使います。カテゴリには親カテゴリを設定でき、子カテゴリ（サブカテゴリ）を作れます。親カテゴリで絞り込むと、その子・孫カテゴリのキャラもまとめて表示されます。1キャラに複数のカテゴリを設定でき、複数に登録したキャラはどのカテゴリで絞り込んでも表示されます。各キャラへの割り当ては、キャラの設定メニュー「カテゴリを設定」から行います。子カテゴリとその親カテゴリは同時には付けられず、両方が付いた状態になると子カテゴリだけが残ります（親子関係を後から変えた時も、既存の割り当ては自動で子だけに整理されます）。カテゴリを削除すると、その子カテゴリは削除したカテゴリの親の下へ移動し、各キャラからはそのカテゴリだけが外れます（他のカテゴリは残ります）。
+          {T.categoryManage.description}
         </p>
 
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="category-name">
-          新しいカテゴリ名
+          {T.categoryManage.newNameLabel}
         </label>
         <input
           id="category-name"
@@ -1318,12 +1396,12 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); }
           }}
-          placeholder="例: ゲーム"
+          placeholder={T.categoryManage.namePlaceholder}
           className="mt-1 w-full rounded-2xl px-3 py-2.5"
           style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
         />
         <label className="mt-3 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="category-parent">
-          親カテゴリ
+          {T.categoryManage.parentLabel}
         </label>
         <select
           id="category-parent"
@@ -1332,7 +1410,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
           className="mt-1 w-full rounded-2xl px-3 py-2.5"
           style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
         >
-          <option value="">最上位（親なし）</option>
+          <option value="">{T.categoryManage.topLevelOption}</option>
           {tree.map(({ cat, depth }) => (
             <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
           ))}
@@ -1344,20 +1422,20 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
           className="mt-3 w-full rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
           style={{ background: "var(--accent)" }}
         >
-          {create.isPending ? "追加中…" : "追加"}
+          {create.isPending ? T.categoryManage.adding : T.categoryManage.add}
         </button>
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
 
         <div className="mt-4 flex flex-col gap-2">
           {categories.length === 0 && (
-            <p className="text-sm" style={{ color: "var(--dim)" }}>まだカテゴリがありません。</p>
+            <p className="text-sm" style={{ color: "var(--dim)" }}>{T.categoryManage.empty}</p>
           )}
           {tree.map(({ cat, depth }) => (
             <div key={cat.id} style={{ marginLeft: depth * 20 }}>
               {editing?.id === cat.id ? (
                 <div className="rounded-2xl px-3 py-3" style={{ background: "var(--surface-alt)" }}>
                   <label className="block text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor={`category-edit-name-${cat.id}`}>
-                    カテゴリ名
+                    {T.categoryManage.nameLabel}
                   </label>
                   <input
                     id={`category-edit-name-${cat.id}`}
@@ -1368,7 +1446,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                     style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
                   />
                   <label className="mt-3 block text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor={`category-edit-parent-${cat.id}`}>
-                    親カテゴリ
+                    {T.categoryManage.parentLabel}
                   </label>
                   <select
                     id={`category-edit-parent-${cat.id}`}
@@ -1377,12 +1455,12 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                     className="mt-1 w-full rounded-xl px-3 py-2"
                     style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
                   >
-                    <option value="">最上位（親なし）</option>
+                    <option value="">{T.categoryManage.topLevelOption}</option>
                     {tree.filter(({ cat: c }) => !editBlockedIds.has(c.id)).map(({ cat: c, depth: d }) => (
                       <option key={c.id} value={String(c.id)}>{categoryOptionLabel(c, d)}</option>
                     ))}
                   </select>
-                  <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>自分自身と自分の子カテゴリは親に選べません。</p>
+                  <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>{T.categoryManage.parentNote}</p>
                   <div className="mt-3 flex gap-2">
                     <button
                       type="button"
@@ -1390,7 +1468,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                       className="flex-1 rounded-full px-3 py-2 text-sm font-bold"
                       style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
                     >
-                      キャンセル
+                      {T.common.cancel}
                     </button>
                     <button
                       type="button"
@@ -1399,7 +1477,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                       className="flex-1 rounded-full px-3 py-2 text-sm font-bold text-white disabled:opacity-50"
                       style={{ background: "var(--accent)" }}
                     >
-                      {update.isPending ? "保存中…" : "保存する"}
+                      {update.isPending ? T.common.saving : T.common.save}
                     </button>
                   </div>
                 </div>
@@ -1411,13 +1489,13 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                       {cat.name}
                     </span>
                     <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
-                      {cat.parent_id != null ? `親: ${nameById.get(cat.parent_id) ?? "（不明）"}` : "最上位"}
+                      {T.categoryManage.parentDisplay(cat.parent_id != null ? (nameById.get(cat.parent_id) ?? T.categoryManage.unknownParent) : null)}
                     </span>
                   </span>
                   {confirmDelete?.id === cat.id ? (
                     <>
                       <span className="shrink-0 text-xs" style={{ color: "var(--danger)" }}>
-                        削除しますか？{childCountOf(cat.id) > 0 ? `子カテゴリは${cat.parent_id != null ? `「${nameById.get(cat.parent_id) ?? ""}」` : "最上位"}の下へ移動します。` : ""}
+                        {T.categoryManage.deleteConfirmPrefix}{childCountOf(cat.id) > 0 ? T.categoryManage.deleteChildMoveNote(cat.parent_id != null ? T.categoryManage.deleteDestNamed(nameById.get(cat.parent_id) ?? "") : T.categoryManage.deleteDestTop) : ""}
                       </span>
                       <button
                         type="button"
@@ -1426,7 +1504,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                         className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50"
                         style={{ background: "var(--danger)" }}
                       >
-                        削除する
+                        {T.common.deleteConfirm}
                       </button>
                       <button
                         type="button"
@@ -1434,7 +1512,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                         className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
                         style={{ background: "var(--surface)", color: "var(--text)" }}
                       >
-                        やめる
+                        {T.categoryManage.cancelDelete}
                       </button>
                     </>
                   ) : (
@@ -1442,20 +1520,20 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
                       <button
                         type="button"
                         onClick={() => startEdit(cat)}
-                        aria-label={`カテゴリ「${cat.name}」を編集`}
+                        aria-label={T.categoryManage.editAria(cat.name)}
                         className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
                         style={{ background: "var(--surface)", color: "var(--text)" }}
                       >
-                        編集
+                        {T.common.edit}
                       </button>
                       <button
                         type="button"
                         onClick={() => { setConfirmDelete(cat); setEditing(null); setError(""); }}
-                        aria-label={`カテゴリ「${cat.name}」を削除`}
+                        aria-label={T.categoryManage.deleteAria(cat.name)}
                         className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
                         style={{ background: "var(--surface)", color: "var(--danger)" }}
                       >
-                        削除
+                        {T.common.delete}
                       </button>
                     </>
                   )}
@@ -1491,7 +1569,7 @@ function CategoryAssignSheet({
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "設定に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.categoryAssign.setFailed),
   });
   const toggle = (id: number) => {
     setSelectedIds((prev) => {
@@ -1513,21 +1591,21 @@ function CategoryAssignSheet({
   };
   const isDirty = [...selectedIds].sort((a, b) => a - b).join(",") !== [...initialIds].sort((a, b) => a - b).join(",");
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${character.display_name}のカテゴリを設定`}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.categoryAssign.sheetAria(character.display_name)}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-center gap-3">
           <Avatar imageUrl={character.image_url} name={character.display_name} themeColor={character.theme_color} size={40} />
-          <h2 className="font-display min-w-0 flex-1 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{character.display_name}のカテゴリ</h2>
+          <h2 className="font-display min-w-0 flex-1 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{T.categoryAssign.title(character.display_name)}</h2>
         </div>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          複数のカテゴリを選べます。複数に登録したキャラは、どのカテゴリで絞り込んでも表示されます。子カテゴリに登録したキャラは、その親カテゴリで絞り込んだ時にも表示されます。ただし、子カテゴリとその親カテゴリは同時には選べません（子を選ぶと親は自動で外れます）。何も選ばなければ未分類になります。
+          {T.categoryAssign.description}
         </p>
         {categories.length === 0 && (
           <p className="mt-3 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-            まだカテゴリが登録されていません。一覧の「カテゴリ管理」から先にカテゴリを追加してください。
+            {T.common.noCategoriesYet}
           </p>
         )}
-        <div className="mt-4 flex flex-col gap-2" role="group" aria-label="カテゴリの選択（複数選択可）">
+        <div className="mt-4 flex flex-col gap-2" role="group" aria-label={T.common.categoryFilterGroupAria}>
           {categoryTreeEntries(categories).map(({ cat, depth }) => {
             const selected = selectedIds.includes(cat.id);
             // 子孫カテゴリが選択中なら、この祖先カテゴリは選択できない（v1.27）。
@@ -1551,7 +1629,7 @@ function CategoryAssignSheet({
                   checked={selected}
                   disabled={disabled}
                   onChange={() => toggle(cat.id)}
-                  aria-label={`カテゴリ「${cat.name}」`}
+                  aria-label={T.common.categoryAria(cat.name)}
                   className="h-5 w-5 shrink-0"
                   style={{ accentColor: "var(--accent)" }}
                 />
@@ -1559,17 +1637,17 @@ function CategoryAssignSheet({
                   {depth > 0 && <span aria-hidden="true" style={{ color: "var(--dim)" }}>└ </span>}
                   {cat.name}
                 </span>
-                {selected && <span className="ml-auto text-xs font-bold" style={{ color: "var(--accent)" }}>選択中</span>}
+                {selected && <span className="ml-auto text-xs font-bold" style={{ color: "var(--accent)" }}>{T.common.selected}</span>}
                 {disabled && (
                   <span className="ml-auto text-right text-xs" style={{ color: "var(--dim)" }}>
-                    子カテゴリ「{blockedBy}」を選択中のため選べません
+                    {T.categoryAssign.blockedByChild(blockedBy ?? "")}
                   </span>
                 )}
               </label>
             );
           })}
           {categories.length > 0 && selectedIds.length === 0 && (
-            <p className="px-1 text-xs" style={{ color: "var(--dim)" }}>現在は未分類です（カテゴリ未選択）。</p>
+            <p className="px-1 text-xs" style={{ color: "var(--dim)" }}>{T.categoryAssign.currentlyUncategorized}</p>
           )}
         </div>
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
@@ -1580,7 +1658,7 @@ function CategoryAssignSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold"
             style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
           >
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -1589,7 +1667,7 @@ function CategoryAssignSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {assign.isPending ? "保存中…" : "保存する"}
+            {assign.isPending ? T.common.saving : T.common.save}
           </button>
         </div>
       </div>
@@ -1601,29 +1679,13 @@ function CategoryAssignSheet({
 
 type ReviewHistoryData = ApiResponse<typeof api, "getReviewHistory">;
 
-const REVIEW_STATUS_LABELS: Record<string, string> = {
-  pending: "処理待ち",
-  processing: "見直し中",
-  done: "完了（自動適用済み）",
-  no_change: "変更なし",
-  failed: "失敗",
-};
+// 表示文は display-texts.ts に集約（設計書 v3.3）。ここでは参照だけを持つ。
+const REVIEW_STATUS_LABELS: Record<string, string> = T.review.statusLabels;
 
-const REVIEW_FAIL_REASONS: Record<string, string> = {
-  timeout: "タイムアウト（10分以内に見直しが終わりませんでした）",
-  rate_limited: "Claudeの利用上限に達しました",
-  generation_error: "生成に失敗しました",
-  invalid_json: "見直し結果がJSONとして読み取れませんでした",
-  invalid_format: "見直し結果の形式が avatar-profile ではありませんでした",
-  name_mismatch: "見直し結果のキャラクター名が対象と一致しませんでした",
-  id_mismatch: "見直し結果のプロファイルIDが元のものと変わっていました",
-  invalid_profile: "見直し結果から設定を構築できませんでした",
-  no_source_json: "元の設定JSONが保持されていないため、見直しできませんでした",
-  character_not_found: "キャラクターが見つかりませんでした",
-};
+const REVIEW_FAIL_REASONS: Record<string, string> = T.review.failReasons;
 
 function reviewFailLabel(reason: string): string {
-  return REVIEW_FAIL_REASONS[reason] ?? (reason ? `見直しに失敗しました（${reason}）` : "見直しに失敗しました");
+  return REVIEW_FAIL_REASONS[reason] ?? (reason ? T.review.failWithDetail(reason) : T.review.failFallback);
 }
 
 function formatDateTime(iso: string): string {
@@ -1638,7 +1700,7 @@ function ReviewModeToggle({ active, onToggle }: { active: boolean; onToggle: () 
       type="button"
       onClick={onToggle}
       aria-pressed={active}
-      className="rounded-full px-2.5 py-1 text-xs"
+      className="shrink-0 rounded-full px-2.5 py-1 text-xs whitespace-nowrap"
       style={{
         background: active ? "var(--accent-soft)" : "transparent",
         color: "var(--dim)",
@@ -1646,7 +1708,7 @@ function ReviewModeToggle({ active, onToggle }: { active: boolean; onToggle: () 
         opacity: active ? 1 : 0.6,
       }}
     >
-      レビューモード{active ? " ON" : ""}
+      {T.review.modeToggle(active)}
     </button>
   );
 }
@@ -1672,16 +1734,16 @@ function ReviewPanel({
   const [feedback, setFeedback] = useState("");
   const [localError, setLocalError] = useState("");
   return (
-    <div className="mb-2 rounded-2xl p-3" style={{ background: "var(--surface)", border: "1.5px solid var(--accent)" }} role="form" aria-label="レビューの指摘を書く">
+    <div className="mb-2 rounded-2xl p-3" style={{ background: "var(--surface)", border: "1.5px solid var(--accent)" }} role="form" aria-label={T.review.panelAria}>
       <div className="flex items-start justify-between gap-2">
-        <p className="text-xs font-bold" style={{ color: "var(--dim)" }}>レビュー対象（{speakerName}の発言）</p>
-        <button type="button" onClick={onCancel} aria-label="レビューの選択をやめる" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>
+        <p className="text-xs font-bold" style={{ color: "var(--dim)" }}>{T.review.targetLabel(speakerName)}</p>
+        <button type="button" onClick={onCancel} aria-label={T.review.cancelSelectionAria} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>
           ×
         </button>
       </div>
       <p className="mt-1 line-clamp-3 text-sm whitespace-pre-wrap" style={{ color: "var(--text)" }}>{messageBody}</p>
       <label className="mt-3 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="review-feedback">
-        設定と異なっている点
+        {T.review.feedbackLabel}
       </label>
       <textarea
         id="review-feedback"
@@ -1689,7 +1751,7 @@ function ReviewPanel({
         value={feedback}
         onChange={(e) => { setFeedback(e.target.value); setLocalError(""); }}
         rows={3}
-        placeholder="例: 一人称は「オレ様」のはずが「ボク」になっている"
+        placeholder={T.review.feedbackPlaceholder}
         className="mt-1 w-full rounded-2xl p-3 text-sm"
         style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
       />
@@ -1699,20 +1761,20 @@ function ReviewPanel({
           type="button"
           disabled={busy}
           onClick={() => {
-            if (!feedback.trim()) { setLocalError("指摘を入力してください。"); return; }
+            if (!feedback.trim()) { setLocalError(T.review.feedbackRequired); return; }
             onSubmit(feedback.trim());
           }}
           className="rounded-full px-4 py-2 text-sm font-bold text-white disabled:opacity-50"
           style={{ background: "var(--accent)" }}
         >
-          {busy ? "送信中…" : "レビューを送る"}
+          {busy ? T.review.sending : T.review.submit}
         </button>
         <button type="button" onClick={onOpenHistory} className="rounded-full px-3 py-2 text-xs font-bold" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>
-          このキャラのレビュー履歴
+          {T.review.openHistoryForChar}
         </button>
       </div>
       <p className="mt-2 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-        送信すると、AIがキャラ設定を見直して自動で適用します。結果と差分はレビュー履歴に残ります。
+        {T.review.panelNote}
       </p>
     </div>
   );
@@ -1739,7 +1801,7 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
       queryClient.invalidateQueries({ queryKey: ["chat"] });
       queryClient.invalidateQueries({ queryKey: ["group"] });
     },
-    onError: (e) => setRevertError(e instanceof Error ? e.message : "取り消しに失敗しました"),
+    onError: (e) => setRevertError(e instanceof Error ? e.message : T.reviewHistory.revertFailed),
   });
   const copyJson = async (reviewId: number, json: string) => {
     try {
@@ -1752,26 +1814,26 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
 
   const reviews: ReviewHistoryData["reviews"] = history.data?.reviews ?? [];
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={`${characterName}のレビュー履歴`}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.reviewHistory.title(characterName)}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
         <div className="flex items-start justify-between gap-2">
-          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{characterName}のレビュー履歴</h2>
-          <button type="button" onClick={onClose} aria-label="レビュー履歴を閉じる" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.reviewHistory.title(characterName)}</h2>
+          <button type="button" onClick={onClose} aria-label={T.reviewHistory.closeAria} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>
             ×
           </button>
         </div>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-          指摘を受けてAIが見直した結果です。差分があった見直しは自動で設定に適用されています。適用済みの改訂は、変更前の設定へ取り消せます。
+          {T.reviewHistory.description}
         </p>
-        {history.isPending && <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
-        {history.error && <p className="mt-4 text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>}
+        {history.isPending && <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
+        {history.error && <p className="mt-4 text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>}
         {history.data && reviews.length === 0 && (
-          <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>まだレビューはありません。レビューモードでキャラの発言を選んで指摘を送ると、ここに記録されます。</p>
+          <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>{T.reviewHistory.empty}</p>
         )}
         {revertError && <p className="mt-3 text-sm" style={{ color: "var(--danger)" }}>{revertError}</p>}
         <div className="mt-4 flex flex-col gap-4">
           {reviews.map((r) => (
-            <article key={r.id} className="rounded-2xl p-3" style={{ background: "var(--surface-alt)" }} aria-label={`レビュー ${formatDateTime(r.created_at)}`}>
+            <article key={r.id} className="rounded-2xl p-3" style={{ background: "var(--surface-alt)" }} aria-label={T.reviewHistory.articleAria(formatDateTime(r.created_at))}>
               <div className="flex items-center gap-2">
                 <span
                   className="rounded-full px-2 py-0.5 text-xs font-bold"
@@ -1782,39 +1844,39 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
                 >
                   {REVIEW_STATUS_LABELS[r.status] ?? r.status}
                 </span>
-                <span className="text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(r.created_at)}・{r.target_kind === "group" ? "グループでの発言" : "1対1での発言"}</span>
+                <span className="text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(r.created_at)}・{r.target_kind === "group" ? T.reviewHistory.groupMessage : T.reviewHistory.chatMessage}</span>
                 {r.revision?.reverted_at && (
-                  <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--danger)" }}>取り消し済み</span>
+                  <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--danger)" }}>{T.reviewHistory.revertedBadge}</span>
                 )}
               </div>
-              <p className="mt-2 text-xs font-bold" style={{ color: "var(--dim)" }}>対象の発言</p>
+              <p className="mt-2 text-xs font-bold" style={{ color: "var(--dim)" }}>{T.reviewHistory.targetHeading}</p>
               <p className="mt-0.5 line-clamp-4 text-sm whitespace-pre-wrap" style={{ color: "var(--text)" }}>{r.message_body}</p>
-              <p className="mt-2 text-xs font-bold" style={{ color: "var(--dim)" }}>指摘</p>
+              <p className="mt-2 text-xs font-bold" style={{ color: "var(--dim)" }}>{T.reviewHistory.feedbackHeading}</p>
               <p className="mt-0.5 text-sm whitespace-pre-wrap" style={{ color: "var(--text)" }}>{r.feedback}</p>
               {r.status === "failed" && (
-                <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{reviewFailLabel(r.fail_reason)}（設定は変更されていません）</p>
+                <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{reviewFailLabel(r.fail_reason)}{T.reviewHistory.failedNoteSuffix}</p>
               )}
               {r.status === "no_change" && (
-                <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>見直しの結果、設定の変更はありませんでした。</p>
+                <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.reviewHistory.noChangeNote}</p>
               )}
               {r.revision && (
                 <>
-                  <p className="mt-3 text-xs font-bold" style={{ color: "var(--dim)" }}>設定の差分（{r.revision.diff.length}件）</p>
+                  <p className="mt-3 text-xs font-bold" style={{ color: "var(--dim)" }}>{T.reviewHistory.diffHeading(r.revision.diff.length)}</p>
                   <div className="mt-1 flex flex-col gap-2">
                     {r.revision.diff.map((d, i) => (
                       <div key={i} className="rounded-xl p-2.5" style={{ background: "var(--surface)" }}>
                         <p className="text-xs font-bold break-all" style={{ color: "var(--gold)" }}>{d.path}</p>
                         <p className="mt-1 text-xs whitespace-pre-wrap break-words" style={{ color: "var(--dim)" }}>
-                          <span className="font-bold">変更前: </span>{d.before}
+                          <span className="font-bold">{T.reviewHistory.diffBefore}</span>{d.before}
                         </p>
                         <p className="mt-1 max-h-40 overflow-y-auto text-xs whitespace-pre-wrap break-words" style={{ color: "var(--text)" }}>
-                          <span className="font-bold">変更後: </span>{d.after}
+                          <span className="font-bold">{T.reviewHistory.diffAfter}</span>{d.after}
                         </p>
                       </div>
                     ))}
                   </div>
                   <details className="mt-3">
-                    <summary className="cursor-pointer text-xs font-bold" style={{ color: "var(--dim)" }}>再出力された設定JSON全文</summary>
+                    <summary className="cursor-pointer text-xs font-bold" style={{ color: "var(--dim)" }}>{T.reviewHistory.fullJsonSummary}</summary>
                     <pre className="mt-2 max-h-64 overflow-auto rounded-xl p-3 text-xs whitespace-pre-wrap break-all" style={{ background: "var(--surface)", color: "var(--text)" }}>{r.revision.after_json}</pre>
                     <button
                       type="button"
@@ -1822,16 +1884,16 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
                       className="mt-2 rounded-full px-3 py-1.5 text-xs font-bold"
                       style={{ background: "var(--surface)", color: "var(--text)" }}
                     >
-                      {copiedId === r.id ? "コピーしました" : "JSONをコピー"}
+                      {copiedId === r.id ? T.reviewHistory.copied : T.reviewHistory.copyJson}
                     </button>
                   </details>
                   {!r.revision.reverted_at && (
                     confirmRevertId === r.revision.id ? (
                       <div className="mt-3 rounded-xl p-3" style={{ background: "var(--surface)" }}>
-                        <p className="text-sm" style={{ color: "var(--text)" }}>この改訂を取り消して、変更前の設定に戻しますか？（この改訂より後の見直しも上書きされます）</p>
+                        <p className="text-sm" style={{ color: "var(--text)" }}>{T.reviewHistory.revertConfirm}</p>
                         <div className="mt-2 flex gap-2">
                           <button type="button" onClick={() => setConfirmRevertId(null)} className="flex-1 rounded-full px-3 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-                            やめる
+                            {T.reviewHistory.revertCancel}
                           </button>
                           <button
                             type="button"
@@ -1840,7 +1902,7 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
                             className="flex-1 rounded-full px-3 py-2 text-sm font-bold text-white disabled:opacity-50"
                             style={{ background: "var(--danger)" }}
                           >
-                            取り消す
+                            {T.reviewHistory.revertDo}
                           </button>
                         </div>
                       </div>
@@ -1851,12 +1913,12 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
                         className="mt-3 rounded-full px-3 py-1.5 text-xs font-bold"
                         style={{ background: "var(--surface)", color: "var(--danger)" }}
                       >
-                        この改訂を取り消す
+                        {T.reviewHistory.revertButton}
                       </button>
                     )
                   )}
                   {r.revision.reverted_at && (
-                    <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(r.revision.reverted_at)} に取り消され、変更前の設定に戻っています。</p>
+                    <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>{T.reviewHistory.revertedNote(formatDateTime(r.revision.reverted_at))}</p>
                   )}
                 </>
               )}
@@ -1896,6 +1958,9 @@ function loadCompact(): boolean {
 // その場で正として保持し、一覧へ戻った時に即座にその並びで表示する。
 let sessionSort: CharSort | null = null;
 let sessionCompact: boolean | null = null;
+
+// グループ一覧のページ位置（10件/ページ、設計書 v2.0 / A）。画面遷移で失われないようセッション内に保持する。
+let sessionGroupPage = 0;
 
 // 一覧上部のタブ（個人 / グループ）。選択中タブのチャットだけを一覧に表示する。
 // 画面遷移で失われないようセッション内に保持する。
@@ -1951,6 +2016,21 @@ function HomeView({ go }: { go: (v: View) => void }) {
     sessionHomeTab = t;
     setHomeTab(t);
   };
+  // グループ一覧のページ（10件/ページ、設計書 v2.0 / A）。
+  const [groupPage, setGroupPage] = useState(sessionGroupPage);
+  const changeGroupPage = (p: number) => {
+    sessionGroupPage = p;
+    setGroupPage(p);
+  };
+  // スケジューリング（設計書 v2.0 / B）: 一覧と編集シート。
+  const schedulesQuery = useQuery({ queryKey: ["schedules"], queryFn: () => api.listSchedules({}), refetchInterval: 30000 });
+  const [scheduleSheet, setScheduleSheet] = useState<{ mode: "create" } | { mode: "edit"; schedule: ScheduleItem } | null>(null);
+  // 全体設定（v2.1）: 返信が届いたらClaudeへ通知する ON/OFF。サーバ側（meta）に保存する。
+  const globalSettings = useQuery({ queryKey: ["global-settings"], queryFn: () => api.getGlobalSettings({}) });
+  const saveGlobalSettings = useMutation({
+    mutationFn: async (v: { notify_reply: boolean }) => await api.saveGlobalSettings(v),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["global-settings"] }),
+  });
 
   // 並び替え・簡易表示の選択はサーバ側（meta）にも保存し、次回開いた時に復元する。
   // この端末の localStorage は埋め込み表示では保持されないことがあるため、
@@ -2023,20 +2103,32 @@ function HomeView({ go }: { go: (v: View) => void }) {
   });
 
   if (home.isPending) {
-    return <p className="px-4 py-12 text-center text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>;
+    return <p className="px-4 py-12 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>;
   }
   if (home.error) {
     return (
       <div className="px-4 py-12 text-center">
-        <p className="text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>
+        <p className="text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>
         <button type="button" onClick={() => home.refetch()} className="mt-3 rounded-full px-5 py-2 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-          再読み込み
+          {T.common.reload}
         </button>
       </div>
     );
   }
   const { characters, groups, categories } = home.data;
   const categoryNameById = new Map(categories.map((c) => [c.id, c.name]));
+
+  // グループ一覧は更新された順（最終発言時刻の降順。自動生成分も含む）に並べ、
+  // 10件ごとにページ分けする（設計書 v2.0 / A）。個人一覧は従来通り。
+  const GROUP_PAGE_SIZE = 10;
+  const sortedGroups = [...groups].sort((a, b) =>
+    b.last_activity_at !== a.last_activity_at
+      ? b.last_activity_at.localeCompare(a.last_activity_at)
+      : a.id - b.id,
+  );
+  const groupPageCount = Math.max(1, Math.ceil(sortedGroups.length / GROUP_PAGE_SIZE));
+  const safeGroupPage = Math.min(groupPage, groupPageCount - 1);
+  const pageGroups = sortedGroups.slice(safeGroupPage * GROUP_PAGE_SIZE, safeGroupPage * GROUP_PAGE_SIZE + GROUP_PAGE_SIZE);
 
   // カテゴリ絞り込み＋並び替えを適用した表示用リスト（v1.25、階層対応 v1.26）。
   // カテゴリは複数設定できるため、絞り込みは「そのカテゴリ（子孫カテゴリを含む）に
@@ -2061,7 +2153,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         type="button"
         onClick={() => openView({ kind: "chat", characterId: c.id, unreadFromSeq: c.first_unread_seq })}
         className="flex min-w-0 flex-1 items-center gap-3 text-left"
-        aria-label={`${c.display_name}とのチャットを開く${c.unread_count > 0 ? `（未読の返信${c.unread_count}件）` : ""}`}
+        aria-label={T.home.openChatAria(c.display_name, c.unread_count)}
       >
         <span className="relative shrink-0">
           <Avatar imageUrl={c.image_url} name={c.display_name} themeColor={c.theme_color} size={40} />
@@ -2087,7 +2179,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         <StatusBadge status={c.request_status} />
         {c.unreplied_count > 0 && c.request_status === "none" && (
           <span className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>
-            未返信 {c.unreplied_count}
+            {T.status.unreplied(c.unreplied_count)}
           </span>
         )}
       </button>
@@ -2096,14 +2188,14 @@ function HomeView({ go }: { go: (v: View) => void }) {
         onClick={() => setMenuChar(c)}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full"
         style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
-        aria-label={`${c.display_name}の設定`}
+        aria-label={T.home.settingsAria(c.display_name)}
       >
         <GearIcon />
       </button>
       <button
         type="button"
         onClick={() => setConfirmDeleteChar(c)}
-        aria-label={`${c.display_name}を削除`}
+        aria-label={T.home.deleteAria(c.display_name)}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-base"
         style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
       >
@@ -2121,7 +2213,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         type="button"
         onClick={() => openView({ kind: "chat", characterId: c.id, unreadFromSeq: c.first_unread_seq })}
         className="flex w-full flex-col items-center gap-2 text-center"
-        aria-label={`${c.display_name}とのチャットを開く${c.unread_count > 0 ? `（未読の返信${c.unread_count}件）` : ""}`}
+        aria-label={T.home.openChatAria(c.display_name, c.unread_count)}
       >
         <span className="relative">
           <Avatar imageUrl={c.image_url} name={c.display_name} themeColor={c.theme_color} size={72} />
@@ -2148,7 +2240,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
           <StatusBadge status={c.request_status} />
           {c.unreplied_count > 0 && c.request_status === "none" && (
             <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>
-              未返信 {c.unreplied_count}
+              {T.status.unreplied(c.unreplied_count)}
             </span>
           )}
         </span>
@@ -2156,7 +2248,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
       <button
         type="button"
         onClick={() => setConfirmDeleteChar(c)}
-        aria-label={`${c.display_name}を削除`}
+        aria-label={T.home.deleteAria(c.display_name)}
         className="absolute top-2 right-2 flex h-9 w-9 items-center justify-center rounded-full text-base"
         style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
       >
@@ -2167,7 +2259,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         onClick={() => setMenuChar(c)}
         className="absolute top-2 left-2 flex h-9 w-9 items-center justify-center rounded-full"
         style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
-        aria-label={`${c.display_name}の設定`}
+        aria-label={T.home.settingsAria(c.display_name)}
       >
         <GearIcon />
       </button>
@@ -2176,11 +2268,11 @@ function HomeView({ go }: { go: (v: View) => void }) {
 
   return (
     <main className="mx-auto w-full max-w-2xl px-4 pb-10">
-      <div className="mt-4 flex rounded-full p-1" style={{ background: "var(--surface-alt)" }} role="tablist" aria-label="チャットの種類">
+      <div className="mt-4 flex rounded-full p-1" style={{ background: "var(--surface-alt)" }} role="tablist" aria-label={T.home.tabListAria}>
         {(
           [
-            { key: "personal", label: "個人" },
-            { key: "group", label: "グループ" },
+            { key: "personal", label: T.home.tabPersonal },
+            { key: "group", label: T.home.tabGroup },
           ] as const
         ).map((t) => (
           <button
@@ -2201,22 +2293,22 @@ function HomeView({ go }: { go: (v: View) => void }) {
         ))}
       </div>
       {homeTab === "personal" && (
-      <section aria-label="キャラクター">
+      <section aria-label={T.home.charactersSectionAria}>
         <div className="mt-4 flex items-center justify-between">
-          <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>キャラクター</h2>
+          <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>{T.home.charactersHeading}</h2>
           <button
             type="button"
             onClick={() => setShowImport(true)}
             className="rounded-full px-4 py-2 text-sm font-bold"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            キャラを追加
+            {T.home.addCharacter}
           </button>
         </div>
 
         {characters.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="char-sort">並び替え</label>
+            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="char-sort">{T.home.sortLabel}</label>
             <select
               id="char-sort"
               value={sort}
@@ -2224,9 +2316,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
               className="rounded-full px-3 py-1.5 text-sm font-bold"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
-              <option value="added">追加順</option>
-              <option value="gojuon">五十音順</option>
-              <option value="recent">最近使用した順</option>
+              <option value="added">{T.home.sortAdded}</option>
+              <option value="gojuon">{T.home.sortGojuon}</option>
+              <option value="recent">{T.home.sortRecent}</option>
             </select>
             <button
               type="button"
@@ -2239,9 +2331,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
                 border: "1px solid var(--border)",
               }}
             >
-              簡易表示{compact ? " ON" : ""}
+              {T.home.compactToggle(compact)}
             </button>
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="char-category-filter">カテゴリ</label>
+            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="char-category-filter">{T.common.category}</label>
             <select
               id="char-category-filter"
               value={categoryFilter === "all" ? "all" : categoryFilter === "none" ? "none" : String(categoryFilter)}
@@ -2252,11 +2344,11 @@ function HomeView({ go }: { go: (v: View) => void }) {
               className="rounded-full px-3 py-1.5 text-sm font-bold"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
-              <option value="all">すべて</option>
+              <option value="all">{T.common.all}</option>
               {categoryTreeEntries(categories).map(({ cat, depth }) => (
                 <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
-              <option value="none">未分類</option>
+              <option value="none">{T.common.uncategorized}</option>
             </select>
             <button
               type="button"
@@ -2264,7 +2356,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
               className="rounded-full px-3 py-1.5 text-sm font-bold"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
-              カテゴリ管理
+              {T.categoryManage.title}
             </button>
           </div>
         )}
@@ -2272,7 +2364,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         {characters.length === 0 ? (
           <div className="mt-4 rounded-3xl p-5" style={{ background: "var(--surface)" }}>
             <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-              まだキャラクターがいません。アバターテンプレ管理のプロファイルを取り込むか、書き出しJSONを貼って追加できます。
+              {T.home.noCharacters}
             </p>
             <div className="mt-4 flex flex-col gap-2">
               <button
@@ -2282,10 +2374,10 @@ function HomeView({ go }: { go: (v: View) => void }) {
                 className="rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
                 style={{ background: "var(--accent)" }}
               >
-                アバター管理から一括取り込み
+                {T.home.bulkImport}
               </button>
               {importKick.isSuccess && (
-                <p className="text-xs" style={{ color: "var(--dim)" }}>取り込みを開始しました。反映まで少し時間がかかります。この画面は自動で更新されます。</p>
+                <p className="text-xs" style={{ color: "var(--dim)" }}>{T.home.importStarted}</p>
               )}
               <button
                 type="button"
@@ -2293,13 +2385,13 @@ function HomeView({ go }: { go: (v: View) => void }) {
                 className="rounded-full px-4 py-2.5 font-bold"
                 style={{ background: "var(--surface-alt)", color: "var(--text)" }}
               >
-                書き出しJSONで追加
+                {T.home.addByJson}
               </button>
             </div>
           </div>
         ) : displayedCharacters.length === 0 ? (
           <p className="mt-4 rounded-3xl p-5 text-sm" style={{ background: "var(--surface)", color: "var(--dim)" }}>
-            このカテゴリのキャラクターはいません。キャラの設定メニュー「カテゴリを設定」から分類できます。
+            {T.home.categoryFilterEmpty}
           </p>
         ) : compact ? (
           <div className="mt-4 flex flex-col gap-2">
@@ -2314,9 +2406,10 @@ function HomeView({ go }: { go: (v: View) => void }) {
       )}
 
       {homeTab === "group" && (
-      <section aria-label="グループチャット">
+      <>
+      <section aria-label={T.home.groupsSectionAria}>
         <div className="mt-4 flex items-center justify-between">
-          <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>グループチャット</h2>
+          <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>{T.home.groupsHeading}</h2>
           <button
             type="button"
             onClick={() => setShowCreateGroup(true)}
@@ -2324,23 +2417,24 @@ function HomeView({ go }: { go: (v: View) => void }) {
             className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            グループを作る
+            {T.home.createGroup}
           </button>
         </div>
         {groups.length === 0 ? (
           <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>
-            キャラ同士の掛け合いを楽しむグループは、まだありません。1人から作れて、なりきり機能で自分も参加できます。
+            {T.home.noGroups}
           </p>
         ) : (
+          <>
           <div className="mt-3 flex flex-col gap-3">
-            {groups.map((g) => (
+            {pageGroups.map((g) => (
               <button
                 key={g.id}
                 type="button"
                 onClick={() => openView({ kind: "group", groupId: g.id, unreadFromSeq: g.first_unread_seq })}
                 className="relative flex w-full items-center gap-3 rounded-3xl p-4 text-left"
                 style={{ background: "var(--surface)" }}
-                aria-label={`グループ「${g.name}」を開く${g.unread_count > 0 ? `（未読の返信${g.unread_count}件）` : ""}`}
+                aria-label={T.home.openGroupAria(g.name, g.unread_count)}
               >
                 {g.unread_count > 0 && (
                   <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 rounded-t-3xl" style={{ background: "var(--danger)" }} />
@@ -2353,7 +2447,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
                 <span className="min-w-0 flex-1">
                   <span className="font-display block truncate font-bold" style={{ color: "var(--text)" }}>{g.name}</span>
                   <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
-                    {g.status === "dissolved" ? "解散済み（ログの閲覧のみ）" : g.member_names.join("・")}
+                    {g.status === "dissolved" ? T.home.groupDissolved : g.member_names.join("・")}
                   </span>
                 </span>
                 {g.unread_count > 0 && (
@@ -2367,23 +2461,106 @@ function HomeView({ go }: { go: (v: View) => void }) {
                 <StatusBadge status={g.request_status} />
                 {g.unreplied_count > 0 && g.request_status === "none" && (
                   <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--accent-soft)", color: "var(--gold)" }}>
-                    未返信 {g.unreplied_count}
+                    {T.status.unreplied(g.unreplied_count)}
                   </span>
                 )}
               </button>
             ))}
           </div>
+          {groupPageCount > 1 && (
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => changeGroupPage(safeGroupPage - 1)}
+                disabled={safeGroupPage === 0}
+                aria-label={T.home.prevPage}
+                className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                {T.home.prevPage}
+              </button>
+              <span className="text-xs font-bold" style={{ color: "var(--dim)" }}>
+                {T.home.pageIndicator(safeGroupPage + 1, groupPageCount, sortedGroups.length)}
+              </span>
+              <button
+                type="button"
+                onClick={() => changeGroupPage(safeGroupPage + 1)}
+                disabled={safeGroupPage >= groupPageCount - 1}
+                aria-label={T.home.nextPage}
+                className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-40"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                {T.home.nextPage}
+              </button>
+            </div>
+          )}
+          </>
         )}
       </section>
+
+      <SchedulingSection
+        data={schedulesQuery.data}
+        isPending={schedulesQuery.isPending}
+        isError={!!schedulesQuery.error}
+        onRetry={() => schedulesQuery.refetch()}
+        onCreate={() => setScheduleSheet({ mode: "create" })}
+        onEdit={(s) => setScheduleSheet({ mode: "edit", schedule: s })}
+      />
+      </>
       )}
 
       <p className="mt-10 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-        発言を送ると、連携済みのClaudeが分離した生成プロセスで自動で返信を書きます（数分かかることがあります）。返信に失敗した時は、送った文章が入力欄に戻るので、そのまま再送信できます。生成に渡される履歴は直近20発言までで、それより前の会話は参照されません。会話ログはこのアプリ内に保存されます。外部へのバックアップは無いため、アプリを削除するとログも消えます。
+        {T.home.footerNote}
       </p>
+
+      {/* 全体設定（v2.1）: 返信到着時のClaudeへの通知 ON/OFF。 */}
+      <section aria-label={T.home.globalSettingsAria} className="mt-10">
+        <h2 className="font-display text-base font-black" style={{ color: "var(--text)" }}>{T.home.globalSettingsHeading}</h2>
+        <label className="mt-3 flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={globalSettings.data?.notify_reply ?? false}
+            disabled={globalSettings.isPending || saveGlobalSettings.isPending}
+            onChange={(e) => saveGlobalSettings.mutate({ notify_reply: e.target.checked })}
+            aria-label={T.home.notifyReply}
+            className="mt-0.5 h-5 w-5 shrink-0"
+            style={{ accentColor: "var(--accent)" }}
+          />
+          <span>
+            <span className="block text-sm font-bold" style={{ color: "var(--text)" }}>{T.home.notifyReply}</span>
+            <span className="mt-1 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {T.home.notifyReplyDesc}
+            </span>
+          </span>
+        </label>
+        {saveGlobalSettings.isError && (
+          <p className="mt-2 text-xs font-bold" style={{ color: "var(--danger)" }}>{T.home.globalSettingsSaveFailed}</p>
+        )}
+      </section>
+
+      {/* 全体ログ（履歴ページ）への入口。目立たない形でページ下部に置く（設計書 v2.0 / D）。 */}
+      <div className="mt-8 text-center">
+        <button
+          type="button"
+          onClick={() => go({ kind: "logs" })}
+          className="px-3 py-1.5 text-xs"
+          style={{ color: "var(--dim)", opacity: 0.7 }}
+        >
+          {T.home.logsLink}
+        </button>
+      </div>
 
       {showImport && <ImportSheet onClose={() => setShowImport(false)} />}
       {showCreateGroup && (
         <CreateGroupSheet characters={characters} categories={categories} onClose={() => setShowCreateGroup(false)} go={openView} />
+      )}
+      {scheduleSheet && schedulesQuery.data && (
+        <ScheduleEditSheet
+          initial={scheduleSheet.mode === "edit" ? scheduleSheet.schedule : null}
+          eligibleGroups={schedulesQuery.data.eligible_groups}
+          categories={categories}
+          onClose={() => setScheduleSheet(null)}
+        />
       )}
       {showCategoryManage && (
         <CategoryManageSheet categories={categories} onClose={() => setShowCategoryManage(false)} />
@@ -2425,14 +2602,591 @@ function HomeView({ go }: { go: (v: View) => void }) {
       )}
       {confirmDeleteChar && (
         <ConfirmSheet
-          title={`${confirmDeleteChar.display_name}を削除しますか？`}
-          body={"このキャラクターとの会話ログも一緒に削除されます。参加しているグループからは除外され、過去の発言は名前を残して保持されます。"}
-          confirmLabel="削除する"
+          title={T.home.deleteCharacterTitle(confirmDeleteChar.display_name)}
+          body={T.home.deleteCharacterBody}
+          confirmLabel={T.common.deleteConfirm}
           busy={deleteChar.isPending}
           onCancel={() => setConfirmDeleteChar(null)}
           onConfirm={() => deleteChar.mutate(confirmDeleteChar.id)}
         />
       )}
+    </main>
+  );
+}
+
+// ------------------------------------------------------------------ scheduling (v2.0 / B)
+
+// 曜日ラベルは display-texts.ts に集約（設計書 v3.3）。
+const WEEKDAY_LABELS = T.schedule.weekdayLabels;
+
+function scheduleSummary(s: ScheduleItem): string {
+  const freq = s.frequency === "weekly"
+    ? T.schedule.freqWeekly(s.weekdays.map((d) => WEEKDAY_LABELS[d] ?? "").filter(Boolean).join("・"))
+    : T.schedule.freqDaily;
+  const target = s.target_type === "existing"
+    ? (s.target_group_name ? T.schedule.targetExisting(s.target_group_name) : T.schedule.targetMissing)
+    : T.schedule.targetNew;
+  return `${freq} ${s.times.join("・")} ／ ${target}`;
+}
+
+/** グループ一覧の下部に置く「スケジューリング」セクション。スケジュールの一覧・有効/無効・編集・削除と、作成ボタンを出す。 */
+function SchedulingSection({
+  data,
+  isPending,
+  isError,
+  onRetry,
+  onCreate,
+  onEdit,
+}: {
+  data: SchedulesData | undefined;
+  isPending: boolean;
+  isError: boolean;
+  onRetry: () => void;
+  onCreate: () => void;
+  onEdit: (s: ScheduleItem) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [confirmDelete, setConfirmDelete] = useState<ScheduleItem | null>(null);
+  const [error, setError] = useState("");
+  const toggle = useMutation({
+    mutationFn: async (v: { id: number; enabled: boolean }) => await api.setScheduleEnabled(v),
+    onSuccess: () => {
+      setError("");
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : T.schedule.toggleFailed),
+  });
+  const del = useMutation({
+    mutationFn: async (id: number) => await api.deleteSchedule({ id }),
+    onSuccess: () => {
+      setConfirmDelete(null);
+      setError("");
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.deleteFailed),
+  });
+  const schedules = data?.schedules ?? [];
+  return (
+    <section aria-label={T.schedule.sectionAria} className="mt-10">
+      <div className="flex items-center justify-between">
+        <h2 className="font-display text-xl font-black" style={{ color: "var(--text)" }}>{T.schedule.heading}</h2>
+        <button
+          type="button"
+          onClick={onCreate}
+          className="rounded-full px-4 py-2 text-sm font-bold"
+          style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+        >
+          {T.schedule.create}
+        </button>
+      </div>
+      <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+        {T.schedule.description}
+      </p>
+      {isPending && <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
+      {isError && (
+        <div className="mt-3">
+          <p className="text-sm" style={{ color: "var(--danger)" }}>{T.schedule.loadFailed}</p>
+          <button type="button" onClick={onRetry} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            {T.common.reload}
+          </button>
+        </div>
+      )}
+      {data && schedules.length === 0 && (
+        <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>{T.schedule.empty}</p>
+      )}
+      <div className="mt-3 flex flex-col gap-3">
+        {schedules.map((s) => (
+          <div key={s.id} className="rounded-3xl p-4" style={{ background: "var(--surface)" }}>
+            <div className="flex items-center gap-2">
+              <span className="font-display min-w-0 flex-1 truncate font-bold" style={{ color: "var(--text)" }}>{s.name}</span>
+              <label className="flex shrink-0 items-center gap-1.5 text-xs font-bold" style={{ color: "var(--text)" }}>
+                <input
+                  type="checkbox"
+                  checked={s.enabled}
+                  disabled={toggle.isPending}
+                  onChange={(e) => toggle.mutate({ id: s.id, enabled: e.target.checked })}
+                  aria-label={T.schedule.enabledAria(s.name)}
+                  className="h-5 w-5"
+                  style={{ accentColor: "var(--accent)" }}
+                />
+                {s.enabled ? T.schedule.enabled : T.schedule.disabled}
+              </label>
+            </div>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{scheduleSummary(s)}</p>
+            {(() => {
+              const parts = [
+                s.target_type === "new" ? T.schedule.drawFromCategories(s.min_members, s.max_members) : "",
+                s.allow_guests ? T.schedule.guestsOn : "",
+                s.allow_mobs ? T.schedule.mobsOn : "",
+                s.target_type === "new" && s.allow_narration ? T.schedule.narrationOn : "",
+              ].filter(Boolean);
+              return parts.length ? (
+                <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{parts.join(" ／ ")}</p>
+              ) : null;
+            })()}
+            <div className="mt-2.5 flex gap-2">
+              <button
+                type="button"
+                onClick={() => onEdit(s)}
+                className="rounded-full px-4 py-1.5 text-sm font-bold"
+                style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+              >
+                {T.common.edit}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setConfirmDelete(s); setError(""); }}
+                className="rounded-full px-4 py-1.5 text-sm font-bold"
+                style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
+              >
+                {T.common.delete}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+      {confirmDelete && (
+        <ConfirmSheet
+          title={T.schedule.deleteTitle(confirmDelete.name)}
+          body={T.schedule.deleteBody}
+          confirmLabel={T.common.deleteConfirm}
+          busy={del.isPending}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => del.mutate(confirmDelete.id)}
+        />
+      )}
+    </section>
+  );
+}
+
+/** スケジュールの作成・編集シート。スケジュール側ではキャラを指定しない（対象チャットの設定を参照するため）。新規チャット型の時だけカテゴリ・人数・背景情報を指定する。 */
+function ScheduleEditSheet({
+  initial,
+  eligibleGroups,
+  categories,
+  onClose,
+}: {
+  initial: ScheduleItem | null;
+  eligibleGroups: SchedulesData["eligible_groups"];
+  categories: CategoryItem[];
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const F = FIELDS.createSchedule;
+  const [name, setName] = useState(initial?.name ?? "");
+  const [enabled, setEnabled] = useState(initial?.enabled ?? true);
+  const [frequency, setFrequency] = useState<"daily" | "weekly">(initial?.frequency === "weekly" ? "weekly" : "daily");
+  const [weekdays, setWeekdays] = useState<number[]>(initial?.weekdays ?? []);
+  const [times, setTimes] = useState<string[]>(initial && initial.times.length ? initial.times : ["08:00"]);
+  const [targetType, setTargetType] = useState<"existing" | "new">(initial?.target_type === "new" ? "new" : "existing");
+  const [targetGroupId, setTargetGroupId] = useState<number | null>(initial?.target_group_id ?? null);
+  const [categoryIds, setCategoryIds] = useState<number[]>(initial?.category_ids ?? []);
+  const [minMembers, setMinMembers] = useState(initial?.min_members ?? 2);
+  const [maxMembers, setMaxMembers] = useState(initial?.max_members ?? 4);
+  const [allowGuests, setAllowGuests] = useState(initial?.allow_guests ?? false);
+  const [allowMobs, setAllowMobs] = useState(initial?.allow_mobs ?? false);
+  const [allowNarration, setAllowNarration] = useState(initial?.allow_narration ?? false);
+  const [backgroundText, setBackgroundText] = useState(initial?.background_text ?? "");
+  const [error, setError] = useState("");
+
+  const buildPayload = () => ({
+    name: name.trim(),
+    enabled,
+    frequency,
+    weekdays,
+    times: times.map((t) => t.trim()).filter(Boolean),
+    target_type: targetType,
+    target_group_id: targetType === "existing" ? targetGroupId : null,
+    category_ids: categoryIds,
+    min_members: minMembers,
+    max_members: maxMembers,
+    allow_guests: allowGuests,
+    allow_mobs: allowMobs,
+    allow_narration: allowNarration,
+    background_text: backgroundText,
+  });
+  const save = useMutation({
+    mutationFn: async () => {
+      const p = buildPayload();
+      return initial ? await api.updateSchedule({ id: initial.id, ...p }) : await api.createSchedule(p);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["schedules"] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+  });
+  const submit = () => {
+    if (!name.trim()) { setError(T.scheduleEdit.nameRequired); return; }
+    if (times.map((t) => t.trim()).filter(Boolean).length === 0) { setError(T.scheduleEdit.timeRequired); return; }
+    if (frequency === "weekly" && weekdays.length === 0) { setError(T.scheduleEdit.weekdayRequired); return; }
+    if (targetType === "existing" && targetGroupId == null) { setError(T.scheduleEdit.targetGroupRequired); return; }
+    if (targetType === "new" && categoryIds.length === 0) { setError(T.scheduleEdit.categoryRequired); return; }
+    if (minMembers > maxMembers) { setError(T.scheduleEdit.membersRangeError); return; }
+    setError("");
+    save.mutate();
+  };
+  // 対象グループの選択肢。編集時に現在の対象が選択肢（なりきり無効・解散していない
+  // グループ）に無い場合は、現状が分かるよう注記つきで1件追加する。
+  const groupOptions = [...eligibleGroups];
+  if (initial?.target_group_id != null && !groupOptions.some((g) => g.id === initial.target_group_id)) {
+    groupOptions.push({ id: initial.target_group_id, name: T.scheduleEdit.targetGroupUnavailable(initial.target_group_name ?? T.scheduleEdit.unknownGroup) });
+  }
+  const toggleWeekday = (d: number) =>
+    setWeekdays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
+  const toggleCategory = (id: number) =>
+    setCategoryIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={initial ? T.scheduleEdit.titleEdit : T.scheduleEdit.titleCreate}>
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{initial ? T.scheduleEdit.titleEdit : T.scheduleEdit.titleCreate}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={T.common.close}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-base"
+            style={{ background: "var(--surface-alt)", color: "var(--dim)" }}
+          >
+            ×
+          </button>
+        </div>
+
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-name">
+          {T.scheduleEdit.nameLabel}
+        </label>
+        <input
+          id="schedule-name"
+          {...F.name}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={T.scheduleEdit.namePlaceholder}
+          className="mt-1 w-full rounded-2xl px-3 py-2.5"
+          style={editInputStyle}
+        />
+        <label className="mt-3 flex items-center gap-2 text-sm font-bold" style={{ color: "var(--text)" }}>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-5 w-5" style={{ accentColor: "var(--accent)" }} />
+          {T.scheduleEdit.enableLabel}
+        </label>
+
+        <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.frequencyHeading}</p>
+        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label={T.scheduleEdit.frequencyAria}>
+          {(
+            [
+              { key: "daily", label: T.scheduleEdit.freqDaily },
+              { key: "weekly", label: T.scheduleEdit.freqWeekly },
+            ] as const
+          ).map((o) => (
+            <label key={o.key} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: frequency === o.key ? "var(--accent-soft)" : "transparent" }}>
+              <input type="radio" name="schedule-frequency" checked={frequency === o.key} onChange={() => setFrequency(o.key)} aria-label={o.label} className="h-5 w-5 shrink-0" />
+              <span className="font-bold" style={{ color: "var(--text)" }}>{o.label}</span>
+            </label>
+          ))}
+        </div>
+        {frequency === "weekly" && (
+          <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label={T.scheduleEdit.weekdaysAria}>
+            {WEEKDAY_LABELS.map((label, d) => {
+              const on = weekdays.includes(d);
+              return (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => toggleWeekday(d)}
+                  aria-pressed={on}
+                  aria-label={T.scheduleEdit.weekdayAria(label)}
+                  className="h-10 w-10 rounded-full text-sm font-bold"
+                  style={
+                    on
+                      ? { background: "var(--accent)", color: "#fff" }
+                      : { background: "var(--surface-alt)", color: "var(--text)" }
+                  }
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.timesHeading}</p>
+        <div className="mt-2 flex flex-col gap-2">
+          {times.map((t, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="time"
+                value={t}
+                onChange={(e) => setTimes((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))}
+                aria-label={T.scheduleEdit.timeAria(i)}
+                className="rounded-2xl px-3 py-2.5"
+                style={editInputStyle}
+              />
+              {times.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setTimes((prev) => prev.filter((_, j) => j !== i))}
+                  aria-label={T.scheduleEdit.timeDeleteAria(i)}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base"
+                  style={{ background: "var(--surface-alt)", color: "var(--danger)" }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+          {times.length < 10 && (
+            <button
+              type="button"
+              onClick={() => setTimes((prev) => [...prev, "12:00"])}
+              className="self-start rounded-full px-4 py-2 text-sm font-bold"
+              style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+            >
+              {T.scheduleEdit.addTime}
+            </button>
+          )}
+        </div>
+
+        <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.targetHeading}</p>
+        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label={T.scheduleEdit.targetTypeAria}>
+          {(
+            [
+              { key: "existing", label: T.scheduleEdit.targetExistingLabel, desc: T.scheduleEdit.targetExistingDesc },
+              { key: "new", label: T.scheduleEdit.targetNewLabel, desc: T.scheduleEdit.targetNewDesc },
+            ] as const
+          ).map((o) => (
+            <label key={o.key} className="flex cursor-pointer items-start gap-3 rounded-2xl px-2 py-2" style={{ background: targetType === o.key ? "var(--accent-soft)" : "transparent" }}>
+              <input type="radio" name="schedule-target-type" checked={targetType === o.key} onChange={() => setTargetType(o.key)} aria-label={o.label} className="mt-0.5 h-5 w-5 shrink-0" />
+              <span>
+                <span className="block font-bold" style={{ color: "var(--text)" }}>{o.label}</span>
+                <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{o.desc}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+
+        {targetType === "existing" && (
+          <div className="mt-3">
+            <label className="block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-target-group">
+              {T.scheduleEdit.targetGroupLabel}
+            </label>
+            <select
+              id="schedule-target-group"
+              value={targetGroupId === null ? "" : String(targetGroupId)}
+              onChange={(e) => setTargetGroupId(e.target.value === "" ? null : Number(e.target.value))}
+              className="mt-1 w-full rounded-2xl px-3 py-2.5"
+              style={editInputStyle}
+            >
+              <option value="">{T.scheduleEdit.targetGroupPlaceholder}</option>
+              {groupOptions.map((g) => (
+                <option key={g.id} value={String(g.id)}>{g.name}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {T.scheduleEdit.targetGroupNote}
+            </p>
+          </div>
+        )}
+
+        {targetType === "new" && (
+          <div className="mt-3">
+            <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.drawCategoriesHeading}</p>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {T.scheduleEdit.drawCategoriesNote}
+            </p>
+            {categories.length === 0 && (
+              <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.common.noCategoriesYet}</p>
+            )}
+            <div className="mt-2 flex flex-col gap-2" role="group" aria-label={T.common.categoryFilterGroupAria}>
+              {categoryTreeEntries(categories).map(({ cat, depth }) => {
+                const selected = categoryIds.includes(cat.id);
+                return (
+                  <label
+                    key={cat.id}
+                    className="flex items-center gap-3 rounded-2xl px-4 py-3"
+                    style={{
+                      background: selected ? "var(--accent-soft)" : "var(--surface-alt)",
+                      color: "var(--text)",
+                      outline: selected ? "2px solid var(--accent)" : "none",
+                      marginLeft: depth * 20,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => toggleCategory(cat.id)}
+                      aria-label={T.common.categoryAria(cat.name)}
+                      className="h-5 w-5 shrink-0"
+                      style={{ accentColor: "var(--accent)" }}
+                    />
+                    <span className="font-bold">
+                      {depth > 0 && <span aria-hidden="true" style={{ color: "var(--dim)" }}>└ </span>}
+                      {cat.name}
+                    </span>
+                    {selected && <span className="ml-auto text-xs font-bold" style={{ color: "var(--accent)" }}>{T.common.selected}</span>}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="mt-3 flex items-center gap-3">
+              <label className="text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="schedule-min-members">{T.scheduleEdit.membersLabel}</label>
+              <select
+                id="schedule-min-members"
+                value={String(minMembers)}
+                onChange={(e) => setMinMembers(Number(e.target.value))}
+                aria-label={T.scheduleEdit.minMembersAria}
+                className="rounded-2xl px-3 py-2"
+                style={editInputStyle}
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={String(n)}>{T.common.memberCount(n)}</option>
+                ))}
+              </select>
+              <span style={{ color: "var(--dim)" }}>〜</span>
+              <select
+                value={String(maxMembers)}
+                onChange={(e) => setMaxMembers(Number(e.target.value))}
+                aria-label={T.scheduleEdit.maxMembersAria}
+                className="rounded-2xl px-3 py-2"
+                style={editInputStyle}
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={String(n)}>{T.common.memberCount(n)}</option>
+                ))}
+              </select>
+            </div>
+            <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.guestMobNarrationHeading}</p>
+            <div className="mt-2 flex flex-col gap-1">
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowGuests} onChange={(e) => setAllowGuests(e.target.checked)} aria-label={T.guestMob.allowGuestsAria} className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.guestsOn}</span>
+              </label>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowMobs ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowMobs} onChange={(e) => setAllowMobs(e.target.checked)} aria-label={T.guestMob.allowMobsAria} className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.mobsOn}</span>
+              </label>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
+                <input type="checkbox" checked={allowNarration} onChange={(e) => setAllowNarration(e.target.checked)} aria-label={T.guestMob.allowNarrationAria} className="h-5 w-5 shrink-0" />
+                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.narrationOn}</span>
+              </label>
+            </div>
+            <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }}>
+              {T.scheduleEdit.backgroundLabel}
+              <textarea
+                {...F.background_text}
+                value={backgroundText}
+                onChange={(e) => setBackgroundText(e.target.value)}
+                rows={4}
+                placeholder={T.scheduleEdit.backgroundPlaceholder}
+                className="mt-1 w-full rounded-2xl px-3 py-2.5 font-normal"
+                style={editInputStyle}
+              />
+            </label>
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+              {T.scheduleEdit.backgroundNote}
+            </p>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <div className="mt-4 flex gap-3">
+          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            {T.common.cancel}
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={save.isPending}
+            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+            style={{ background: "var(--accent)" }}
+          >
+            {save.isPending ? T.common.saving : initial ? T.common.save : T.scheduleEdit.create}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ app logs (v2.0 / D)
+
+// 種別ラベルは display-texts.ts に集約（設計書 v3.3）。
+const LOG_KIND_LABELS: Record<string, string> = T.logs.kindLabels;
+
+function LogBody({ id }: { id: number }) {
+  const q = useQuery({ queryKey: ["app-log", id], queryFn: () => api.getAppLogBody({ id }) });
+  if (q.isPending) return <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>;
+  if (q.error) {
+    return (
+      <div className="mt-2">
+        <p className="text-sm" style={{ color: "var(--danger)" }}>{T.logs.bodyLoadFailed}</p>
+        <button type="button" onClick={() => q.refetch()} className="mt-1 rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--text)" }}>
+          {T.common.reload}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <pre className="mt-2 max-h-80 overflow-auto rounded-xl p-3 text-xs leading-relaxed whitespace-pre-wrap break-words" style={{ background: "var(--surface)", color: "var(--text)" }}>
+      {q.data?.body || T.logs.bodyEmpty}
+    </pre>
+  );
+}
+
+/** 全体ログ（履歴ページ）。見出しのみの一覧で、タップした行だけ本文を個別に読み込んで開閉表示する。 */
+function LogsView({ back }: { back: () => void }) {
+  const logs = useQuery({ queryKey: ["app-logs"], queryFn: () => api.listAppLogs({}), refetchInterval: 20000 });
+  const [openId, setOpenId] = useState<number | null>(null);
+  const items: AppLogItem[] = logs.data?.logs ?? [];
+  return (
+    <main className="mx-auto w-full max-w-2xl px-4 pb-10">
+      <div className="mt-4 flex items-center gap-3">
+        <button type="button" onClick={back} aria-label={T.common.backToList} className="flex h-10 w-10 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
+          ←
+        </button>
+        <h2 className="font-display text-lg font-black" style={{ color: "var(--text)" }}>{T.logs.title}</h2>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+        {T.logs.description}
+      </p>
+      {logs.isPending && <p className="mt-6 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
+      {logs.error && (
+        <div className="mt-6 text-center">
+          <p className="text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>
+          <button type="button" onClick={() => logs.refetch()} className="mt-3 rounded-full px-5 py-2 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            {T.common.reload}
+          </button>
+        </div>
+      )}
+      {logs.data && items.length === 0 && (
+        <p className="mt-6 rounded-3xl p-5 text-sm" style={{ background: "var(--surface)", color: "var(--dim)" }}>
+          {T.logs.empty}
+        </p>
+      )}
+      <div className="mt-4 flex flex-col gap-2">
+        {items.map((l) => {
+          const open = openId === l.id;
+          return (
+            <div key={l.id} className="rounded-2xl px-3 py-2.5" style={{ background: "var(--surface-alt)" }}>
+              <button
+                type="button"
+                onClick={() => setOpenId(open ? null : l.id)}
+                aria-expanded={open}
+                aria-label={T.logs.toggleAria(l.title, open)}
+                className="flex w-full items-center gap-2 text-left"
+              >
+                <span className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
+                  {LOG_KIND_LABELS[l.kind] ?? l.kind}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-sm font-bold" style={{ color: "var(--text)" }}>{l.title}</span>
+                <span className="shrink-0 text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(l.created_at)}</span>
+                <span aria-hidden="true" className="shrink-0 text-xs" style={{ color: "var(--dim)" }}>{open ? "▲" : "▼"}</span>
+              </button>
+              {open && <LogBody id={l.id} />}
+            </div>
+          );
+        })}
+      </div>
     </main>
   );
 }
@@ -2445,23 +3199,23 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
   const importChar = useMutation({
     mutationFn: async (text: string) => await api.importCharacter({ json: text }),
     onSuccess: (r) => {
-      setDone(r.is_new ? `「${r.display_name}」を追加しました。` : `「${r.display_name}」の設定を更新しました（会話履歴は保持されています）。`);
+      setDone(r.is_new ? T.importSheet.addedNotice(r.display_name) : T.importSheet.updatedNotice(r.display_name));
       setJson("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "取り込みに失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.importSheet.importFailed),
   });
   const importKick = useMutation({ mutationFn: async () => await api.requestImport({}) });
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="キャラクターを追加">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.importSheet.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>キャラクターを追加</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.importSheet.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          アバターテンプレ管理アプリの書き出しJSON（avatar-profile形式）を貼ると、そのキャラクターを追加できます。同じプロファイルの再取り込みでは、設定だけが更新され、会話履歴は残ります。ここからの追加では画像は付きません（画像つきで取り込む場合は下の一括取り込みを使ってください）。
+          {T.importSheet.description}
         </p>
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="import-json">
-          書き出しJSON
+          {T.importSheet.jsonLabel}
         </label>
         <textarea
           id="import-json"
@@ -2477,19 +3231,19 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
         {done && <p className="mt-2 text-sm" style={{ color: "var(--gold)" }}>{done}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            閉じる
+            {T.common.close}
           </button>
           <button
             type="button"
             disabled={importChar.isPending}
             onClick={() => {
-              if (!json.trim()) { setError("JSONを貼ってください。"); return; }
+              if (!json.trim()) { setError(T.importSheet.jsonRequired); return; }
               importChar.mutate(json);
             }}
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            取り込む
+            {T.importSheet.importButton}
           </button>
         </div>
         <div className="mt-5 border-t pt-4" style={{ borderColor: "var(--border)" }}>
@@ -2500,10 +3254,10 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
             className="w-full rounded-full px-4 py-2.5 font-bold disabled:opacity-50"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            アバター管理から一括取り込み（画像つき）
+            {T.importSheet.bulkImportWithImages}
           </button>
           {importKick.isSuccess && (
-            <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>取り込みを開始しました。反映まで少し時間がかかります。</p>
+            <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>{T.home.importStartedShort}</p>
           )}
         </div>
       </div>
@@ -2517,6 +3271,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
   const [selected, setSelected] = useState<number[]>([]);
   const [allowGuests, setAllowGuests] = useState(false);
   const [allowMobs, setAllowMobs] = useState(false);
+  const [allowNarration, setAllowNarration] = useState(false);
   const [error, setError] = useState("");
   // シート内のカテゴリ絞り込み（v1.23、階層対応 v1.26）: "all" = 未指定（全員）/
   // "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
@@ -2531,41 +3286,41 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
     "gojuon",
   );
   const create = useMutation({
-    mutationFn: async () => await api.createGroup({ name: name.trim(), character_ids: selected, allow_guests: allowGuests, allow_mobs: allowMobs }),
+    mutationFn: async () => await api.createGroup({ name: name.trim(), character_ids: selected, allow_guests: allowGuests, allow_mobs: allowMobs, allow_narration: allowNarration }),
     onSuccess: (r) => {
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
       go({ kind: "group", groupId: r.id, unreadFromSeq: null });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "作成に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.createGroup.createFailed),
   });
   const toggle = (id: number) => {
     setSelected((prev) => {
       if (prev.includes(id)) return prev.filter((x) => x !== id);
-      if (prev.length >= 8) { setError("グループは最大8人までです。"); return prev; }
+      if (prev.length >= 8) { setError(T.createGroup.maxMembersError); return prev; }
       setError("");
       return [...prev, id];
     });
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="グループを作る">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.createGroup.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>グループを作る</h2>
-        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="group-name">グループ名（任意）</label>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.createGroup.title}</h2>
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="group-name">{T.createGroup.nameLabel}</label>
         <input
           id="group-name"
           {...FIELDS.createGroup.name}
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="空欄なら参加キャラ名から自動で付けます"
+          placeholder={T.createGroup.namePlaceholder}
           className="mt-1 w-full rounded-2xl px-3 py-2 text-sm"
           style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
         />
-        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>参加キャラクター（1〜8人）</p>
-        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>1人だけでも作れます。作成後に「なりきり」を設定すると、自分がそのキャラとして参加できます。</p>
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.createGroup.membersHeading}</p>
+        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.createGroup.membersNote}</p>
         {categories.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-create-category-filter">カテゴリ</label>
+            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-create-category-filter">{T.common.category}</label>
             <select
               id="group-create-category-filter"
               value={catFilter === "all" ? "all" : catFilter === "none" ? "none" : String(catFilter)}
@@ -2576,13 +3331,13 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
               className="rounded-full px-3 py-1.5 text-sm font-bold"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
-              <option value="all">すべて</option>
+              <option value="all">{T.common.all}</option>
               {categoryTreeEntries(categories).map(({ cat, depth }) => (
                 <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
-              <option value="none">未分類</option>
+              <option value="none">{T.common.uncategorized}</option>
             </select>
-            <span className="text-xs" style={{ color: "var(--dim)" }}>選択中 {selected.length}人</span>
+            <span className="text-xs" style={{ color: "var(--dim)" }}>{T.common.selectedCount(selected.length)}</span>
           </div>
         )}
         <div className="mt-2 flex flex-col gap-1">
@@ -2592,7 +3347,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
                 type="checkbox"
                 checked={selected.includes(c.id)}
                 onChange={() => toggle(c.id)}
-                aria-label={`${c.display_name}を参加させる`}
+                aria-label={T.createGroup.joinAria(c.display_name)}
                 className="h-5 w-5 shrink-0"
               />
               <Avatar imageUrl={c.image_url} name={c.display_name} themeColor={c.theme_color} size={36} />
@@ -2600,49 +3355,59 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
             </label>
           ))}
           {visibleCharacters.length === 0 && (
-            <p className="px-2 py-3 text-sm" style={{ color: "var(--dim)" }}>このカテゴリのキャラクターはいません。</p>
+            <p className="px-2 py-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.categoryEmpty}</p>
           )}
         </div>
-        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>ゲスト・モブ</p>
-        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>オンにすると、会話の流れに応じて参加者以外が混じることがあります（混じらないこともあります）。作成後もグループの設定から変えられます。</p>
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.createGroup.guestMobNarrationHeading}</p>
+        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.createGroup.guestMobNarrationNote}</p>
         <div className="mt-2 flex flex-col gap-1">
           <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
             <input
               type="checkbox"
               checked={allowGuests}
               onChange={(e) => setAllowGuests(e.target.checked)}
-              aria-label="ゲストを許可する"
+              aria-label={T.guestMob.allowGuestsAria}
               className="h-5 w-5 shrink-0"
             />
-            <span className="font-bold" style={{ color: "var(--text)" }}>ゲスト（参加していないキャラが名前つきで入ることがある）</span>
+            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.guestLabel}</span>
           </label>
           <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowMobs ? "var(--accent-soft)" : "transparent" }}>
             <input
               type="checkbox"
               checked={allowMobs}
               onChange={(e) => setAllowMobs(e.target.checked)}
-              aria-label="モブを許可する"
+              aria-label={T.guestMob.allowMobsAria}
               className="h-5 w-5 shrink-0"
             />
-            <span className="font-bold" style={{ color: "var(--text)" }}>モブ（住民・生徒などの名前のない人々が入ることがある）</span>
+            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.mobLabel}</span>
+          </label>
+          <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
+            <input
+              type="checkbox"
+              checked={allowNarration}
+              onChange={(e) => setAllowNarration(e.target.checked)}
+              aria-label={T.guestMob.allowNarrationAria}
+              className="h-5 w-5 shrink-0"
+            />
+            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.narrationLabel}</span>
           </label>
         </div>
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
             disabled={create.isPending}
             onClick={() => {
-              if (selected.length < 1) { setError("キャラクターを1人以上選んでください。"); return; }
+              if (selected.length < 1) { setError(T.createGroup.selectRequired); return; }
               create.mutate();
             }}
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            作成する
+            {T.createGroup.create}
           </button>
         </div>
       </div>
@@ -2726,7 +3491,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : "送信に失敗しました"),
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "chat", target_id: characterId }),
@@ -2736,14 +3501,14 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
         setDraft((prev) => (prev.trim() ? `${res.restored_text}\n${prev}` : res.restored_text));
         setFailNotice("");
         setSendError("");
-        setCancelNotice("送信を取り消しました。文章を入力欄に戻しました。");
+        setCancelNotice(T.chat.cancelDoneNotice);
       } else {
-        setCancelNotice("生成が始まっているため、取り消せませんでした。");
+        setCancelNotice(T.chat.cancelTooLateNotice);
       }
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : "取り消しに失敗しました"),
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.cancelFailed),
   });
   const clear = useMutation({
     mutationFn: async () => await api.clearChatHistory({ character_id: characterId }),
@@ -2753,20 +3518,32 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
+  // 履歴の使用設定の切り替え（設計書 v3.2）。「使わない」へ切り替えた時点で
+  // サーバ側が境界と新しい区間を記録する。
+  const historyToggle = useMutation({
+    mutationFn: async (v: boolean) => await api.setUseHistory({ target_kind: "chat", target_id: characterId, use_history: v }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
+    },
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.historyChangeFailed),
+  });
   const submitReview = useMutation({
     mutationFn: async (args: { message_id: number; feedback: string }) =>
       await api.submitReview({ target_kind: "chat", target_id: characterId, message_id: args.message_id, feedback: args.feedback }),
     onSuccess: () => {
       setSelectedReviewId(null);
       setReviewError("");
-      setReviewNotice("レビューを登録しました。見直しが終わると設定へ自動で反映されます。結果はレビュー履歴で確認できます。");
+      setReviewNotice(T.review.registeredNotice);
       queryClient.invalidateQueries({ queryKey: ["reviewHistory", characterId] });
     },
-    onError: (e) => setReviewError(e instanceof Error ? e.message : "レビューの送信に失敗しました"),
+    onError: (e) => setReviewError(e instanceof Error ? e.message : T.review.submitFailed),
   });
 
   const data: ChatState | undefined = state.data;
   const req = data?.request;
+  const chatSegments = groupIntoSegments(data?.messages ?? []);
+  // 区間フレーム内の発言描画で使うキャラ情報。発言がある時点で data は必ずある。
+  const chatCharacter = data?.character;
   const selectedReviewMsg = data?.messages.find((m) => m.id === selectedReviewId && m.speaker === "character") ?? null;
 
   // 返信待ち（pending / 生成中）の間は送信できない。取り消しボタンは
@@ -2774,14 +3551,14 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
   // 下に出す。生成が始まったら（processing）もう取り消せないので出さない。
   const waiting = req?.status === "pending" || req?.status === "processing";
   const chatUserMsgs = (data?.messages ?? []).filter((m) => m.speaker === "user");
-  const unrepliedMsgs = req?.status === "pending" && req.unreplied_count > 0 ? chatUserMsgs.slice(-req.unreplied_count) : [];
+  const unrepliedMsgs = req?.status === "pending" && req.origin !== "auto" && req.unreplied_count > 0 ? chatUserMsgs.slice(-req.unreplied_count) : [];
   const cancelTargetId = unrepliedMsgs.length ? unrepliedMsgs[unrepliedMsgs.length - 1]!.id : null;
 
   // 送信ボタンと Enter キーで共用する送信処理。
   const submitDraft = () => {
     if (post.isPending) return;
-    if (waiting) { setSendError("返信が来るまで送信できません。"); return; }
-    if (!draft.trim()) { setSendError("メッセージを入力してください。"); return; }
+    if (waiting) { setSendError(T.chat.waitingError); return; }
+    if (!draft.trim()) { setSendError(T.chat.emptyMessageError); return; }
     post.mutate(draft.trim());
   };
 
@@ -2790,37 +3567,58 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       className="fixed top-0 right-0 left-0 mx-auto flex w-full max-w-2xl flex-col"
       style={{ height: "100dvh", background: "var(--bg)" }}
     >
-      <header className="flex shrink-0 items-center gap-3 px-3 pt-safe pb-2" style={{ background: "var(--bg)" }}>
-        <button type="button" onClick={back} aria-label="一覧へ戻る" className="flex h-10 w-10 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
-          ←
-        </button>
+      <header className="shrink-0 px-3 pt-safe pb-2" style={{ background: "var(--bg)" }}>
+        <div className="flex items-center gap-3">
+          <button type="button" onClick={back} aria-label={T.common.backToList} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
+            ←
+          </button>
+          {data && (
+            <>
+              <Avatar imageUrl={data.character.image_url} name={data.character.display_name} themeColor={data.character.theme_color} size={40} />
+              <h2 className="font-display min-w-0 flex-1 truncate text-lg font-black" style={{ color: "var(--text)" }}>{data.character.display_name}</h2>
+            </>
+          )}
+        </div>
         {data && (
-          <>
-            <Avatar imageUrl={data.character.image_url} name={data.character.display_name} themeColor={data.character.theme_color} size={40} />
-            <h2 className="font-display min-w-0 flex-1 truncate text-lg font-black" style={{ color: "var(--text)" }}>{data.character.display_name}</h2>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => setShowImageEdit(true)}
-              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold whitespace-nowrap"
               style={{ background: "var(--surface)", color: "var(--dim)" }}
             >
-              画像変更
+              {T.chat.imageChange}
             </button>
             <button
               type="button"
               onClick={() => setConfirmClear(true)}
-              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold whitespace-nowrap"
               style={{ background: "var(--surface)", color: "var(--dim)" }}
             >
-              履歴クリア
+              {T.chat.clearHistory}
             </button>
             <button
               type="button"
               onClick={() => setShowExport(true)}
-              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold whitespace-nowrap"
               style={{ background: "var(--surface)", color: "var(--dim)" }}
             >
-              全文出力
+              {T.chat.export}
+            </button>
+            <button
+              type="button"
+              onClick={() => historyToggle.mutate(!data.use_history)}
+              disabled={historyToggle.isPending}
+              aria-pressed={data.use_history}
+              aria-label={T.chat.historyToggleAria}
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold whitespace-nowrap disabled:opacity-50"
+              style={
+                data.use_history
+                  ? { background: "var(--accent)", color: "#fff" }
+                  : { background: "var(--surface)", color: "var(--dim)" }
+              }
+            >
+              {data.use_history ? T.chat.historyOn : T.chat.historyOff}
             </button>
             <ReviewModeToggle
               active={reviewMode}
@@ -2830,14 +3628,14 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                 setReviewError("");
               }}
             />
-          </>
+          </div>
         )}
       </header>
 
       {reviewMode && (
         <div className="mx-3 mt-1 flex items-center gap-2 rounded-xl px-3 py-2" style={{ background: "var(--surface)" }} role="status">
           <p className="min-w-0 flex-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-            レビューモード中です。キャラの発言をタップして選ぶと、設定と違う点を指摘できます。
+            {T.review.chatBanner}
           </p>
           <button
             type="button"
@@ -2845,24 +3643,31 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
             className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
             style={{ background: "var(--surface-alt)", color: "var(--text)" }}
           >
-            レビュー履歴
+            {T.review.historyButton}
           </button>
         </div>
       )}
 
       {req && <RequestBanner request={req} />}
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none px-3 py-3">
-        {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
-        {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>}
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none py-3">
+        {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
+        {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>}
         {data && data.messages.length === 0 && (
           <p className="py-8 text-center text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-            まだ会話がありません。下の入力欄から話しかけてみてください。
-            <br />送信すると、自動で返信が届きます。
+            {T.chat.emptyLine1}
+            <br />{T.chat.emptyLine2}
           </p>
         )}
-        <div className="flex flex-col gap-3">
-          {data?.messages.map((m) => (
+        <div className="flex flex-col">
+          {chatSegments.map((seg, segIndex) => (
+            <Fragment key={seg.segmentNo}>
+              {segIndex > 0 && <SegmentBand date={seg.date} />}
+              <div
+                className={`relative z-10 flex flex-col gap-3 px-4 py-3 ${segIndex > 0 ? "rounded-t-3xl" : ""} ${segIndex < chatSegments.length - 1 ? "rounded-b-3xl" : ""}`}
+                style={{ background: "var(--segment)" }}
+              >
+              {seg.messages.map((m) => (
             <Fragment key={m.id}>
               {unreadFromSeq != null && m.seq === unreadFromSeq && (
                 <div ref={(el) => { dividerRef.current = el; }}>
@@ -2880,24 +3685,24 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                     type="button"
                     onClick={() => cancelSend.mutate()}
                     disabled={cancelSend.isPending}
-                    aria-label="この送信を取り消す"
+                    aria-label={T.chat.cancelSendAria}
                     className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
                     style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
                   >
-                    送信を取り消す
+                    {T.chat.cancelSend}
                   </button>
                 )}
               </div>
             ) : (
               <div className="flex items-start gap-2">
-                <Avatar imageUrl={data.character.image_url} name={data.character.display_name} themeColor={data.character.theme_color} size={32} />
+                <Avatar imageUrl={chatCharacter?.image_url ?? null} name={chatCharacter?.display_name ?? ""} themeColor={chatCharacter?.theme_color ?? ""} size={32} />
                 <div className="flex max-w-[82%] flex-col">
                   {reviewMode ? (
                     <button
                       type="button"
                       onClick={() => { setSelectedReviewId(m.id); setReviewError(""); setReviewNotice(""); }}
                       aria-pressed={selectedReviewId === m.id}
-                      aria-label={`この発言をレビュー対象に選ぶ: ${m.body.slice(0, 40)}`}
+                      aria-label={T.review.selectMessageAria(m.body.slice(0, 40))}
                       className="rounded-3xl rounded-bl-md px-4 py-2.5 text-left text-base whitespace-pre-wrap"
                       style={{
                         background: selectedReviewId === m.id ? "var(--accent-soft)" : "var(--surface)",
@@ -2918,6 +3723,9 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
               </div>
               )}
             </Fragment>
+              ))}
+              </div>
+            </Fragment>
           ))}
         </div>
       </div>
@@ -2926,7 +3734,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
         {reviewNotice && (
           <div className="mb-2 flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: "var(--accent-soft)" }} role="status">
             <p className="min-w-0 flex-1 text-sm" style={{ color: "var(--text)" }}>{reviewNotice}</p>
-            <button type="button" onClick={() => setReviewNotice("")} aria-label="通知を閉じる" className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
+            <button type="button" onClick={() => setReviewNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
           </div>
         )}
         {reviewMode && selectedReviewMsg && data && (
@@ -2948,11 +3756,11 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
         {cancelNotice && (
           <div className="mb-2 flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: "var(--accent-soft)" }} role="status">
             <p className="min-w-0 flex-1 text-sm" style={{ color: "var(--text)" }}>{cancelNotice}</p>
-            <button type="button" onClick={() => setCancelNotice("")} aria-label="通知を閉じる" className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
+            <button type="button" onClick={() => setCancelNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
           </div>
         )}
         <div className="flex items-end gap-2 pb-2">
-          <label className="sr-only" htmlFor="chat-input">メッセージ</label>
+          <label className="sr-only" htmlFor="chat-input">{T.chat.inputLabel}</label>
           <textarea
             id="chat-input"
             {...FIELDS.postMessage.body}
@@ -2968,7 +3776,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
               }
             }}
             rows={2}
-            placeholder={waiting ? "返信待ちです（返信が来るまで送信できません）" : "メッセージを書く"}
+            placeholder={waiting ? T.chat.waitingPlaceholder : T.chat.inputPlaceholder}
             className="min-w-0 flex-1 rounded-3xl px-4 py-2.5 text-base"
             style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
           />
@@ -2979,7 +3787,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
             className="shrink-0 rounded-full px-5 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            送信
+            {T.chat.send}
           </button>
         </div>
         {sendError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{sendError}</p>}
@@ -2996,7 +3804,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
       {showExport && data && (
         <ExportSheet
-          title={`${data.character.display_name}とのチャット全文`}
+          title={T.exportSheet.chatTitle(data.character.display_name)}
           queryKey={["export-chat", String(characterId)]}
           fetchText={() => api.exportChatText({ character_id: characterId })}
           onClose={() => setShowExport(false)}
@@ -3013,9 +3821,9 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
       {confirmClear && (
         <ConfirmSheet
-          title="履歴をクリアしますか？"
-          body="このキャラクターとの会話ログが全て消えます。元には戻せません。"
-          confirmLabel="クリアする"
+          title={T.chat.clearConfirmTitle}
+          body={T.chat.clearConfirmBody}
+          confirmLabel={T.chat.clearConfirm}
           busy={clear.isPending}
           onCancel={() => setConfirmClear(false)}
           onConfirm={() => clear.mutate()}
@@ -3027,7 +3835,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
 // ------------------------------------------------------------------ group chat
 
-/** なりきり設定シート（v1.19 / v1.20）: なりきるキャラの選択（未選択で解除）と、「なりきりキャラの台詞」の扱い（AIも演じる / 自分だけが演じる）を選ぶ。どちらを選んでも、発言したらAIは返信する。 */
+/** なりきり設定シート（v1.19 / v1.20 / v1.30）: なりきるキャラの選択（未選択で解除）と、「なりきりキャラの台詞」の扱い（AIも演じる / 自分だけが演じる）を選ぶ。どちらを選んでも、発言したらAIは返信する。台詞の既定値は、なりきり未設定のグループでは「AIも演じる」。すでに保存済みのグループは保存値をそのまま初期値にし、「自分だけが演じる」を選んで保存した選択は変えない。 */
 function RoleplaySheet({
   groupId,
   members,
@@ -3043,7 +3851,10 @@ function RoleplaySheet({
 }) {
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<number | null>(currentCharacterId);
-  const [cont, setCont] = useState<boolean>(currentContinue);
+  // 既定値（v1.30）: なりきり未設定（currentCharacterId が null）のグループで
+  // キャラを新たに選ぶ時は「AIも演じる」を既定にする。保存済みのグループは
+  // 保存値 currentContinue をそのまま初期値にし、既存の選択を勝手に変えない。
+  const [cont, setCont] = useState<boolean>(currentCharacterId == null ? true : currentContinue);
   const [error, setError] = useState("");
   const save = useMutation({
     mutationFn: async () => await api.setGroupRoleplay({ group_id: groupId, character_id: selected, continue_mode: cont }),
@@ -3052,30 +3863,30 @@ function RoleplaySheet({
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
   });
   // なりきりに選べるのは、キャラ本体が存在し、現在も参加しているキャラだけ
   // （元参加者は過去の発言の参照用に members へ含まれているだけ）。
   const presentMembers = members.filter((m) => m.present && m.in_group);
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="なりきり設定">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.roleplay.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>なりきり設定</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.roleplay.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          自分がなりきるキャラクターを選ぶと、あなたの送信がそのキャラのアイコンと名前の付いた吹き出しになります（自分が書いた物だと分かるよう、色は通常の送信と同じ色になります）。
+          {T.roleplay.description}
         </p>
-        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>なりきるキャラクター</p>
-        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label="なりきるキャラクター">
+        <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.roleplay.characterHeading}</p>
+        <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label={T.roleplay.characterHeading}>
           <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: selected === null ? "var(--accent-soft)" : "transparent" }}>
             <input
               type="radio"
               name="roleplay-character"
               checked={selected === null}
               onChange={() => setSelected(null)}
-              aria-label="なりきらない"
+              aria-label={T.roleplay.noneAria}
               className="h-5 w-5 shrink-0"
             />
-            <span className="font-bold" style={{ color: "var(--text)" }}>なりきらない（未選択）</span>
+            <span className="font-bold" style={{ color: "var(--text)" }}>{T.roleplay.noneLabel}</span>
           </label>
           {presentMembers.map((m) => (
             <label key={m.character_id} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: selected === m.character_id ? "var(--accent-soft)" : "transparent" }}>
@@ -3084,7 +3895,7 @@ function RoleplaySheet({
                 name="roleplay-character"
                 checked={selected === m.character_id}
                 onChange={() => setSelected(m.character_id)}
-                aria-label={`${m.display_name}になりきる`}
+                aria-label={T.roleplay.asAria(m.display_name)}
                 className="h-5 w-5 shrink-0"
               />
               <Avatar imageUrl={m.image_url} name={m.display_name} themeColor={m.theme_color} size={36} />
@@ -3094,20 +3905,20 @@ function RoleplaySheet({
         </div>
         {selected !== null && (
           <>
-            <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>なりきりキャラの台詞</p>
-            <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label="なりきりキャラの台詞">
+            <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.roleplay.linesHeading}</p>
+            <div className="mt-2 flex flex-col gap-1" role="radiogroup" aria-label={T.roleplay.linesHeading}>
               <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-2 py-2" style={{ background: cont ? "var(--accent-soft)" : "transparent" }}>
                 <input
                   type="radio"
                   name="roleplay-continue"
                   checked={cont}
                   onChange={() => setCont(true)}
-                  aria-label="AIも演じる"
+                  aria-label={T.roleplay.aiAlsoLabel}
                   className="mt-0.5 h-5 w-5 shrink-0"
                 />
                 <span>
-                  <span className="block font-bold" style={{ color: "var(--text)" }}>AIも演じる</span>
-                  <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>AIが返信し、その後のなりきりキャラの台詞もAIが考えて続けます。なりきりキャラは、あなたとAIの共同になります。</span>
+                  <span className="block font-bold" style={{ color: "var(--text)" }}>{T.roleplay.aiAlsoLabel}</span>
+                  <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.roleplay.aiAlsoDesc}</span>
                 </span>
               </label>
               <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-2 py-2" style={{ background: !cont ? "var(--accent-soft)" : "transparent" }}>
@@ -3116,12 +3927,12 @@ function RoleplaySheet({
                   name="roleplay-continue"
                   checked={!cont}
                   onChange={() => setCont(false)}
-                  aria-label="自分だけが演じる"
+                  aria-label={T.roleplay.selfOnlyLabel}
                   className="mt-0.5 h-5 w-5 shrink-0"
                 />
                 <span>
-                  <span className="block font-bold" style={{ color: "var(--text)" }}>自分だけが演じる</span>
-                  <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>AIは他のキャラだけで返信して続けます。なりきりキャラの台詞はAIは書きません。そのキャラが話すのは、あなたが打った時だけです。</span>
+                  <span className="block font-bold" style={{ color: "var(--text)" }}>{T.roleplay.selfOnlyLabel}</span>
+                  <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.roleplay.selfOnlyDesc}</span>
                 </span>
               </label>
             </div>
@@ -3130,7 +3941,7 @@ function RoleplaySheet({
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -3139,7 +3950,7 @@ function RoleplaySheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {save.isPending ? "保存中…" : "設定する"}
+            {save.isPending ? T.common.saving : T.roleplay.apply}
           </button>
         </div>
       </div>
@@ -3147,29 +3958,35 @@ function RoleplaySheet({
   );
 }
 
-/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブの設定」の3つ。 */
+/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「背景情報を編集する」「グループを削除」の5つ。履歴の使用設定は設定一覧には無く、グループ画面上部のタブで切り替える。 */
 function GroupMenuSheet({
   groupName,
   onClose,
   onRename,
   onEditMembers,
   onGuestMob,
+  onBackground,
+  onDelete,
 }: {
   groupName: string;
   onClose: () => void;
   onRename: () => void;
   onEditMembers: () => void;
   onGuestMob: () => void;
+  onBackground: () => void;
+  onDelete: () => void;
 }) {
-  const items: { label: string; description: string; onSelect: () => void }[] = [
-    { label: "グループチャットの名前を変える", description: "このグループの表示名を変更します（参加者や会話履歴には影響しません）", onSelect: onRename },
-    { label: "グループチャットの参加者を変える", description: "参加キャラクターを1〜8人の間で増やしたり減らしたりできます（会話履歴は残ります）", onSelect: onEditMembers },
-    { label: "ゲスト・モブの設定", description: "参加者以外のキャラクター（ゲスト）や、名前のない人々（モブ）が会話に混じることがあるかを選びます", onSelect: onGuestMob },
+  const items: { label: string; description: string; danger?: boolean; onSelect: () => void }[] = [
+    { label: T.groupMenu.rename, description: T.groupMenu.renameDesc, onSelect: onRename },
+    { label: T.groupMenu.editMembers, description: T.groupMenu.editMembersDesc, onSelect: onEditMembers },
+    { label: T.groupMenu.guestMob, description: T.groupMenu.guestMobDesc, onSelect: onGuestMob },
+    { label: T.groupMenu.background, description: T.groupMenu.backgroundDesc, onSelect: onBackground },
+    { label: T.groupMenu.deleteGroup, description: T.groupMenu.deleteGroupDesc, danger: true, onSelect: onDelete },
   ];
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="グループ設定メニュー">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupMenu.menuAria}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display min-w-0 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{groupName}の設定</h2>
+        <h2 className="font-display min-w-0 truncate text-lg font-bold" style={{ color: "var(--text)" }}>{T.groupMenu.title(groupName)}</h2>
         <div className="mt-4 flex flex-col gap-2">
           {items.map((item) => (
             <button
@@ -3179,7 +3996,7 @@ function GroupMenuSheet({
               className="w-full rounded-2xl px-4 py-3 text-left"
               style={{ background: "var(--surface-alt)", color: "var(--text)" }}
             >
-              <span className="block font-bold">{item.label}</span>
+              <span className="block font-bold" style={item.danger ? { color: "var(--danger)" } : undefined}>{item.label}</span>
               <span className="mt-0.5 block text-xs" style={{ color: "var(--dim)" }}>{item.description}</span>
             </button>
           ))}
@@ -3190,45 +4007,49 @@ function GroupMenuSheet({
           className="mt-4 w-full rounded-full px-4 py-2.5 font-bold"
           style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
         >
-          閉じる
+          {T.common.close}
         </button>
       </div>
     </div>
   );
 }
 
-/** ゲスト・モブの設定シート（グループ設定メニューの「ゲスト・モブの設定」から開く）。
+/** ゲスト・モブ・ナレーションの設定シート（グループ設定メニューの「ゲスト・モブ・ナレーションの設定」から開く）。
  *  オンにすると、生成の場面に応じて参加者以外のキャラ（ゲスト）や名前のない人々
- *  （モブ）が会話に混じることがある。混じらないこともある。 */
+ *  （モブ）が会話に混じることがある。混じらないこともある。ナレーションは、会話の
+ *  背景説明・場面転換・時間経過の説明が、誰の台詞でもない形で入ることがある。 */
 function GroupGuestMobSheet({
   groupId,
   currentGuests,
   currentMobs,
+  currentNarration,
   onClose,
 }: {
   groupId: number;
   currentGuests: boolean;
   currentMobs: boolean;
+  currentNarration: boolean;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
   const [guests, setGuests] = useState(currentGuests);
   const [mobs, setMobs] = useState(currentMobs);
+  const [narration, setNarration] = useState(currentNarration);
   const [error, setError] = useState("");
   const save = useMutation({
-    mutationFn: async () => await api.setGroupGuestMob({ group_id: groupId, allow_guests: guests, allow_mobs: mobs }),
+    mutationFn: async () => await api.setGroupGuestMob({ group_id: groupId, allow_guests: guests, allow_mobs: mobs, allow_narration: narration }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
   });
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="ゲスト・モブの設定">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupGuestMob.title}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>ゲスト・モブの設定</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          オンにすると、会話の流れに応じて参加者以外のキャラクターや人々が混じることがあります（混じらないこともあります）。参加者や会話履歴には影響しません。
+          {T.groupGuestMob.intro}
         </p>
         <div className="mt-4 flex flex-col gap-2">
           <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: guests ? "var(--accent-soft)" : "var(--surface-alt)" }}>
@@ -3236,13 +4057,13 @@ function GroupGuestMobSheet({
               type="checkbox"
               checked={guests}
               onChange={(e) => setGuests(e.target.checked)}
-              aria-label="ゲストを許可する"
+              aria-label={T.guestMob.allowGuestsAria}
               className="mt-0.5 h-5 w-5 shrink-0"
             />
             <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>ゲスト</span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.guestLabel}</span>
               <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                このグループに参加していないキャラクターが、そのキャラクターの名前で会話に入ることがあります。このアプリに登録済みのキャラクターが登場する場合は、その設定を参考にします。登録されていないキャラクターのアイコンはデフォルト表示になります。
+                {T.groupGuestMob.guestDesc}
               </span>
             </span>
           </label>
@@ -3251,13 +4072,28 @@ function GroupGuestMobSheet({
               type="checkbox"
               checked={mobs}
               onChange={(e) => setMobs(e.target.checked)}
-              aria-label="モブを許可する"
+              aria-label={T.guestMob.allowMobsAria}
               className="mt-0.5 h-5 w-5 shrink-0"
             />
             <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>モブ</span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.mobLabel}</span>
               <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                名前のない一般の人々が、「住民」「生徒」「兵士」のような一般名詞の表記で会話に入ることがあります。
+                {T.groupGuestMob.mobDesc}
+              </span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: narration ? "var(--accent-soft)" : "var(--surface-alt)" }}>
+            <input
+              type="checkbox"
+              checked={narration}
+              onChange={(e) => setNarration(e.target.checked)}
+              aria-label={T.guestMob.allowNarrationAria}
+              className="mt-0.5 h-5 w-5 shrink-0"
+            />
+            <span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.narrationLabel}</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+                {T.groupGuestMob.narrationDesc}
               </span>
             </span>
           </label>
@@ -3265,7 +4101,7 @@ function GroupGuestMobSheet({
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -3274,7 +4110,68 @@ function GroupGuestMobSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {save.isPending ? "保存中…" : "保存する"}
+            {save.isPending ? T.common.saving : T.common.save}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 背景情報の編集シート（設計書 v2.0 / C）。グループの生成（通常・自動の両方）のシステムプロンプトへ常時含まれる。 */
+function GroupBackgroundSheet({
+  groupId,
+  currentText,
+  onClose,
+}: {
+  groupId: number;
+  currentText: string;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [text, setText] = useState(currentText);
+  const [error, setError] = useState("");
+  const save = useMutation({
+    mutationFn: async () => await api.updateGroupBackground({ group_id: groupId, background_text: text }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["group", groupId] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+  });
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupBackground.title}>
+      <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.groupBackground.title}</h2>
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+          {T.groupBackground.description}
+        </p>
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="group-background-text">
+          {T.groupBackground.label}
+        </label>
+        <textarea
+          id="group-background-text"
+          {...FIELDS.updateGroupBackground.background_text}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={8}
+          placeholder={T.groupBackground.placeholder}
+          className="mt-1 w-full rounded-2xl px-3 py-2.5 text-sm"
+          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
+        />
+        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <div className="mt-4 flex gap-3">
+          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
+            {T.common.cancel}
+          </button>
+          <button
+            type="button"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+            style={{ background: "var(--accent)" }}
+          >
+            {save.isPending ? T.common.saving : T.common.save}
           </button>
         </div>
       </div>
@@ -3294,12 +4191,12 @@ function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; 
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "変更に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
   });
   const submit = () => {
     const v = name.trim();
     if (!v) {
-      setError("グループ名を入力してください。");
+      setError(T.renameGroup.nameRequired);
       return;
     }
     if (v === currentName) {
@@ -3310,14 +4207,14 @@ function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; 
     rename.mutate(v);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="グループチャットの名前を変える">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.renameGroup.title}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>グループチャットの名前を変える</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.renameGroup.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          一覧やグループ画面で表示される名前を変えます。参加者や会話履歴には影響しません。
+          {T.renameGroup.description}
         </p>
         <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="rename-group-name">
-          グループ名
+          {T.renameGroup.label}
         </label>
         <input
           id="rename-group-name"
@@ -3330,7 +4227,7 @@ function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; 
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -3339,7 +4236,7 @@ function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; 
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {rename.isPending ? "保存中…" : "変更する"}
+            {rename.isPending ? T.common.saving : T.common.change}
           </button>
         </div>
       </div>
@@ -3370,19 +4267,19 @@ function GroupMembersSheet({
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
       if (r.roleplay_cleared) {
-        setNotice("参加者を変更しました。なりきり中のキャラクターが外れたため、なりきりは解除されました。");
+        setNotice(T.groupMembers.roleplayClearedNotice);
         // 解除されたことが分かるよう、通知を見せてから閉じられるようにする。
         setTimeout(onClose, 1200);
       } else {
         onClose();
       }
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "変更に失敗しました"),
+    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
   });
   const toggle = (id: number) => {
     setSelected((prev) => {
       if (prev.includes(id)) return prev.filter((x) => x !== id);
-      if (prev.length >= 8) { setError("グループは最大8人までです。"); return prev; }
+      if (prev.length >= 8) { setError(T.createGroup.maxMembersError); return prev; }
       setError("");
       return [...prev, id];
     });
@@ -3403,22 +4300,22 @@ function GroupMembersSheet({
   );
   const roleplayRemoved = roleplayMember != null && !selected.includes(roleplayMember.character_id);
   const submit = () => {
-    if (selected.length < 1) { setError("参加者は1人以上選んでください。"); return; }
-    if (selected.length > 8) { setError("参加者は8人までです。"); return; }
+    if (selected.length < 1) { setError(T.groupMembers.minMembersError); return; }
+    if (selected.length > 8) { setError(T.groupMembers.overMembersError); return; }
     setError("");
     save.mutate();
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="グループチャットの参加者を変える">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupMembers.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>グループチャットの参加者を変える</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.groupMembers.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          参加キャラクターは1〜8人です。外したキャラクターは会話に参加しなくなりますが、過去の発言は名前と画像つきで会話履歴にそのまま残ります。
+          {T.groupMembers.description}
         </p>
-        <p className="mt-3 text-sm font-bold" style={{ color: "var(--text)" }}>参加キャラクター（現在 {selected.length}人）</p>
+        <p className="mt-3 text-sm font-bold" style={{ color: "var(--text)" }}>{T.groupMembers.membersHeading(selected.length)}</p>
         {categories.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-members-category-filter">カテゴリ</label>
+            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-members-category-filter">{T.common.category}</label>
             <select
               id="group-members-category-filter"
               value={catFilter === "all" ? "all" : catFilter === "none" ? "none" : String(catFilter)}
@@ -3429,21 +4326,21 @@ function GroupMembersSheet({
               className="rounded-full px-3 py-1.5 text-sm font-bold"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
             >
-              <option value="all">すべて</option>
+              <option value="all">{T.common.all}</option>
               {categoryTreeEntries(categories).map(({ cat, depth }) => (
                 <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
               ))}
-              <option value="none">未分類</option>
+              <option value="none">{T.common.uncategorized}</option>
             </select>
-            <span className="text-xs" style={{ color: "var(--dim)" }}>選択中 {selected.length}人</span>
+            <span className="text-xs" style={{ color: "var(--dim)" }}>{T.common.selectedCount(selected.length)}</span>
           </div>
         )}
-        {home.isPending && <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
+        {home.isPending && <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
         {home.error && (
           <div className="mt-2">
-            <p className="text-sm" style={{ color: "var(--danger)" }}>キャラクター一覧の読み込みに失敗しました。</p>
+            <p className="text-sm" style={{ color: "var(--danger)" }}>{T.groupMembers.charactersLoadFailed}</p>
             <button type="button" onClick={() => home.refetch()} className="mt-2 rounded-full px-4 py-2 text-sm font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-              再読み込み
+              {T.common.reload}
             </button>
           </div>
         )}
@@ -3454,23 +4351,23 @@ function GroupMembersSheet({
                 type="checkbox"
                 checked={selected.includes(c.id)}
                 onChange={() => toggle(c.id)}
-                aria-label={`${c.display_name}を参加させる`}
+                aria-label={T.createGroup.joinAria(c.display_name)}
                 className="h-5 w-5 shrink-0"
               />
               <Avatar imageUrl={c.image_url} name={c.display_name} themeColor={c.theme_color} size={36} />
               <span className="font-bold" style={{ color: "var(--text)" }}>{c.display_name}</span>
               {currentMemberIds.includes(c.id) && (
-                <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>参加中</span>
+                <span className="rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface-alt)", color: "var(--dim)" }}>{T.groupMembers.inGroupBadge}</span>
               )}
             </label>
           ))}
           {visibleCharacters.length === 0 && !home.isPending && (
-            <p className="px-2 py-3 text-sm" style={{ color: "var(--dim)" }}>このカテゴリのキャラクターはいません。</p>
+            <p className="px-2 py-3 text-sm" style={{ color: "var(--dim)" }}>{T.common.categoryEmpty}</p>
           )}
         </div>
         {roleplayRemoved && roleplayMember && (
           <p className="mt-3 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--danger)" }} role="alert">
-            なりきり中の「{roleplayMember.display_name}」を外すと、なりきりは解除され未選択に戻ります。
+            {T.groupMembers.roleplayRemovedWarning(roleplayMember.display_name)}
           </p>
         )}
         {notice && (
@@ -3481,7 +4378,7 @@ function GroupMembersSheet({
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -3490,7 +4387,7 @@ function GroupMembersSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {save.isPending ? "保存中…" : "変更する"}
+            {save.isPending ? T.common.saving : T.common.change}
           </button>
         </div>
       </div>
@@ -3510,13 +4407,14 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   const [sendError, setSendError] = useState("");
   const [failNotice, setFailNotice] = useState("");
   const [cancelNotice, setCancelNotice] = useState("");
-  const [confirm, setConfirm] = useState<"clear" | "delete" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | null>(null);
   const [showExport, setShowExport] = useState(false);
   const [showRoleplay, setShowRoleplay] = useState(false);
   const [showGroupMenu, setShowGroupMenu] = useState(false);
   const [showRenameGroup, setShowRenameGroup] = useState(false);
   const [showEditMembers, setShowEditMembers] = useState(false);
   const [showGuestMob, setShowGuestMob] = useState(false);
+  const [showBackground, setShowBackground] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
   const [selectedReviewId, setSelectedReviewId] = useState<number | null>(null);
   const [reviewError, setReviewError] = useState("");
@@ -3574,7 +4472,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : "送信に失敗しました"),
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "group", target_id: groupId }),
@@ -3584,22 +4482,23 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
         setDraft((prev) => (prev.trim() ? `${res.restored_text}\n${prev}` : res.restored_text));
         setFailNotice("");
         setSendError("");
-        setCancelNotice("送信を取り消しました。文章を入力欄に戻しました。");
+        setCancelNotice(T.chat.cancelDoneNotice);
       } else {
-        setCancelNotice("生成が始まっているため、取り消せませんでした。");
+        setCancelNotice(T.chat.cancelTooLateNotice);
       }
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : "取り消しに失敗しました"),
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.cancelFailed),
   });
-  const clear = useMutation({
-    mutationFn: async () => await api.clearGroupHistory({ group_id: groupId }),
+  // 履歴の使用設定の切り替え（設計書 v3.2）。上部タブのタップで即時に切り替える。
+  // 「使わない」へ切り替えた時点でサーバ側が境界と新しい区間を記録する。
+  const historyToggle = useMutation({
+    mutationFn: async (v: boolean) => await api.setUseHistory({ target_kind: "group", target_id: groupId, use_history: v }),
     onSuccess: () => {
-      setConfirm(null);
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
-      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
+    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.historyChangeFailed),
   });
   const del = useMutation({
     mutationFn: async () => await api.deleteGroup({ group_id: groupId }),
@@ -3614,34 +4513,37 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
     onSuccess: () => {
       setSelectedReviewId(null);
       setReviewError("");
-      setReviewNotice("レビューを登録しました。見直しが終わると設定へ自動で反映されます。結果はレビュー履歴で確認できます。");
+      setReviewNotice(T.review.registeredNotice);
       queryClient.invalidateQueries({ queryKey: ["reviewHistory"] });
     },
-    onError: (e) => setReviewError(e instanceof Error ? e.message : "レビューの送信に失敗しました"),
+    onError: (e) => setReviewError(e instanceof Error ? e.message : T.review.submitFailed),
   });
 
   const data: GroupState | undefined = state.data;
   const req = data?.request;
+  const groupSegments = groupIntoSegments(data?.messages ?? []);
 
   // 返信待ち（pending / 生成中）の間は投稿できない。取り消しボタンは
   // 生成が始まる前（pending の間）だけ出す。対象は、未返信の話題がある時は
   // その最後の話題、なりきり発言への返信待ちの時は最後のなりきり発言。
   const waiting = req?.status === "pending" || req?.status === "processing";
+  // 自動生成（auto）の開始待ちは送信取り消しの対象外（設計書 v2.0 / B）。
+  const canCancel = req?.status === "pending" && req.origin !== "auto";
   const groupUserMsgs = (data?.messages ?? []).filter((m) => m.kind === "user");
-  const unrepliedMsgs = req?.status === "pending" && req.unreplied_count > 0 ? groupUserMsgs.slice(-req.unreplied_count) : [];
+  const unrepliedMsgs = canCancel && req.unreplied_count > 0 ? groupUserMsgs.slice(-req.unreplied_count) : [];
   const roleplayMsgs = (data?.messages ?? []).filter((m) => m.user_authored);
   const cancelTargetId =
     unrepliedMsgs.length
       ? unrepliedMsgs[unrepliedMsgs.length - 1]!.id
-      : req?.status === "pending" && roleplayMsgs.length
+      : canCancel && roleplayMsgs.length
         ? roleplayMsgs[roleplayMsgs.length - 1]!.id
         : null;
 
   // 投稿ボタンと Enter キーで共用する投稿処理。
   const submitDraft = () => {
     if (post.isPending) return;
-    if (waiting) { setSendError("掛け合いが来るまで投稿できません。"); return; }
-    if (!draft.trim()) { setSendError(data?.roleplay_character_id != null ? "発言を入力してください。" : "話題や指示を入力してください。"); return; }
+    if (waiting) { setSendError(T.group.waitingError); return; }
+    if (!draft.trim()) { setSendError(data?.roleplay_character_id != null ? T.group.emptySpeechError : T.group.emptyTopicError); return; }
     post.mutate(draft.trim());
   };
   const dissolved = data?.group.status === "dissolved";
@@ -3658,30 +4560,41 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
     >
       <header className="shrink-0 px-3 pt-safe pb-2" style={{ background: "var(--bg)" }}>
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" onClick={back} aria-label="一覧へ戻る" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
+          <button type="button" onClick={back} aria-label={T.common.backToList} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xl" style={{ background: "var(--surface)", color: "var(--text)" }}>
             ←
           </button>
-          <h2 className="font-display min-w-24 flex-1 truncate text-lg font-black" style={{ color: "var(--text)" }}>{data?.group.name ?? "グループ"}</h2>
+          <h2 className="font-display min-w-24 flex-1 truncate text-lg font-black" style={{ color: "var(--text)" }}>{data?.group.name ?? T.group.fallbackName}</h2>
           {data && data.group.status === "active" && (
             <button
               type="button"
               onClick={() => setShowGroupMenu(true)}
-              aria-label="グループ設定"
+              aria-label={T.group.settingsAria}
               className="flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-bold"
               style={{ background: "var(--surface)", color: "var(--dim)" }}
             >
               <GearIcon />
-              設定
+              {T.group.settings}
             </button>
           )}
-          <button type="button" onClick={() => setConfirm("clear")} className="rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
-            履歴クリア
-          </button>
-          <button type="button" onClick={() => setConfirm("delete")} className="rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--danger)" }}>
-            グループ削除
-          </button>
+          {data && data.group.status === "active" && (
+            <button
+              type="button"
+              onClick={() => historyToggle.mutate(!data.use_history)}
+              disabled={historyToggle.isPending}
+              aria-pressed={data.use_history}
+              aria-label={T.chat.historyToggleAria}
+              className="rounded-full px-3 py-1.5 text-xs font-bold disabled:opacity-50"
+              style={
+                data.use_history
+                  ? { background: "var(--accent)", color: "#fff" }
+                  : { background: "var(--surface)", color: "var(--dim)" }
+              }
+            >
+              {T.group.historyTab(data.use_history)}
+            </button>
+          )}
           <button type="button" onClick={() => setShowExport(true)} className="rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
-            全文出力
+            {T.group.export}
           </button>
           {data && data.group.status === "active" && (
             <button
@@ -3695,7 +4608,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                   : { background: "var(--surface)", color: "var(--dim)" }
               }
             >
-              なりきり
+              {T.group.roleplayButton}
             </button>
           )}
           <ReviewModeToggle
@@ -3715,19 +4628,19 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             {data.members.filter((m) => m.in_group).map((m) => (
               <span key={m.character_id} className="flex items-center gap-1.5 rounded-full py-1 pr-3 pl-1 text-xs font-bold" style={{ background: "var(--surface)", color: m.present ? "var(--text)" : "var(--dim)" }}>
                 <Avatar imageUrl={m.image_url} name={m.display_name} themeColor={m.theme_color} size={22} />
-                {m.display_name}{!m.present ? "（削除済み）" : ""}
+                {m.display_name}{!m.present ? T.group.deletedSuffix : ""}
               </span>
             ))}
             {roleplayMember && (
               <span className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-bold text-white" style={{ background: "var(--accent)" }}>
-                なりきり中: {roleplayMember.display_name}（{data.roleplay_continue ? "AIも演じる" : "自分だけが演じる"}）
+                {T.group.roleplayChip(roleplayMember.display_name, data.roleplay_continue ? T.roleplay.aiAlsoLabel : T.roleplay.selfOnlyLabel)}
               </span>
             )}
           </div>
         )}
         {dissolved && (
           <p className="mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--dim)" }}>
-            このグループは解散済みです（参加キャラクターが2人未満になりました）。ログの閲覧のみできます。
+            {T.group.dissolvedNote}
           </p>
         )}
       </header>
@@ -3735,7 +4648,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       {reviewMode && data && (
         <div className="mx-3 mt-1 rounded-xl px-3 py-2" style={{ background: "var(--surface)" }} role="status">
           <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-            レビューモード中です。キャラの発言をタップして選ぶと、そのキャラの設定への指摘ができます。
+            {T.review.groupBanner}
           </p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {data.members.filter((m) => m.present).map((m) => (
@@ -3746,7 +4659,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                 className="rounded-full px-2.5 py-1 text-xs font-bold"
                 style={{ background: "var(--surface-alt)", color: "var(--text)" }}
               >
-                {m.display_name}のレビュー履歴
+                {T.review.historyButtonFor(m.display_name)}
               </button>
             ))}
           </div>
@@ -3755,42 +4668,69 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
 
       {req && <RequestBanner request={req} isGroup />}
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none px-3 py-3">
-        {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>読み込み中…</p>}
-        {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>読み込みに失敗しました。</p>}
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-none py-3">
+        {state.isPending && <p className="py-8 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>}
+        {state.error && <p className="py-8 text-center text-sm" style={{ color: "var(--danger)" }}>{T.common.loadFailed}</p>}
         {data && data.messages.length === 0 && (
           <p className="py-8 text-center text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-            まだ掛け合いがありません。下の入力欄に話題や指示を書いて投稿すると、自動で掛け合いが始まります。
+            {T.group.empty}
           </p>
         )}
-        <div className="flex flex-col gap-3">
-          {data?.messages.map((m) => {
+        <div className="flex flex-col">
+          {groupSegments.map((seg, segIndex) => (
+            <Fragment key={seg.segmentNo}>
+              {segIndex > 0 && <SegmentBand date={seg.date} />}
+              <div
+                className={`relative z-10 flex flex-col gap-3 px-4 py-3 ${segIndex > 0 ? "rounded-t-3xl" : ""} ${segIndex < groupSegments.length - 1 ? "rounded-b-3xl" : ""}`}
+                style={{ background: "var(--segment)" }}
+              >
+              {seg.messages.map((m) => {
             const divider = unreadFromSeq != null && m.seq === unreadFromSeq ? (
               <div ref={(el) => { dividerRef.current = el; }}>
                 <NewMessageDivider />
               </div>
             ) : null;
+            // 区間の区切りはフレームの途切れと帯で示す（設計書 v3.3）。発言単位の
+            // 区切り線は出さないため、historyDivider は常に null（各分岐の置き場は
+            // 従来の構造を保つために残してある）。
+            const historyDivider = null;
             if (m.kind === "user") {
               return (
                 <Fragment key={m.id}>
+                  {historyDivider}
                   {divider}
                   <div className="flex flex-col items-end">
                     <div className="max-w-[82%] rounded-3xl rounded-br-md px-4 py-2.5 text-base whitespace-pre-wrap text-white" style={{ background: "var(--accent)" }}>
                       {m.body}
                     </div>
-                    <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>話題 {formatClock(m.created_at)}</span>
+                    <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{T.group.topicTime(formatClock(m.created_at))}</span>
                     {m.id === cancelTargetId && (
                       <button
                         type="button"
                         onClick={() => cancelSend.mutate()}
                         disabled={cancelSend.isPending}
-                        aria-label="この送信を取り消す"
+                        aria-label={T.chat.cancelSendAria}
                         className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
                         style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
                       >
-                        送信を取り消す
+                        {T.chat.cancelSend}
                       </button>
                     )}
+                  </div>
+                </Fragment>
+              );
+            }
+            if (m.kind === "narration") {
+              // ナレーション（v3.1）: 吹き出しにせず、アバター・名前なしで
+              // 中央揃えのシステムメッセージ的に表示する。
+              return (
+                <Fragment key={m.id}>
+                  {historyDivider}
+                  {divider}
+                  <div className="flex justify-center px-2 py-1">
+                    <p className="max-w-[88%] text-center text-sm leading-relaxed whitespace-pre-wrap" style={{ color: "var(--dim)" }}>
+                      {m.body}
+                    </p>
                   </div>
                 </Fragment>
               );
@@ -3798,9 +4738,10 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             if (m.kind === "raw") {
               return (
                 <Fragment key={m.id}>
+                  {historyDivider}
                   {divider}
                   <div className="rounded-2xl px-4 py-3" style={{ border: "1.5px dashed var(--danger)", background: "var(--surface)" }}>
-                    <p className="text-xs font-bold" style={{ color: "var(--danger)" }}>分割できなかった出力</p>
+                    <p className="text-xs font-bold" style={{ color: "var(--danger)" }}>{T.group.rawHeading}</p>
                     <p className="mt-1 text-sm whitespace-pre-wrap" style={{ color: "var(--text)" }}>{m.body}</p>
                   </div>
                 </Fragment>
@@ -3813,6 +4754,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             const isRoleplayLine = m.user_authored;
             return (
               <Fragment key={m.id}>
+                {historyDivider}
                 {divider}
                 <div className="flex items-start gap-2">
                 <Avatar imageUrl={member?.image_url ?? null} name={m.speaker_name} themeColor={member?.theme_color ?? ""} size={32} />
@@ -3823,7 +4765,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                       type="button"
                       onClick={() => { setSelectedReviewId(m.id); setReviewError(""); setReviewNotice(""); }}
                       aria-pressed={selectedReviewId === m.id}
-                      aria-label={`この発言をレビュー対象に選ぶ: ${m.body.slice(0, 40)}`}
+                      aria-label={T.review.selectMessageAria(m.body.slice(0, 40))}
                       className="rounded-3xl rounded-bl-md px-4 py-2.5 text-left text-base whitespace-pre-wrap"
                       style={{
                         background: selectedReviewId === m.id ? "var(--accent-soft)" : "var(--surface)",
@@ -3849,27 +4791,35 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                       type="button"
                       onClick={() => cancelSend.mutate()}
                       disabled={cancelSend.isPending}
-                      aria-label="この送信を取り消す"
+                      aria-label={T.chat.cancelSendAria}
                       className="mt-1 self-start rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
                       style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
                     >
-                      送信を取り消す
+                      {T.chat.cancelSend}
                     </button>
                   )}
                 </div>
                 </div>
               </Fragment>
             );
-          })}
+              })}
+              </div>
+            </Fragment>
+          ))}
         </div>
       </div>
 
       {!dissolved && (
         <div className="shrink-0 px-3 pb-safe" style={{ background: "var(--bg)" }}>
+          {data && !data.use_history && (
+            <p className="mb-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--surface)", color: "var(--dim)", border: "1px solid var(--border)" }} role="note">
+              {T.group.historyOffNote}
+            </p>
+          )}
           {reviewNotice && (
             <div className="mb-2 flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: "var(--accent-soft)" }} role="status">
               <p className="min-w-0 flex-1 text-sm" style={{ color: "var(--text)" }}>{reviewNotice}</p>
-              <button type="button" onClick={() => setReviewNotice("")} aria-label="通知を閉じる" className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
+              <button type="button" onClick={() => setReviewNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
             </div>
           )}
           {reviewMode && selectedReviewMsg && selectedReviewMsg.character_id != null && (
@@ -3891,11 +4841,11 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
           {cancelNotice && (
             <div className="mb-2 flex items-start gap-2 rounded-xl px-3 py-2" style={{ background: "var(--accent-soft)" }} role="status">
               <p className="min-w-0 flex-1 text-sm" style={{ color: "var(--text)" }}>{cancelNotice}</p>
-              <button type="button" onClick={() => setCancelNotice("")} aria-label="通知を閉じる" className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
+              <button type="button" onClick={() => setCancelNotice("")} aria-label={T.chat.closeNoticeAria} className="shrink-0 text-sm font-bold" style={{ color: "var(--dim)" }}>×</button>
             </div>
           )}
           <div className="flex items-end gap-2 pb-2">
-            <label className="sr-only" htmlFor="group-input">話題・指示</label>
+            <label className="sr-only" htmlFor="group-input">{T.group.inputLabel}</label>
             <textarea
               id="group-input"
               {...FIELDS.postGroupPrompt.body}
@@ -3913,10 +4863,10 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
               rows={2}
               placeholder={
                 waiting
-                  ? "掛け合い待ちです（届くまで投稿できません）"
+                  ? T.group.waitingPlaceholder
                   : roleplayMember
-                    ? `${roleplayMember.display_name}として発言する`
-                    : "話題や指示を書く（例: 初めて会った時の話をして）"
+                    ? T.group.roleplayPlaceholder(roleplayMember.display_name)
+                    : T.group.inputPlaceholder
               }
               className="min-w-0 flex-1 rounded-3xl px-4 py-2.5 text-base"
               style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
@@ -3928,7 +4878,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
               className="shrink-0 rounded-full px-5 py-2.5 font-bold text-white disabled:opacity-50"
               style={{ background: "var(--accent)" }}
             >
-              {roleplayMember ? "発言" : "投稿"}
+              {roleplayMember ? T.group.speak : T.group.post}
             </button>
           </div>
           {sendError && <p className="pb-2 text-sm" style={{ color: "var(--danger)" }}>{sendError}</p>}
@@ -3969,6 +4919,22 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             setShowGroupMenu(false);
             setShowGuestMob(true);
           }}
+          onBackground={() => {
+            setShowGroupMenu(false);
+            setShowBackground(true);
+          }}
+          onDelete={() => {
+            setShowGroupMenu(false);
+            setConfirm("delete");
+          }}
+        />
+      )}
+
+      {showBackground && data && (
+        <GroupBackgroundSheet
+          groupId={groupId}
+          currentText={data.group.background_text}
+          onClose={() => setShowBackground(false)}
         />
       )}
 
@@ -3977,6 +4943,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
           groupId={groupId}
           currentGuests={data.allow_guests}
           currentMobs={data.allow_mobs}
+          currentNarration={data.allow_narration}
           onClose={() => setShowGuestMob(false)}
         />
       )}
@@ -4000,28 +4967,18 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
 
       {showExport && data && (
         <ExportSheet
-          title={`グループ「${data.group.name}」の全文`}
+          title={T.exportSheet.groupTitle(data.group.name)}
           queryKey={["export-group", String(groupId)]}
           fetchText={() => api.exportGroupText({ group_id: groupId })}
           onClose={() => setShowExport(false)}
         />
       )}
 
-      {confirm === "clear" && (
-        <ConfirmSheet
-          title="履歴をクリアしますか？"
-          body="このグループの掛け合いログが全て消えます。元には戻せません。"
-          confirmLabel="クリアする"
-          busy={clear.isPending}
-          onCancel={() => setConfirm(null)}
-          onConfirm={() => clear.mutate()}
-        />
-      )}
       {confirm === "delete" && (
         <ConfirmSheet
-          title="グループを削除しますか？"
-          body="グループと掛け合いログが全て消えます。元には戻せません。"
-          confirmLabel="削除する"
+          title={T.group.deleteConfirmTitle}
+          body={T.group.deleteConfirmBody}
+          confirmLabel={T.common.deleteConfirm}
           busy={del.isPending}
           onCancel={() => setConfirm(null)}
           onConfirm={() => del.mutate()}
@@ -4052,6 +5009,12 @@ export function App() {
       )}
       {view.kind === "chat" && <ChatView characterId={view.characterId} unreadFromSeq={view.unreadFromSeq} back={goHome} />}
       {view.kind === "group" && <GroupView groupId={view.groupId} unreadFromSeq={view.unreadFromSeq} back={goHome} />}
+      {view.kind === "logs" && (
+        <>
+          <SafeAreaTopScrim backgroundColor="var(--bg)" />
+          <LogsView back={goHome} />
+        </>
+      )}
     </div>
   );
 }

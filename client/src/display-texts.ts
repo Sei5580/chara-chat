@@ -1,0 +1,678 @@
+// 表示文専用ファイル（設計書 v3.3）
+//
+// このアプリの画面に表示される静的な文章は、全てこのファイルに名前付きの
+// 定数として集約する。画面側（App.tsx 等）はこのファイルだけを参照し、
+// 文言を直接書かない。文言を変えたい時はこのファイルだけを編集すればよい。
+//
+// 対象外: キャラ名・発言本文・日付などの動的データそのもの、生成プロンプト、
+// サーバ側で組み立てる通知文。動的な値を埋め込む文は、値を引数に取る
+// 関数として置く（例: characterSettingsTitle）。
+//
+// 構成は画面・部品ごとに名前空間を分けてある。同じ文言が複数箇所で使われる
+// 場合は common などへ寄せて一本化してある。
+
+export const TEXTS = {
+  // ------------------------------------------------------------ 共通
+  common: {
+    cancel: "キャンセル",
+    close: "閉じる",
+    save: "保存する",
+    saving: "保存中…",
+    loading: "読み込み中…",
+    loadFailed: "読み込みに失敗しました。",
+    reload: "再読み込み",
+    delete: "削除",
+    deleteConfirm: "削除する",
+    deleteFailed: "削除に失敗しました",
+    change: "変更する",
+    edit: "編集",
+    backToList: "一覧へ戻る",
+    saveFailed: "保存に失敗しました",
+    changeFailed: "変更に失敗しました",
+    selected: "選択中",
+    all: "すべて",
+    uncategorized: "未分類",
+    category: "カテゴリ",
+    memberCount: (n: number) => `${n}人`,
+    selectedCount: (n: number) => `選択中 ${n}人`,
+    categoryEmpty: "このカテゴリのキャラクターはいません。",
+    noCategoriesYet:
+      "まだカテゴリが登録されていません。一覧の「カテゴリ管理」から先にカテゴリを追加してください。",
+    categoryAria: (name: string) => `カテゴリ「${name}」`,
+    categoryFilterGroupAria: "カテゴリの選択（複数選択可）",
+  },
+
+  // ------------------------------------------------------------ 失敗通知（setFailureNoticeText）
+  notice: {
+    inputCheck: "入力内容を確認してください。",
+    genericFailure: "うまくいきませんでした。もう一度お試しください。",
+  },
+
+  // ------------------------------------------------------------ 生成の失敗理由
+  failReasons: {
+    timeout: "タイムアウト（10分以内に生成が終わりませんでした）",
+    rateLimited: "Claudeの利用上限に達しました。時間をおいて再度お試しください",
+    authError: "生成に使うClaudeのログインセッションが切れています。再ログインすると直ります",
+    generationError: "生成に失敗しました",
+    fallback: "生成に失敗しました",
+    withDetail: (reason: string) => `生成に失敗しました（${reason}）`,
+  },
+
+  // ------------------------------------------------------------ 経過時間の表記
+  elapsed: {
+    seconds: (n: number) => `${n}秒`,
+    minutes: (n: number) => `${n}分`,
+    hoursMinutes: (h: number, m: number) => `${h}時間${m}分`,
+  },
+
+  // ------------------------------------------------------------ 一覧の状態バッジ
+  status: {
+    pending: "返信待ち",
+    processing: "生成中",
+    failed: "失敗",
+    unreplied: (n: number) => `未返信 ${n}`,
+  },
+
+  // ------------------------------------------------------------ 返信リクエストのバナー
+  requestBanner: {
+    replyWord: "返信",
+    groupWord: "掛け合い",
+    failedSuffix: "。送った文章は入力欄に戻してあります。",
+    generating: (word: string, elapsed: string) => `${word}を生成中です…（${elapsed}経過）`,
+    waiting: (word: string, elapsed: string) =>
+      `${word}待ちです（発言から${elapsed}）。生成には数分かかることがあります。`,
+  },
+
+  // ------------------------------------------------------------ 区切り表示
+  divider: {
+    newMessages: "新着",
+    newMessagesAria: "ここから新着の返信です",
+  },
+
+  // ------------------------------------------------------------ 区間（履歴の区切り・フレーム表示）
+  segment: {
+    bandAria: (date: string | null) =>
+      date
+        ? `ここからは過去の履歴を参照せずに生成された会話です（この区間の最初の生成は${date}）`
+        : "ここからは過去の履歴を参照せずに生成された会話です",
+  },
+
+  // ------------------------------------------------------------ 戻し下書きの復元通知
+  draftRestore: {
+    failedNotice: (label: string) =>
+      `返信に失敗しました（${label}）。文章を入力欄に戻しました。そのまま、または直して再送信できます。`,
+  },
+
+  // ------------------------------------------------------------ 全文出力シート
+  exportSheet: {
+    closeAria: "全文出力を閉じる",
+    description:
+      "このチャットの全履歴を「発言者名:内容」の形で時系列順に並べたプレーンテキストです。",
+    textLabel: "チャット全文",
+    copyFailed:
+      "コピーできませんでした。上のテキストを長押し（または全選択）してコピーしてください。",
+    copy: "全文をコピー",
+    copied: "コピーしました",
+    chatTitle: (name: string) => `${name}とのチャット全文`,
+    groupTitle: (name: string) => `グループ「${name}」の全文`,
+  },
+
+  // ------------------------------------------------------------ 画像変更シート
+  imageEdit: {
+    title: (name: string) => `${name}の画像を変更`,
+    description:
+      "画像ファイルを選んで正方形にトリミングして保存すると、一覧・チャット・グループの表示にすぐ反映されます。",
+    fileInputAria: "画像ファイルを選ぶ",
+    chooseFile: "画像ファイルを選ぶ",
+    chooseAnother: "別の画像を選ぶ",
+    cropAreaAria: "トリミング範囲。ドラッグで位置を調整できます",
+    croppingAlt: "トリミング中の画像",
+    zoom: "拡大・縮小",
+    previewNote: "プレビューは上の枠の通りです。ドラッグで位置を調整できます。",
+    currentAlt: (name: string) => `${name}の現在の画像`,
+    currentNote: "現在の画像です。新しい画像を選ぶと差し替わります。",
+    saveCropped: "トリミングして保存",
+    notImageFile: "画像ファイルを選んでください。",
+    loadImageFailed: "画像を読み込めませんでした。別のファイルをお試しください。",
+    processFailed: "画像の処理に失敗しました。",
+  },
+
+  // ------------------------------------------------------------ キャラ設定メニュー
+  characterMenu: {
+    menuAria: (name: string) => `${name}の設定メニュー`,
+    title: (name: string) => `${name}の設定`,
+    viewSettings: "概要を確認する",
+    viewSettingsDesc: "設定本文と関係・呼び方を確認します",
+    editSettings: "設定を編集する",
+    editSettingsDesc: "項目ごとの入力欄で設定を書き換えます",
+    editImage: "画像を変更",
+    editImageDesc: "画像を選んでトリミングして差し替えます",
+    rename: "表示名を変更",
+    renameDesc: "表示される名前だけを変えます",
+    setCategory: "カテゴリを設定",
+    setCategoryDesc: "カテゴリを選んで分類します（複数選択可）",
+  },
+
+  // ------------------------------------------------------------ キャラ設定の閲覧シート
+  characterSettings: {
+    title: "キャラ設定",
+    displayName: "表示名",
+    originalName: "元の名前",
+    sourceProfileId: "取り込み元ID",
+    createdAt: "登録日時",
+    settingsTextHeading: "設定本文（生成に使われる内容）",
+    relationTextHeading: "関係・呼び方",
+    footerNote:
+      "設定の書き換えは設定メニューの「設定を編集する」から、発言への指摘はチャット画面のレビューモードから行えます。",
+  },
+
+  // ------------------------------------------------------------ 設定の編集フォーム
+  settingsEdit: {
+    sheetAria: (name: string) => `${name}の設定を編集する`,
+    title: "設定を編集する",
+    notEditable:
+      "このキャラクターは設定データ（avatar-profile形式）を保持していないため、ここからは編集できません。",
+    intro:
+      "保存すると、このアプリ内の設定が書き換わり、次の返信から反映されます（アバター管理ツール側の設定と表示名は変わりません）。",
+    nameRequired: "名前を入力してください。",
+    sectionBasic: "基本",
+    sectionBackground: "背景",
+    sectionSpeech: "話し方",
+    sectionRelation: "相手との関係",
+    sectionAppearance: "見た目の要素",
+    sectionTraits: "フレーバー特性",
+    labelName: "名前",
+    labelSummary: "概要",
+    labelGreeting: "挨拶の例",
+    labelAvatarMemory: "固有の記憶",
+    labelBackgroundText: "背景（本文）",
+    labelLinks: "関連リンク",
+    labelLinkSummary: "つながりの要約",
+    labelPortrayalFocus: "演じる姿・状況",
+    labelVideoUrls: "参考動画URL",
+    labelSpeechStyle: "話し方の説明",
+    labelFirstPerson: "一人称",
+    labelSecondPerson: "二人称",
+    labelCatchphrase: "口癖",
+    labelSpeechMemo: "話し方のメモ",
+    labelVideoNotes: "口調の参考資料（参考動画の所見）",
+    labelUserRelationship: "相手との関係",
+    labelCallUserAs: "相手の呼び方",
+    hintOnePerLine: "1行に1件ずつ入力してください。",
+    hintPortrayalFocus: "このキャラクターを演じる前提の姿・状況です。空欄なら指定なしです。",
+    hintVideoNotes:
+      "参考動画の台詞から得た口調の所見です。参考資料であり、台詞や言い回しの正本ではありません。",
+    elementKeyAria: (i: number) => `見た目の要素${i + 1}の項目名`,
+    elementValueAria: (i: number) => `見た目の要素${i + 1}の内容`,
+    elementDeleteAria: (i: number) => `見た目の要素${i + 1}を削除`,
+    elementKeyPlaceholder: "項目名（例: 髪）",
+    elementValuePlaceholder: "内容",
+    addElement: "＋ 要素を追加",
+    traitNameAria: (i: number) => `フレーバー特性${i + 1}の名前`,
+    traitDeleteAria: (i: number) => `フレーバー特性${i + 1}を削除`,
+    traitNamePlaceholder: "特性の名前",
+    traitExamplesLabel: "例（1行に1件）",
+    traitEnabled: "この特性を有効にする",
+    addTrait: "＋ 特性を追加",
+  },
+
+  // ------------------------------------------------------------ 表示名の変更シート
+  renameCharacter: {
+    title: "表示名を変更",
+    description: "一覧やチャットで表示される名前だけを変えます（設定や会話履歴には影響しません）。",
+    label: "表示名",
+    nameRequired: "表示名を入力してください。",
+  },
+
+  // ------------------------------------------------------------ カテゴリ管理シート
+  categoryManage: {
+    title: "カテゴリ管理",
+    closeAria: "カテゴリ管理を閉じる",
+    description:
+      "カテゴリはキャラ一覧の絞り込みに使います。カテゴリには親カテゴリを設定でき、子カテゴリ（サブカテゴリ）を作れます。親カテゴリで絞り込むと、その子・孫カテゴリのキャラもまとめて表示されます。1キャラに複数のカテゴリを設定でき、複数に登録したキャラはどのカテゴリで絞り込んでも表示されます。各キャラへの割り当ては、キャラの設定メニュー「カテゴリを設定」から行います。子カテゴリとその親カテゴリは同時には付けられず、両方が付いた状態になると子カテゴリだけが残ります（親子関係を後から変えた時も、既存の割り当ては自動で子だけに整理されます）。カテゴリを削除すると、その子カテゴリは削除したカテゴリの親の下へ移動し、各キャラからはそのカテゴリだけが外れます（他のカテゴリは残ります）。",
+    newNameLabel: "新しいカテゴリ名",
+    namePlaceholder: "例: ゲーム",
+    parentLabel: "親カテゴリ",
+    topLevelOption: "最上位（親なし）",
+    add: "追加",
+    adding: "追加中…",
+    empty: "まだカテゴリがありません。",
+    nameLabel: "カテゴリ名",
+    parentNote: "自分自身と自分の子カテゴリは親に選べません。",
+    parentDisplay: (name: string | null) => (name != null ? `親: ${name}` : "最上位"),
+    unknownParent: "（不明）",
+    deleteConfirmPrefix: "削除しますか？",
+    deleteChildMoveNote: (dest: string) => `子カテゴリは${dest}の下へ移動します。`,
+    deleteDestTop: "最上位",
+    deleteDestNamed: (name: string) => `「${name}」`,
+    cancelDelete: "やめる",
+    editAria: (name: string) => `カテゴリ「${name}」を編集`,
+    deleteAria: (name: string) => `カテゴリ「${name}」を削除`,
+    nameRequired: "カテゴリ名を入力してください。",
+    addFailed: "追加に失敗しました",
+  },
+
+  // ------------------------------------------------------------ カテゴリ割り当てシート
+  categoryAssign: {
+    sheetAria: (name: string) => `${name}のカテゴリを設定`,
+    title: (name: string) => `${name}のカテゴリ`,
+    description:
+      "複数のカテゴリを選べます。複数に登録したキャラは、どのカテゴリで絞り込んでも表示されます。子カテゴリに登録したキャラは、その親カテゴリで絞り込んだ時にも表示されます。ただし、子カテゴリとその親カテゴリは同時には選べません（子を選ぶと親は自動で外れます）。何も選ばなければ未分類になります。",
+    blockedByChild: (name: string) => `子カテゴリ「${name}」を選択中のため選べません`,
+    currentlyUncategorized: "現在は未分類です（カテゴリ未選択）。",
+    setFailed: "設定に失敗しました",
+  },
+
+  // ------------------------------------------------------------ レビュー
+  review: {
+    statusLabels: {
+      pending: "処理待ち",
+      processing: "見直し中",
+      done: "完了（自動適用済み）",
+      no_change: "変更なし",
+      failed: "失敗",
+    } as Record<string, string>,
+    failReasons: {
+      timeout: "タイムアウト（10分以内に見直しが終わりませんでした）",
+      rate_limited: "Claudeの利用上限に達しました",
+      generation_error: "生成に失敗しました",
+      invalid_json: "見直し結果がJSONとして読み取れませんでした",
+      invalid_format: "見直し結果の形式が avatar-profile ではありませんでした",
+      name_mismatch: "見直し結果のキャラクター名が対象と一致しませんでした",
+      id_mismatch: "見直し結果のプロファイルIDが元のものと変わっていました",
+      invalid_profile: "見直し結果から設定を構築できませんでした",
+      no_source_json: "元の設定JSONが保持されていないため、見直しできませんでした",
+      character_not_found: "キャラクターが見つかりませんでした",
+    } as Record<string, string>,
+    failFallback: "見直しに失敗しました",
+    failWithDetail: (reason: string) => `見直しに失敗しました（${reason}）`,
+    modeToggle: (active: boolean) => (active ? "レビューモード ON" : "レビューモード"),
+    panelAria: "レビューの指摘を書く",
+    targetLabel: (speakerName: string) => `レビュー対象（${speakerName}の発言）`,
+    cancelSelectionAria: "レビューの選択をやめる",
+    feedbackLabel: "設定と異なっている点",
+    feedbackPlaceholder: "例: 一人称は「オレ様」のはずが「ボク」になっている",
+    feedbackRequired: "指摘を入力してください。",
+    sending: "送信中…",
+    submit: "レビューを送る",
+    openHistoryForChar: "このキャラのレビュー履歴",
+    panelNote:
+      "送信すると、AIがキャラ設定を見直して自動で適用します。結果と差分はレビュー履歴に残ります。",
+    selectMessageAria: (excerpt: string) => `この発言をレビュー対象に選ぶ: ${excerpt}`,
+    registeredNotice:
+      "レビューを登録しました。見直しが終わると設定へ自動で反映されます。結果はレビュー履歴で確認できます。",
+    submitFailed: "レビューの送信に失敗しました",
+    chatBanner: "レビューモード中です。キャラの発言をタップして選ぶと、設定と違う点を指摘できます。",
+    groupBanner:
+      "レビューモード中です。キャラの発言をタップして選ぶと、そのキャラの設定への指摘ができます。",
+    historyButton: "レビュー履歴",
+    historyButtonFor: (name: string) => `${name}のレビュー履歴`,
+  },
+
+  // ------------------------------------------------------------ レビュー履歴シート
+  reviewHistory: {
+    title: (name: string) => `${name}のレビュー履歴`,
+    closeAria: "レビュー履歴を閉じる",
+    description:
+      "指摘を受けてAIが見直した結果です。差分があった見直しは自動で設定に適用されています。適用済みの改訂は、変更前の設定へ取り消せます。",
+    empty:
+      "まだレビューはありません。レビューモードでキャラの発言を選んで指摘を送ると、ここに記録されます。",
+    revertFailed: "取り消しに失敗しました",
+    articleAria: (date: string) => `レビュー ${date}`,
+    revertedBadge: "取り消し済み",
+    groupMessage: "グループでの発言",
+    chatMessage: "1対1での発言",
+    targetHeading: "対象の発言",
+    feedbackHeading: "指摘",
+    failedNoteSuffix: "（設定は変更されていません）",
+    noChangeNote: "見直しの結果、設定の変更はありませんでした。",
+    diffHeading: (n: number) => `設定の差分（${n}件）`,
+    diffBefore: "変更前: ",
+    diffAfter: "変更後: ",
+    fullJsonSummary: "再出力された設定JSON全文",
+    copyJson: "JSONをコピー",
+    copied: "コピーしました",
+    revertConfirm:
+      "この改訂を取り消して、変更前の設定に戻しますか？（この改訂より後の見直しも上書きされます）",
+    revertCancel: "やめる",
+    revertDo: "取り消す",
+    revertButton: "この改訂を取り消す",
+    revertedNote: (date: string) => `${date} に取り消され、変更前の設定に戻っています。`,
+  },
+
+  // ------------------------------------------------------------ ホーム（一覧）
+  home: {
+    tabListAria: "チャットの種類",
+    tabPersonal: "個人",
+    tabGroup: "グループ",
+    charactersSectionAria: "キャラクター",
+    charactersHeading: "キャラクター",
+    addCharacter: "キャラを追加",
+    sortLabel: "並び替え",
+    sortAdded: "追加順",
+    sortGojuon: "五十音順",
+    sortRecent: "最近使用した順",
+    compactToggle: (on: boolean) => (on ? "簡易表示 ON" : "簡易表示"),
+    openChatAria: (name: string, unread: number) =>
+      `${name}とのチャットを開く${unread > 0 ? `（未読の返信${unread}件）` : ""}`,
+    settingsAria: (name: string) => `${name}の設定`,
+    deleteAria: (name: string) => `${name}を削除`,
+    noCharacters:
+      "まだキャラクターがいません。アバター総合管理のプロファイルを取り込むか、書き出しJSONを貼って追加できます。",
+    bulkImport: "アバター管理から一括取り込み",
+    importStarted:
+      "取り込みを開始しました。反映まで少し時間がかかります。この画面は自動で更新されます。",
+    importStartedShort: "取り込みを開始しました。反映まで少し時間がかかります。",
+    addByJson: "書き出しJSONで追加",
+    categoryFilterEmpty:
+      "このカテゴリのキャラクターはいません。キャラの設定メニュー「カテゴリを設定」から分類できます。",
+    groupsSectionAria: "グループチャット",
+    groupsHeading: "グループチャット",
+    createGroup: "グループを作る",
+    noGroups:
+      "キャラ同士の掛け合いを楽しむグループは、まだありません。1人から作れて、なりきり機能で自分も参加できます。",
+    openGroupAria: (name: string, unread: number) =>
+      `グループ「${name}」を開く${unread > 0 ? `（未読の返信${unread}件）` : ""}`,
+    groupDissolved: "解散済み（ログの閲覧のみ）",
+    prevPage: "前のページ",
+    nextPage: "次のページ",
+    pageIndicator: (page: number, count: number, total: number) =>
+      `${page} / ${count} ページ（全${total}件）`,
+    footerNote:
+      "発言を送ると、連携済みのClaudeが分離した生成プロセスで自動で返信を書きます（数分かかることがあります）。返信に失敗した時は、送った文章が入力欄に戻るので、そのまま再送信できます。生成に渡される履歴は直近20発言までで、それより前の会話は参照されません。会話ログはこのアプリ内に保存されます。外部へのバックアップは無いため、アプリを削除するとログも消えます。",
+    globalSettingsAria: "全体設定",
+    globalSettingsHeading: "全体設定",
+    notifyReply: "返信が届いたらClaudeに通知する",
+    notifyReplyDesc:
+      "ONにすると、キャラからの返信（スケジューリングの自動生成も含む）が届いた時に、Claude側へメッセージが送られます。なお、Claudeのログイン切れ（トークン切れ）で生成に失敗した場合は、この設定がOFFでも通知されます。",
+    globalSettingsSaveFailed: "設定の保存に失敗しました。もう一度お試しください。",
+    logsLink: "履歴（全体ログ）",
+    deleteCharacterTitle: (name: string) => `${name}を削除しますか？`,
+    deleteCharacterBody:
+      "このキャラクターとの会話ログも一緒に削除されます。参加しているグループからは除外され、過去の発言は名前を残して保持されます。",
+  },
+
+  // ------------------------------------------------------------ スケジューリング
+  schedule: {
+    weekdayLabels: ["日", "月", "火", "水", "木", "金", "土"],
+    freqDaily: "毎日",
+    freqWeekly: (days: string) => `毎週 ${days}`,
+    targetExisting: (name: string) => `グループ「${name}」`,
+    targetMissing: "（対象グループなし）",
+    targetNew: "毎回新規チャット",
+    drawFromCategories: (min: number, max: number) => `カテゴリから${min}〜${max}人を抽選`,
+    guestsOn: "ゲストあり",
+    mobsOn: "モブあり",
+    narrationOn: "ナレーションあり",
+    sectionAria: "スケジューリング",
+    heading: "スケジューリング",
+    create: "スケジュールを作成",
+    description:
+      "決まった時刻になると、対象のグループチャットでキャラクター同士の会話を自動で生成します。スケジュールは複数作れます。",
+    loadFailed: "スケジュールの読み込みに失敗しました。",
+    empty: "まだスケジュールがありません。「スケジュールを作成」から追加できます。",
+    enabledAria: (name: string) => `スケジュール「${name}」の有効・無効`,
+    enabled: "有効",
+    disabled: "無効",
+    toggleFailed: "切り替えに失敗しました",
+    deleteTitle: (name: string) => `スケジュール「${name}」を削除しますか？`,
+    deleteBody: "このスケジュールでの自動生成は止まります。作成済みのグループや会話履歴は残ります。",
+  },
+
+  // ------------------------------------------------------------ スケジュール作成・編集シート
+  scheduleEdit: {
+    sheetAriaEdit: "スケジュールを編集",
+    sheetAriaCreate: "スケジュールを作成",
+    titleEdit: "スケジュールを編集",
+    titleCreate: "スケジュールを作成",
+    nameLabel: "スケジュール名（必須）",
+    namePlaceholder: "例: 朝の雑談",
+    enableLabel: "このスケジュールを有効にする",
+    frequencyHeading: "生成スケジュール",
+    frequencyAria: "頻度",
+    freqDaily: "毎日",
+    freqWeekly: "毎週",
+    weekdaysAria: "曜日（複数選択可）",
+    weekdayAria: (label: string) => `曜日: ${label}`,
+    timesHeading: "生成時刻（複数選択可・日本時間）",
+    timeAria: (i: number) => `生成時刻${i + 1}`,
+    timeDeleteAria: (i: number) => `生成時刻${i + 1}を削除`,
+    addTime: "＋ 時刻を追加",
+    targetHeading: "対象",
+    targetTypeAria: "対象の種類",
+    targetExistingLabel: "既存のグループチャット",
+    targetExistingDesc:
+      "選んだグループの設定（参加者・ゲスト/モブ・ナレーション・背景情報）を使って、その中で会話を生成します",
+    targetNewLabel: "毎回新規チャット",
+    targetNewDesc: "実行のたびに新しいグループを作り、カテゴリから抽選したキャラで会話を生成します",
+    targetGroupLabel: "対象のグループチャット",
+    targetGroupPlaceholder: "選んでください",
+    targetGroupNote:
+      "なりきり設定が有効なグループは対象にできません。背景情報はグループ側の設定を使います。",
+    targetGroupUnavailable: (name: string) => `${name}（現在は対象に選べません）`,
+    unknownGroup: "（不明なグループ）",
+    drawCategoriesHeading: "抽選するカテゴリ（複数選択可）",
+    drawCategoriesNote:
+      "選んだカテゴリ（子カテゴリを含む）に属するキャラクターの中から抽選します。未分類のキャラクターは対象になりません。",
+    membersLabel: "人数",
+    minMembersAria: "人数の最小",
+    maxMembersAria: "人数の最大",
+    guestMobNarrationHeading: "ゲスト・モブ・ナレーション（作成されるグループに引き継がれます）",
+    backgroundLabel: "背景情報",
+    backgroundPlaceholder: "例: 放課後の教室で、文化祭の準備をしている",
+    backgroundNote:
+      "ここに書いた背景情報が正で、作成されるグループへ初期値としてコピーされます（グループ側で編集しても、こちらには戻りません）。",
+    nameRequired: "スケジュール名を入力してください。",
+    timeRequired: "生成時刻を1つ以上入れてください。",
+    weekdayRequired: "曜日を1つ以上選んでください。",
+    targetGroupRequired: "対象のグループチャットを選んでください。",
+    categoryRequired: "カテゴリを1つ以上選んでください。",
+    membersRangeError: "人数の最小は最大以下にしてください。",
+    create: "作成する",
+  },
+
+  // ------------------------------------------------------------ 全体ログ
+  logs: {
+    kindLabels: {
+      user_send: "送信",
+      generation: "生成",
+      review: "レビュー",
+      settings: "設定変更",
+      auto: "自動生成",
+    } as Record<string, string>,
+    bodyLoadFailed: "本文の読み込みに失敗しました。",
+    bodyEmpty: "（本文なし）",
+    title: "履歴（全体ログ）",
+    description:
+      "あなたの送信、生成に使ったプロンプトと生レスポンス、レビュー、キャラクター設定の変更、自動生成の記録です。新しい順に最大100件まで残ります（古い物から消えます）。見出しをタップすると本文を開きます。",
+    empty:
+      "まだログがありません。チャットで送信したり、設定を変更したりすると、ここに記録されます。",
+    toggleAria: (title: string, open: boolean) => `ログ「${title}」の本文を${open ? "閉じる" : "開く"}`,
+  },
+
+  // ------------------------------------------------------------ キャラ取り込みシート
+  importSheet: {
+    title: "キャラクターを追加",
+    description:
+      "アバター総合管理アプリの書き出しJSON（avatar-profile形式）を貼ると、そのキャラクターを追加できます。同じプロファイルの再取り込みでは、設定だけが更新され、会話履歴は残ります。ここからの追加では画像は付きません（画像つきで取り込む場合は下の一括取り込みを使ってください）。",
+    jsonLabel: "書き出しJSON",
+    addedNotice: (name: string) => `「${name}」を追加しました。`,
+    updatedNotice: (name: string) =>
+      `「${name}」の設定を更新しました（会話履歴は保持されています）。`,
+    importFailed: "取り込みに失敗しました",
+    jsonRequired: "JSONを貼ってください。",
+    importButton: "取り込む",
+    bulkImportWithImages: "アバター管理から一括取り込み（画像つき）",
+  },
+
+  // ------------------------------------------------------------ グループ作成シート
+  createGroup: {
+    title: "グループを作る",
+    nameLabel: "グループ名（任意）",
+    namePlaceholder: "空欄なら参加キャラ名から自動で付けます",
+    membersHeading: "参加キャラクター（1〜8人）",
+    membersNote:
+      "1人だけでも作れます。作成後に「なりきり」を設定すると、自分がそのキャラとして参加できます。",
+    joinAria: (name: string) => `${name}を参加させる`,
+    guestMobNarrationHeading: "ゲスト・モブ・ナレーション",
+    guestMobNarrationNote:
+      "オンにすると、会話の流れに応じて参加者以外が混じることがあります（混じらないこともあります）。作成後もグループの設定から変えられます。",
+    guestLabel: "ゲスト（参加していないキャラが名前つきで入ることがある）",
+    mobLabel: "モブ（住民・生徒などの名前のない人々が入ることがある）",
+    narrationLabel: "ナレーション（背景説明・場面転換・時間経過の説明が入ることがある）",
+    maxMembersError: "グループは最大8人までです。",
+    selectRequired: "キャラクターを1人以上選んでください。",
+    createFailed: "作成に失敗しました",
+    create: "作成する",
+  },
+
+  // ------------------------------------------------------------ ゲスト・モブ許可の共通ラベル
+  guestMob: {
+    allowGuestsAria: "ゲストを許可する",
+    allowMobsAria: "モブを許可する",
+    allowNarrationAria: "ナレーションを許可する",
+  },
+
+  // ------------------------------------------------------------ 1対1チャット
+  chat: {
+    imageChange: "画像変更",
+    clearHistory: "履歴クリア",
+    export: "全文出力",
+    historyToggleAria: "過去の履歴を使うかどうかを切り替える",
+    historyOn: "履歴を使う",
+    historyOff: "履歴を使わない",
+    emptyLine1: "まだ会話がありません。下の入力欄から話しかけてみてください。",
+    emptyLine2: "送信すると、自動で返信が届きます。",
+    cancelSend: "送信を取り消す",
+    cancelSendAria: "この送信を取り消す",
+    closeNoticeAria: "通知を閉じる",
+    inputLabel: "メッセージ",
+    waitingPlaceholder: "返信待ちです（返信が来るまで送信できません）",
+    inputPlaceholder: "メッセージを書く",
+    send: "送信",
+    cancelDoneNotice: "送信を取り消しました。文章を入力欄に戻しました。",
+    cancelTooLateNotice: "生成が始まっているため、取り消せませんでした。",
+    sendFailed: "送信に失敗しました",
+    cancelFailed: "取り消しに失敗しました",
+    historyChangeFailed: "履歴設定の変更に失敗しました",
+    waitingError: "返信が来るまで送信できません。",
+    emptyMessageError: "メッセージを入力してください。",
+    clearConfirmTitle: "履歴をクリアしますか？",
+    clearConfirmBody: "このキャラクターとの会話ログが全て消えます。元には戻せません。",
+    clearConfirm: "クリアする",
+  },
+
+  // ------------------------------------------------------------ なりきり設定シート
+  roleplay: {
+    title: "なりきり設定",
+    description:
+      "自分がなりきるキャラクターを選ぶと、あなたの送信がそのキャラのアイコンと名前の付いた吹き出しになります（自分が書いた物だと分かるよう、色は通常の送信と同じ色になります）。",
+    characterHeading: "なりきるキャラクター",
+    noneAria: "なりきらない",
+    noneLabel: "なりきらない（未選択）",
+    asAria: (name: string) => `${name}になりきる`,
+    linesHeading: "なりきりキャラの台詞",
+    aiAlsoLabel: "AIも演じる",
+    aiAlsoDesc:
+      "AIが返信し、その後のなりきりキャラの台詞もAIが考えて続けます。なりきりキャラは、あなたとAIの共同になります。",
+    selfOnlyLabel: "自分だけが演じる",
+    selfOnlyDesc:
+      "AIは他のキャラだけで返信して続けます。なりきりキャラの台詞はAIは書きません。そのキャラが話すのは、あなたが打った時だけです。",
+    apply: "設定する",
+  },
+
+  // ------------------------------------------------------------ グループ設定メニュー
+  groupMenu: {
+    menuAria: "グループ設定メニュー",
+    title: (name: string) => `${name}の設定`,
+    rename: "グループチャットの名前を変える",
+    renameDesc: "このグループの表示名を変更します（参加者や会話履歴には影響しません）",
+    editMembers: "グループチャットの参加者を変える",
+    editMembersDesc:
+      "参加キャラクターを1〜8人の間で増やしたり減らしたりできます（会話履歴は残ります）",
+    guestMob: "ゲスト・モブ・ナレーションの設定",
+    guestMobDesc:
+      "参加者以外のキャラクター（ゲスト）や名前のない人々（モブ）が会話に混じることがあるかと、背景説明・場面転換のナレーションを入れるかを選びます",
+    background: "背景情報を編集する",
+    backgroundDesc:
+      "このグループの生成（通常・自動の両方）に常に添える背景情報（場所や状況など）を書きます。一度書けば使われ続けます",
+    deleteGroup: "グループを削除",
+    deleteGroupDesc: "このグループと掛け合いログを全て削除します。元には戻せません",
+  },
+
+  // ------------------------------------------------------------ ゲスト・モブ・ナレーション設定シート
+  groupGuestMob: {
+    title: "ゲスト・モブ・ナレーションの設定",
+    intro: "オンにすると、会話の流れに応じて参加者以外のキャラや人々が混じることがあります。",
+    guestLabel: "ゲスト",
+    guestDesc:
+      "参加していないキャラクターが会話に入ることがあります。登録済みのキャラクターは、その設定を参考にします。",
+    mobLabel: "モブ",
+    mobDesc: "名前のない人々が、一般名詞の表記で会話に入ることがあります。",
+    narrationLabel: "ナレーション",
+    narrationDesc:
+      "背景説明・場面転換・時間経過の説明が、誰の台詞でもない形で入ることがあります。吹き出しではなく、中央揃えで表示されます。",
+  },
+
+  // ------------------------------------------------------------ 背景情報シート
+  groupBackground: {
+    title: "背景情報を編集する",
+    description:
+      "このグループの会話の前提になる情報を書きます。内容はこのグループの生成（通常・自動の両方）に毎回添えられ、空にすると添えられなくなります。",
+    label: "背景情報",
+    placeholder: "場所や状況など、会話の前提になる情報",
+  },
+
+  // ------------------------------------------------------------ グループ名変更シート
+  renameGroup: {
+    title: "グループチャットの名前を変える",
+    description: "一覧やグループ画面で表示される名前を変えます。参加者や会話履歴には影響しません。",
+    label: "グループ名",
+    nameRequired: "グループ名を入力してください。",
+  },
+
+  // ------------------------------------------------------------ 参加者変更シート
+  groupMembers: {
+    title: "グループチャットの参加者を変える",
+    description:
+      "参加キャラクターは1〜8人です。外したキャラクターは会話に参加しなくなりますが、過去の発言は名前と画像つきで会話履歴にそのまま残ります。",
+    membersHeading: (n: number) => `参加キャラクター（現在 ${n}人）`,
+    charactersLoadFailed: "キャラクター一覧の読み込みに失敗しました。",
+    inGroupBadge: "参加中",
+    roleplayRemovedWarning: (name: string) =>
+      `なりきり中の「${name}」を外すと、なりきりは解除され未選択に戻ります。`,
+    roleplayClearedNotice:
+      "参加者を変更しました。なりきり中のキャラクターが外れたため、なりきりは解除されました。",
+    minMembersError: "参加者は1人以上選んでください。",
+    overMembersError: "参加者は8人までです。",
+  },
+
+  // ------------------------------------------------------------ グループチャット
+  group: {
+    fallbackName: "グループ",
+    settingsAria: "グループ設定",
+    settings: "設定",
+    historyTab: (on: boolean) => `履歴 ${on ? "ON" : "OFF"}`,
+    export: "全文出力",
+    roleplayButton: "なりきり",
+    deletedSuffix: "（削除済み）",
+    roleplayChip: (name: string, mode: string) => `なりきり中: ${name}（${mode}）`,
+    dissolvedNote:
+      "このグループは解散済みです（参加キャラクターが2人未満になりました）。ログの閲覧のみできます。",
+    empty: "まだ掛け合いがありません。下の入力欄に話題や指示を書いて投稿すると、自動で掛け合いが始まります。",
+    topicTime: (clock: string) => `話題 ${clock}`,
+    rawHeading: "分割できなかった出力",
+    historyOffNote: "履歴がオフのため、生成では過去の会話を参照しません。",
+    inputLabel: "話題・指示",
+    waitingPlaceholder: "掛け合い待ちです（届くまで投稿できません）",
+    roleplayPlaceholder: (name: string) => `${name}として発言する`,
+    inputPlaceholder: "話題や指示を書く（例: 初めて会った時の話をして）",
+    post: "投稿",
+    speak: "発言",
+    waitingError: "掛け合いが来るまで投稿できません。",
+    emptySpeechError: "発言を入力してください。",
+    emptyTopicError: "話題や指示を入力してください。",
+    deleteConfirmTitle: "グループを削除しますか？",
+    deleteConfirmBody: "グループと掛け合いログが全て消えます。元には戻せません。",
+  },
+} as const;
