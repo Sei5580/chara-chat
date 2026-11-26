@@ -172,6 +172,10 @@ export const groups = sqliteTable("groups", {
   // 時間経過の説明（ナレーション）が入ることがある。誰かの台詞ではなく、
   // 次の会話までに起きた事をただ記載する。既定は 0（従来通り入れない）。
   allowNarration: integer("allow_narration").notNull().default(0),
+  // 名前おまかせ: 1 の時、返信が生成されるたびに、その掛け合いの内容を
+  // 要約したタイトルがグループ名として代入され直す。作成時とグループ設定
+  // （名前変更シート）で切り替える。既定は 0（従来通り名前は固定）。
+  autoTitle: integer("auto_title").notNull().default(0),
   // 旧「背景情報」（設計書 v2.0 / C）: フレーバー化に伴い、値は migration
   // 0021 で flavors の1件目へ移行済み。このカラムは移行時点の値を保持する
   // だけで、読み書きは一切されない（characters.category_id と同じ扱い）。
@@ -268,14 +272,23 @@ export const meta = sqliteTable("meta", {
 // レビュー（設計書 v1.5 / 4.4章）: 特定のキャラ発言への指摘。状態は
 // pending / processing / done（自動適用済み）/ no_change（変更なし）/ failed。
 // message_body は発言が削除されても履歴が読めるよう登録時の複写を保持する。
+// 設定全体レビュー（概要確認画面から登録）: target_kind = "settings" で、
+// 特定の発言を持たないため message_id は null、message_body は空、
+// target_id はキャラクター自身のID。見直し以降の流れは通常レビューと同一。
 export const reviews = sqliteTable("reviews", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   characterId: integer("character_id").notNull(),
-  targetKind: text("target_kind", { enum: ["chat", "group"] }).notNull(),
+  targetKind: text("target_kind", { enum: ["chat", "group", "settings"] }).notNull(),
   targetId: integer("target_id").notNull(),
-  messageId: integer("message_id").notNull(),
+  messageId: integer("message_id"),
   messageBody: text("message_body").notNull(),
   feedback: text("feedback").notNull(),
+  // 改訂の意図: 見直し生成が修正後JSONとあわせて出力した「何を狙って、
+  // どこをどう変えたか」の説明。completeReview が生成出力から分離して
+  // ここへ保存し、レビュー履歴で差分・生データと並べて表示する。
+  // 変更なし（no_change）の場合も、変更しなかった理由として残る。
+  // この機能より前のレビューや、意図が出力されなかった場合は空。
+  intent: text("intent").notNull().default(""),
   status: text("status", {
     enum: ["pending", "processing", "done", "no_change", "failed"],
   })
