@@ -266,8 +266,9 @@ async function addReviewFailLog(db: Db, rev: ReviewRow, resultLine: string) {
     "review",
     `レビュー結果: ${crows[0]?.displayName ?? "（削除済みのキャラクター）"}（失敗）`,
     `指摘: ${rev.feedback}\n${resultLine}`,
-    "character",
-    rev.characterId,
+    // 結果ログはレビューIDへ紐付ける（completeReview 側の結果ログと同じ）。
+    "review",
+    rev.id,
   );
 }
 
@@ -298,11 +299,11 @@ async function failReviewRow(
 // ------------------------------------------------------- 返信を考えるAI（設計書 v3.5）
 //
 // 全体設定で、返信生成を担うAIを全チャット・グループ共通で切り替える。
-// - "claude"（既定）: 従来通り、分離した Claude Code プロセスが生成する。
+// - "claude": 分離した Claude Code プロセスが生成する。
 //   モデルは "sonnet"（既定）/ "opus" / "haiku" / "auto" から選べ、
 //   "auto" 以外は仲介が生成コマンドへ --model として渡す。"auto" は
 //   --model 自体を付けず、Claude Code 側の既定のモデル選択に任せる。
-// - "muse": 返信の見張り・仲介をしている Muse（エージェント）自身が、
+// - "muse"（未保存時の既定）: 返信の見張り・仲介をしている Muse（エージェント）自身が、
 //   getWorkItems の材料（システム/ユーザープロンプト）に従って返信文を
 //   考え、completeRequest へそのまま代入する。エージェント側のモデルは
 //   実行環境で固定されていて、アプリからは選べない（そのため muse 選択時は
@@ -325,7 +326,9 @@ async function readReplyAiSettings(db: Db): Promise<ReplyAiSettings> {
   const engineRaw = m.get(REPLY_ENGINE_KEY) ?? "";
   const modelRaw = m.get(CLAUDE_MODEL_KEY) ?? "";
   return {
-    engine: engineRaw === "muse" ? "muse" : "claude",
+    // 既定は muse: 明示的に "claude" と保存されている場合だけ claude にし、
+    // 未保存・不正値は muse として扱う（保存済みの値はそのまま尊重する）。
+    engine: engineRaw === "claude" ? "claude" : "muse",
     model: modelRaw === "opus" || modelRaw === "haiku" || modelRaw === "auto" ? modelRaw : "sonnet",
   };
 }
@@ -1168,13 +1171,14 @@ const MEDIATOR_MESSAGE = [
 "  - workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --model <item.model> --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text（--model には item.model の値（sonnet / opus / haiku）をそのまま入れる。ただし item.model が \"auto\" の場合は --model オプション自体を付けないこと（モデルを指定せず、Claude Code 側の既定のモデル選択に任せる））",
 "  - 終了コード0で出力が空でなければ completeRequest({request_id, output: 標準出力}) を呼ぶ。",
 "  - 失敗・空出力なら failRequest({request_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login / \"not logged in\" 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。failRequest で失敗が確定すると、対象の利用者発言はサーバ側で自動的に入力欄への戻し下書きになる（仲介側の追加処理は不要）。",
+" d. item.auto_title が true の場合（そのグループは「名前おまかせ」が有効）: 生成した掛け合いの内容を要約した短いタイトル（30字以内。グループ名として使う文言だけを書き、前置き・説明・引用符・マークダウンは付けない）をあなたが作り、completeRequest を呼ぶ時に title として一緒に渡すこと（completeRequest({request_id, output: 返信文, title: タイトル})）。タイトルは返信文（output）の中には絶対に含めない。engine が claude の場合も、Claude Code の出力（返信文）を受け取った後に、あなたがその内容を読んでタイトルを作る。auto_title が false の item では title を渡さないこと。",
 "3. 返信 item を全て処理したら、レビューの見直しも処理する（レビューは全体設定の engine にかかわらず、常に従来通り分離Claude Codeで処理する。--model は付けない。手順1で数えた分に加え、返信処理の間に新しく登録されたレビューも拾えるよう、ここで改めて取得し直す）:",
 " a. artifact.invoke_action で slug=kiyaratiyatuto の getReviewWorkItems を呼ぶ。items が空なら手順4へ。",
 " b. 各 review item について順番に（1件ずつ直列に）処理する:",
 "  - beginReview({review_id: item.review_id}) を呼ぶ。ok=false ならその item は飛ばす。",
 "  - item.system_prompt を ~/workspace/your_files/chara-chat/runtime/review-<review_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
 "  - 手順2の claude 生成と同じ専用設定フォルダと作業フォルダを使い（settings.json の上書きも同様に済ませてから）、workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
-"  - 終了コード0で出力が空でなければ completeReview({review_id, output: 標準出力}) を呼ぶ。出力は修正後JSONの原文のまま渡すこと（要約・整形・抜粋は禁止）。",
+"  - 終了コード0で出力が空でなければ completeReview({review_id, output: 標準出力}) を呼ぶ。出力は修正後JSONと、その後の「===改訂の意図===」以降の意図の文章まで含めて、原文のまま全文を渡すこと（要約・整形・抜粋は禁止。意図の部分を落としてJSONだけを渡してはならない）。",
 "  - 失敗・空出力なら failReview({review_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。",
 "4. 全て処理したら、処理件数を短く報告して終了する。通知（返信到着・ログイン切れ）の受け渡しは別の配送経路が担うため、getPendingNotifications / ackNotifications は呼ばないこと。",
 ].join("\n");
@@ -1831,6 +1835,14 @@ function collectDiff(path: string, before: unknown, after: unknown, out: DiffEnt
   if (isObj(before) && isObj(after)) {
     const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])];
     for (const k of keys) collectDiff(path ? `${path}.${k}` : k, before[k], after[k], out);
+    return;
+  }
+  // 配列同士は要素ごとに再帰し、変わった要素だけを「path[番号]」として
+  // 特定する。配列全体を1件の差分として JSON 丸ごと並べると、どの要素の
+  // 何が変わったか読み取れないため（例: flavor.traits の1件の label 変更）。
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const len = Math.max(before.length, after.length);
+    for (let i = 0; i < len; i++) collectDiff(`${path}[${i}]`, before[i], after[i], out);
     return;
   }
   if (JSON.stringify(before ?? null) !== JSON.stringify(after ?? null)) {
@@ -3235,6 +3247,52 @@ export const Actions = {
     },
   }),
 
+  exportCharactersData: defineAction({
+    description: "キャラ情報の出力用: 指定したキャラクター（複数可）について、このアプリ内に保持している設定JSON（取り込み時の元JSON）を character.json の中身として返します。元JSONを保持していないキャラクターは、保持している設定項目から組み立てたJSONを返します。画像のバイト列は含みません（画像はクライアント側が表示用URLから取得して一緒に出力します）。",
+    request: z.object({
+      character_ids: z.array(z.number().int().positive()).min(1).max(200),
+    }),
+    response: z.object({
+      items: z.array(
+        z.object({
+          character_id: z.number(),
+          display_name: z.string(),
+          json: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      const items: { character_id: number; display_name: string; json: string }[] = [];
+      for (const id of [...new Set(args.character_ids)]) {
+        const c = await getCharacterOrThrow(db, id);
+        let json = "";
+        const raw = (c.sourceJson ?? "").trim();
+        if (raw) {
+          try {
+            json = JSON.stringify(JSON.parse(raw), null, 2);
+          } catch {
+            json = raw;
+          }
+        } else {
+          json = JSON.stringify(
+            {
+              name: c.name,
+              display_name: c.displayName,
+              settings_text: c.settingsText,
+              relation_text: c.relationText,
+              theme_color: c.themeColor,
+            },
+            null,
+            2,
+          );
+        }
+        items.push({ character_id: c.id, display_name: c.displayName, json });
+      }
+      return { items };
+    },
+  }),
+
   renameCharacter: defineAction({
     description: "キャラクターの表示名だけを変更します。生成に使う設定本文・元の名前・会話履歴には影響しません。一覧・チャット・グループの表示に即時反映されます。",
     request: z.object({
@@ -3722,13 +3780,14 @@ export const Actions = {
   }),
 
   createGroup: defineAction({
-    description: "1〜8人のキャラクターでグループチャットを作成します（なりきり機能で利用者自身も参加できるため、1人から作成できます）。ゲスト・モブの許可（allow_guests / allow_mobs）とナレーションの許可（allow_narration）も作成時に指定できます。",
+    description: "1〜8人のキャラクターでグループチャットを作成します（なりきり機能で利用者自身も参加できるため、1人から作成できます）。ゲスト・モブの許可（allow_guests / allow_mobs）とナレーションの許可（allow_narration）も作成時に指定できます。auto_title=true（名前おまかせ）の時は、返信が生成されるたびに、その掛け合いの内容を要約したタイトルがグループ名として代入され直します。",
     request: z.object({
       name: z.string().trim().max(60).default(""),
       character_ids: z.array(z.number().int().positive()).min(1).max(8),
       allow_guests: z.boolean().default(false),
       allow_mobs: z.boolean().default(false),
       allow_narration: z.boolean().default(false),
+      auto_title: z.boolean().default(false),
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
@@ -3742,7 +3801,7 @@ export const Actions = {
       const name = args.name || chars.map((c) => c.displayName).join("・").slice(0, 60);
       const ins = await db
         .insert(schema.groups)
-        .values({ name, status: "active", allowGuests: args.allow_guests ? 1 : 0, allowMobs: args.allow_mobs ? 1 : 0, allowNarration: args.allow_narration ? 1 : 0 })
+        .values({ name, status: "active", allowGuests: args.allow_guests ? 1 : 0, allowMobs: args.allow_mobs ? 1 : 0, allowNarration: args.allow_narration ? 1 : 0, autoTitle: args.auto_title ? 1 : 0 })
         .returning({ id: schema.groups.id });
       const gid = ins[0]!.id;
       for (const id of ids) {
@@ -3788,6 +3847,9 @@ export const Actions = {
     request: z.object({ group_id: z.number().int().positive() }),
     response: z.object({
       group: z.object({ id: z.number(), name: z.string(), status: z.string() }),
+      // 名前おまかせ: true の時は、返信が生成されるたびに掛け合いの要約
+      // タイトルがグループ名として代入され直す。
+      auto_title: z.boolean(),
       // フレーバー: このグループで指定されているフレーバー一式（貼られた
       // テキストそのままの配列）。生成時は全件が絶対のルールとして含まれる。
       flavors: z.array(z.string()),
@@ -3900,6 +3962,7 @@ export const Actions = {
       const segDates = segmentDateLabels(msgs);
       return {
         group: { id: g.id, name: g.name, status: g.status },
+        auto_title: g.autoTitle === 1,
         flavors: parseFlavors(g.flavors),
         roleplay_character_id: g.roleplayCharacterId,
         roleplay_continue: g.roleplayContinue === 1,
@@ -3979,17 +4042,21 @@ export const Actions = {
   }),
 
   renameGroup: defineAction({
-    description: "グループチャットの名前を変更します。参加者・会話履歴・なりきり設定には影響しません。一覧・グループ画面の表示に即時反映されます。",
+    description: "グループチャットの名前を変更します。参加者・会話履歴・なりきり設定には影響しません。一覧・グループ画面の表示に即時反映されます。auto_title（名前おまかせ）を渡した場合はその設定も一緒に保存します（おまかせ中は、返信が生成されるたびに掛け合いの要約タイトルで名前が上書きされます）。",
     request: z.object({
       group_id: z.number().int().positive(),
       name: z.string().trim().min(1).max(60),
+      auto_title: z.boolean().optional(),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループの名前は変更できません");
-      await db.update(schema.groups).set({ name: args.name }).where(eq(schema.groups.id, g.id));
+      await db
+        .update(schema.groups)
+        .set({ name: args.name, ...(args.auto_title !== undefined ? { autoTitle: args.auto_title ? 1 : 0 } : {}) })
+        .where(eq(schema.groups.id, g.id));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4395,8 +4462,50 @@ export const Actions = {
     },
   }),
 
+  submitSettingsReview: defineAction({
+    description: "設定全体へのレビューを登録します: 特定の発言ではなく、キャラクターの設定全体に対する指摘を保存します。見直し・差分記録・自動適用・取り消しは通常のレビューと同一の流れで処理されます。",
+    request: z.object({
+      character_id: z.number().int().positive(),
+      feedback: z.string().trim().min(1).max(2000),
+    }),
+    response: z.object({ review_id: z.number() }),
+    async handler(ctx, args) {
+      const db = getDb(ctx);
+      await sweepReviewTimeouts(db);
+      const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
+      const c = crows[0];
+      if (!c) throw new Error("対象のキャラクターが見つかりません");
+      const ins = await db
+        .insert(schema.reviews)
+        .values({
+          characterId: c.id,
+          targetKind: "settings",
+          // 設定全体レビューでは対象はキャラ自身。発言は無いため messageId は null、
+          // messageBody は空（履歴表示側は target_kind で見分ける）。
+          targetId: c.id,
+          messageId: null,
+          messageBody: "",
+          feedback: args.feedback,
+          status: "pending",
+        })
+        .returning({ id: schema.reviews.id });
+      await addAppLog(
+        db,
+        "review",
+        `レビュー登録: ${c.displayName}`,
+        `対象: 設定全体\n指摘: ${args.feedback}`,
+        "character",
+        c.id,
+      );
+      ctx.invalidateQueries();
+      // 見直しの開始も signalAll と同一の共通経路を通す（未処理レビューが走査対象）。
+      await runSignalAll(ctx, db);
+      return { review_id: ins[0]!.id };
+    },
+  }),
+
   getReviewHistory: defineAction({
-    description: "キャラクターごとのレビュー履歴を新しい順に返します（対象発言の抜粋・指摘・状態・差分・再出力JSON・取り消し状態つき）。",
+    description: "キャラクターごとのレビュー履歴を新しい順に返します（対象発言の抜粋・指摘・状態・改訂の意図・差分・変更前後の設定JSON全文・取り消し状態つき）。intent は見直し生成が出力した改訂の意図（変更なしの場合は変更しなかった理由）で、この機能より前のレビューでは空です。target_kind が settings のものは特定の発言ではなく設定全体へのレビューで、message_body は空です。",
     request: z.object({ character_id: z.number().int().positive() }),
     response: z.object({
       character: z.object({ id: z.number(), name: z.string(), display_name: z.string() }),
@@ -4406,6 +4515,7 @@ export const Actions = {
           target_kind: z.string(),
           message_body: z.string(),
           feedback: z.string(),
+          intent: z.string(),
           status: z.string(),
           fail_reason: z.string(),
           fail_detail: z.string(),
@@ -4414,6 +4524,7 @@ export const Actions = {
             .object({
               id: z.number(),
               diff: z.array(z.object({ path: z.string(), before: z.string(), after: z.string() })),
+              before_json: z.string(),
               after_json: z.string(),
               applied_at: z.string(),
               reverted_at: z.string().nullable(),
@@ -4454,6 +4565,7 @@ export const Actions = {
           target_kind: r.targetKind,
           message_body: r.messageBody,
           feedback: r.feedback,
+          intent: r.intent,
           status: r.status,
           fail_reason: r.failReason,
           fail_detail: r.failDetail,
@@ -4462,6 +4574,7 @@ export const Actions = {
             ? {
                 id: rev.id,
                 diff,
+                before_json: rev.beforeJson,
                 after_json: rev.afterJson,
                 applied_at: rev.createdAt.toISOString(),
                 reverted_at: rev.revertedAt ? rev.revertedAt.toISOString() : null,
@@ -4761,7 +4874,7 @@ export const Actions = {
   // ----------------------------------------------------- mediation API
 
   getWorkItems: defineAction({
-    description: "仲介用: pending の返信リクエストと、生成に必要な材料（システムプロンプト・ユーザープロンプト）を組み立てて返します。各 item の engine は全体設定「返信を考えるAI」（claude = 分離Claude Codeで生成し model を --model に渡す / muse = 仲介エージェント自身が材料に従って返信文を考えて completeRequest へ代入する）で、model は engine が claude の時に使うモデル（sonnet / opus / haiku / auto。auto の時は --model を付けず Claude Code 側の既定のモデル選択に任せる）です。",
+    description: "仲介用: pending の返信リクエストと、生成に必要な材料（システムプロンプト・ユーザープロンプト）を組み立てて返します。各 item の engine は全体設定「返信を考えるAI」（claude = 分離Claude Codeで生成し model を --model に渡す / muse = 仲介エージェント自身が材料に従って返信文を考えて completeRequest へ代入する）で、model は engine が claude の時に使うモデル（sonnet / opus / haiku / auto。auto の時は --model を付けず Claude Code 側の既定のモデル選択に任せる）です。auto_title=true のグループ item では、掛け合いの要約タイトルを completeRequest の title へ渡してください。",
     request: z.object({}),
     response: z.object({
       items: z.array(
@@ -4773,6 +4886,9 @@ export const Actions = {
           user_prompt: z.string(),
           engine: z.string(),
           model: z.string(),
+          // 名前おまかせ（グループのみ）: true の時は、生成した掛け合いの
+          // 要約タイトルを completeRequest の title へ渡すよう仲介へ伝える。
+          auto_title: z.boolean(),
         }),
       ),
     }),
@@ -4856,7 +4972,7 @@ export const Actions = {
             .update(schema.replyRequests)
             .set({ noHistory: c.useHistory === 1 ? 0 : 1 })
             .where(eq(schema.replyRequests.id, req.id));
-          items.push({ request_id: req.id, target_kind: "chat", target_name: c.displayName, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model });
+          items.push({ request_id: req.id, target_kind: "chat", target_name: c.displayName, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model, auto_title: false });
         } else {
           const grows = await db.select().from(schema.groups).where(eq(schema.groups.id, req.targetId));
           const g = grows[0];
@@ -5056,7 +5172,7 @@ export const Actions = {
             .update(schema.replyRequests)
             .set({ noHistory: g.useHistory === 1 ? 0 : 1 })
             .where(eq(schema.replyRequests.id, req.id));
-          items.push({ request_id: req.id, target_kind: "group", target_name: g.name, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model });
+          items.push({ request_id: req.id, target_kind: "group", target_name: g.name, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model, auto_title: g.autoTitle === 1 });
         }
       }
       return { items };
@@ -5104,8 +5220,12 @@ export const Actions = {
   }),
 
   completeRequest: defineAction({
-    description: "仲介用: 生成結果の原文を書き戻します。processing のリクエストにだけ受理され、1対1はそのまま保存、グループは表示名で分割して保存します。",
-    request: z.object({ request_id: z.number().int().positive(), output: z.string().max(100_000) }),
+    description: "仲介用: 生成結果の原文を書き戻します。processing のリクエストにだけ受理され、1対1はそのまま保存、グループは表示名で分割して保存します。title は「名前おまかせ」が有効なグループ専用で、掛け合いの要約タイトルを渡すとグループ名として代入されます（おまかせでないグループや1対1では無視されます）。",
+    request: z.object({
+      request_id: z.number().int().positive(),
+      output: z.string().max(100_000),
+      title: z.string().trim().max(200).optional(),
+    }),
     response: z.object({ accepted: z.boolean(), saved_messages: z.number() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
@@ -5234,7 +5354,18 @@ export const Actions = {
             ),
         );
       }
-      stmts.push(db.update(schema.groups).set({ nextSeq: seq }).where(eq(schema.groups.id, g.id)));
+      // 名前おまかせ: 有効なグループでは、仲介が渡した要約タイトル（title）を
+      // グループ名として代入し直す。タイトルが無い・空の場合は名前を変えない。
+      const autoTitle =
+        g.autoTitle === 1 && args.title
+          ? args.title.split(/\r?\n/)[0]!.trim().slice(0, 60)
+          : "";
+      stmts.push(
+        db
+          .update(schema.groups)
+          .set(autoTitle ? { nextSeq: seq, name: autoTitle } : { nextSeq: seq })
+          .where(eq(schema.groups.id, g.id)),
+      );
       stmts.push(
         db.update(schema.replyRequests).set({ status: "done", finishedAt: new Date() }).where(eq(schema.replyRequests.id, req.id)),
       );
@@ -5360,11 +5491,15 @@ export const Actions = {
           } else {
             lines.push(`  結果: 見直し失敗（${p.failReason || "generation_error"}）`);
           }
+          if (p.intent.trim()) lines.push(`  改訂の意図: ${p.intent.trim().slice(0, 200)}`);
           pastLines.push(lines.join("\n"));
         }
-        // 対象発言と前後の会話（前後3件まで）。
+        // 対象発言と前後の会話（前後3件まで）。設定全体レビュー
+        // （target_kind = "settings"）には対象発言が無いため、その旨だけを渡す。
         let contextLines: string[] = [];
-        if (rev.targetKind === "chat") {
+        if (rev.targetKind === "settings") {
+          contextLines = ["（このレビューは特定の発言ではなく、キャラクターの設定全体に対する指摘です。対象の発言はありません）"];
+        } else if (rev.targetKind === "chat") {
           const msgs = await db
             .select()
             .from(schema.messages)
@@ -5393,12 +5528,19 @@ export const Actions = {
         const systemPrompt = [
           "あなたは、キャラクター設定JSONの見直し担当です。利用者からの指摘を受けて、キャラクター設定を修正します。",
           "",
+          "--- 見直しの方針（厳守） ---",
+          "- レビューの目的は、キャラクターの再現精度を高めることである。否定文（「〜しない」「〜ではない」など）や追加情報を足して設定を膨らませる方向で直してはならない。不要な情報は削って短くしつつ、再現に必要な情報はしっかり押さえて残すことを目指す。",
+          "- 出現頻度が問題の場合は、文章を足したり書き換えたりするのではなく数値で直す。該当する項目にある頻度等の数値（frequency / effective_frequency / level など、その項目に実在する数値）を調整し、文章による補足で対処しない。",
+          "- 細かい指定が必要な場合は、記載してよい。その場合も再現に必要な範囲に絞り、冗長にならないようにする。",
+          "- 指摘箇所だけでなく設定全体を見直し、全体を通して冗長な部分（重複、言い換えの繰り返し、再現に寄与しない説明、否定文の積み重ねなど）は削る。ただし、再現に必要な情報まで削らない。",
+          "",
           "--- 出力のルール（厳守） ---",
-          "- 修正後の設定JSON全文だけを返す。前置き・説明・コードフェンス（```）・マークダウンは一切付けない。",
+          "- 修正後の設定JSON全文を返し、その直後に改行を挟んで「===改訂の意図===」という行を1行だけ置き、その後に改訂の意図を書く。前置き・コードフェンス（```）・マークダウンは一切付けない。",
+          "- 改訂の意図には、何を狙って（指摘のどこに応え、再現精度の何を直そうとしたか）、どこをどう変えたか（変更した項目と変更の要点。全体見直しで削った冗長部分があればその旨も）を、簡潔に書く。設定を変更しなかった場合は、変更しなかった理由を書く。意図の文章は設定JSONには含めない（JSONの後ろの区切り行以降にだけ書く）。",
           "- 形式は avatar-profile v1.0 のままにする: \"format\" は \"avatar-profile\"、\"format_version\" は \"1.0\"、\"id\" は元のプロファイルIDをそのまま維持し、\"name\" は変更しない。",
-          "- 指摘に関係する項目だけを、必要最小限に修正する。関係ない項目・キー構造・値の形式は元のまま保持する。",
-          "- 過去のレビューで適用済みの修正は維持する（取り消されたものは除く）。今回の指摘と矛盾しない限り、元に戻さない。",
-          "- 設定に無い事実を新たに捏造しない。指摘を満たすために必要な範囲での書き換え・追記に留める。",
+          "- キー構造・値の形式は元のまま保持する。上記の方針に基づく指摘の反映と全体の冗長削減以外では、関係ない項目の内容を変えない。",
+          "- 過去のレビューで適用済みの修正は維持する（取り消されたものは除く）。今回の指摘と矛盾しない限り、元に戻さない。ただし、その修正自体が上記の方針に照らして冗長である場合は、全体見直しの一環として削ってよい。",
+          "- 設定に無い事実を新たに捏造しない。追記は指摘を満たし再現精度を高めるために必要な範囲に留め、否定文や追加情報で設定を膨らませない。",
           "- background.portrayal_focus は「演じる姿・状況」の指定（このキャラクターを演じる前提の姿・状況）である。ただし background.portrayal_focus_status が \"failed\" の場合は、資料に当たる部分が無いと判定済みであり、その指定は無効として扱う。指摘と無関係に portrayal_focus や portrayal_focus_status を書き換えないこと。",
           "- background.video_notes は参考動画の台詞から得た口調の参考資料であり、このキャラクターの台詞や言い回しの正本ではない。指摘と無関係に書き換えないこと。",
         ].join("\n");
@@ -5409,13 +5551,13 @@ export const Actions = {
           "--- このキャラクターの過去のレビュー（指摘と見直し結果の要約） ---",
           ...(pastLines.length ? pastLines : ["（過去のレビューはありません）"]),
           "",
-          "--- 対象の発言と前後の会話 ---",
+          rev.targetKind === "settings" ? "--- レビューの対象（設定全体） ---" : "--- 対象の発言と前後の会話 ---",
           ...contextLines,
           "",
           "--- 今回の指摘（設定と異なっている点） ---",
           rev.feedback,
           "",
-          "上記の指摘を反映した、修正後の設定JSON全文を出力してください。",
+          "上記の指摘を反映し、システムプロンプトの「見直しの方針」に従って設定全体の冗長な部分も削った、修正後の設定JSON全文を出力してください。頻度が問題の場合は文章ではなく数値で調整してください。JSONの後には「===改訂の意図===」の行を置き、何を狙ってどこをどう変えたか（変更しなかった場合はその理由）を続けて書いてください。",
         ].join("\n");
         items.push({
           review_id: rev.id,
@@ -5446,7 +5588,7 @@ export const Actions = {
   }),
 
   completeReview: defineAction({
-    description: "仲介用: 見直し結果（修正後設定JSON全文）を書き戻します。processing のレビューにだけ受理され、JSONとして解釈でき・形式が avatar-profile で・名前とプロファイルIDが対象キャラと一致する場合のみ有効とします。差分があれば自動適用し、無ければ「変更なし」、検証失敗は「失敗」として記録し設定は変更しません。",
+    description: "仲介用: 見直し結果（修正後設定JSON全文＋「===改訂の意図===」以降の改訂の意図）を書き戻します。processing のレビューにだけ受理され、JSONとして解釈でき・形式が avatar-profile で・名前とプロファイルIDが対象キャラと一致する場合のみ有効とします。意図はJSONから分離してレビューに保存し、履歴で差分・生データと並べて表示します。差分があれば自動適用し、無ければ「変更なし」、検証失敗は「失敗」として記録し設定は変更しません。",
     request: z.object({ review_id: z.number().int().positive(), output: z.string().max(200_000) }),
     response: z.object({ accepted: z.boolean(), outcome: z.string() }),
     async handler(ctx, args) {
@@ -5465,8 +5607,22 @@ export const Actions = {
       const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
       const c = crows[0];
       if (!c) return failWith("character_not_found", "対象のキャラクターが見つかりませんでした。");
+      // 改訂の意図の分離: 生成出力は「修正後JSON全文」の後に
+      // 「===改訂の意図===」の行を挟んで意図の文章が続く形式。JSONの解釈前に
+      // 区切り行で分け、意図はレビュー行へ保存して履歴に残す。区切り行が無い
+      // 出力（この形式になる前の生成など）は意図なしとして従来通り扱う。
+      let intent = "";
+      let rawText = args.output.trim();
+      {
+        const lines = rawText.split("\n");
+        const markerIdx = lines.findIndex((l) => l.trim() === "===改訂の意図===");
+        if (markerIdx >= 0) {
+          intent = lines.slice(markerIdx + 1).join("\n").trim().slice(0, 2000);
+          rawText = lines.slice(0, markerIdx).join("\n").trim();
+        }
+      }
       // コードフェンスが付いていても中身を取り出す。
-      let text = args.output.trim();
+      let text = rawText;
       if (text.startsWith("```")) {
         const firstNl = text.indexOf("\n");
         if (firstNl >= 0) text = text.slice(firstNl + 1);
@@ -5495,15 +5651,16 @@ export const Actions = {
       if (!diff.length) {
         await db
           .update(schema.reviews)
-          .set({ status: "no_change", finishedAt: new Date() })
+          .set({ status: "no_change", intent, finishedAt: new Date() })
           .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "processing")));
         await addAppLog(
           db,
           "review",
           `レビュー結果: ${c.displayName}（変更なし）`,
-          `指摘: ${rev.feedback}\n結果: 見直しの結果、設定の変更はありませんでした。`,
-          "character",
-          c.id,
+          `指摘: ${rev.feedback}\n結果: 見直しの結果、設定の変更はありませんでした。${intent ? `\n改訂の意図: ${intent}` : ""}`,
+          // 結果ログはレビューIDへ紐付ける（getAppLogBody が改訂の差分・値を引くため）。
+          "review",
+          rev.id,
         );
         ctx.invalidateQueries();
         return { accepted: true, outcome: "no_change" };
@@ -5528,7 +5685,7 @@ export const Actions = {
       await applyProfileToCharacter(db, c, parsed, afterJson);
       await db
         .update(schema.reviews)
-        .set({ status: "done", finishedAt: new Date() })
+        .set({ status: "done", intent, finishedAt: new Date() })
         .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "processing")));
       // 全体ログ（設計書 v2.0 / D）: レビューの結果と、設定変更（自動適用）の両方を記録する。
       const diffPaths = diff.map((d) => d.path).join("、");
@@ -5536,17 +5693,18 @@ export const Actions = {
         db,
         "review",
         `レビュー結果: ${c.displayName}（適用）`,
-        `指摘: ${rev.feedback}\n結果: 設定へ自動適用されました。変更項目: ${diffPaths}`,
-        "character",
-        c.id,
+        `指摘: ${rev.feedback}\n結果: 設定へ自動適用されました。変更項目: ${diffPaths}${intent ? `\n改訂の意図: ${intent}` : ""}`,
+        // 結果ログはレビューIDへ紐付ける（getAppLogBody が改訂の差分・値を引くため）。
+        "review",
+        rev.id,
       );
       await addAppLog(
         db,
         "settings",
         `キャラ設定を変更: ${c.displayName}`,
         `レビューの見直しで設定が自動適用されました。変更項目: ${diffPaths}`,
-        "character",
-        c.id,
+        "review",
+        rev.id,
       );
       ctx.invalidateQueries();
       return { accepted: true, outcome: "applied" };
@@ -5708,8 +5866,10 @@ export const Actions = {
   // ----------------------------------------------------- app logs (v2.0 / D)
 
   listAppLogs: defineAction({
-    description: "全体ログの見出し一覧を新しい順に最大100件返します（種別・見出し・時刻のみ。本文は getAppLogBody で個別に取得します）。",
-    request: z.object({}),
+    description: "全体ログの見出し一覧を新しい順に最大100件返します（種別・見出し・時刻のみ。本文は getAppLogBody で個別に取得します）。kind を渡すと、その種別のログだけに絞り込みます（保持上限は全種別合算の最新100件で、絞り込みはその中から行います）。",
+    request: z.object({
+      kind: z.enum(["user_send", "generation", "review", "settings", "auto"]).optional(),
+    }),
     response: z.object({
       logs: z.array(
         z.object({
@@ -5720,18 +5880,22 @@ export const Actions = {
         }),
       ),
     }),
-    async handler(ctx) {
+    async handler(ctx, args) {
       const db = getDb(ctx);
       const rows = await db
         .select({ id: schema.appLogs.id, kind: schema.appLogs.kind, title: schema.appLogs.title, createdAt: schema.appLogs.createdAt })
         .from(schema.appLogs)
         .orderBy(asc(schema.appLogs.id));
-      const logs = [...rows].reverse().slice(0, APP_LOG_LIMIT).map((r) => ({
-        id: r.id,
-        kind: r.kind,
-        title: r.title,
-        created_at: r.createdAt.toISOString(),
-      }));
+      const logs = [...rows]
+        .reverse()
+        .slice(0, APP_LOG_LIMIT)
+        .filter((r) => args.kind === undefined || r.kind === args.kind)
+        .map((r) => ({
+          id: r.id,
+          kind: r.kind,
+          title: r.title,
+          created_at: r.createdAt.toISOString(),
+        }));
       return { logs };
     },
   }),
@@ -5739,7 +5903,7 @@ export const Actions = {
   // ----------------------------------------------------- 全体設定（v2.1）
 
   getGlobalSettings: defineAction({
-    description: "全体設定を返します。notify_reply は「返信が届いたらMuseに通知する」の ON/OFF です（既定は OFF）。Claudeのログイン切れによる生成失敗の通知は、この設定にかかわらず送られます。reply_engine は「返信を考えるAI」（claude = 分離Claude Code、既定 / muse = 見張り役のClaudeが自分で考える）で、全チャット・グループ共通です。claude_model は reply_engine が claude の時に使うモデル（sonnet = 既定 / opus / haiku / auto = モデルを指定せず Claude Code 側の既定の選択に任せる）です。レビューの見直しと「自動」の議題作成は reply_engine の影響を受けません。",
+    description: "全体設定を返します。notify_reply は「返信が届いたらMuseに通知する」の ON/OFF です（既定は OFF）。Claudeのログイン切れによる生成失敗の通知は、この設定にかかわらず送られます。reply_engine は「返信を考えるAI」（claude = 分離Claude Code / muse = 見張り役のClaudeが自分で考える、未保存時の既定はこちら）で、全チャット・グループ共通です。claude_model は reply_engine が claude の時に使うモデル（sonnet = 既定 / opus / haiku / auto = モデルを指定せず Claude Code 側の既定の選択に任せる）です。レビューの見直しと「自動」の議題作成は reply_engine の影響を受けません。",
     request: z.object({}),
     response: z.object({
       notify_reply: z.boolean(),
@@ -5776,7 +5940,7 @@ export const Actions = {
   }),
 
   getAppLogBody: defineAction({
-    description: "全体ログ1件の本文を返します（一覧で見出しを開いた時に呼びます）。",
+    description: "全体ログ1件の本文を返します（一覧で見出しを開いた時に呼びます）。レビューによる設定適用のログでは、適用された改訂（項目ごとの変更前→変更後の差分と、変更前後の設定JSON全文）も review_revision としてあわせて返し、ログ側でもレビュー履歴と同等の内容（何の値が入ったか・差分）が見られるようにします。改訂と結び付かないログでは review_revision は null です。",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({
       id: z.number(),
@@ -5784,13 +5948,87 @@ export const Actions = {
       title: z.string(),
       body: z.string(),
       created_at: z.string(),
+      review_revision: z
+        .object({
+          diff: z.array(z.object({ path: z.string(), before: z.string(), after: z.string() })),
+          before_json: z.string(),
+          after_json: z.string(),
+          reverted_at: z.string().nullable(),
+        })
+        .nullable(),
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
       const rows = await db.select().from(schema.appLogs).where(eq(schema.appLogs.id, args.id));
       const r = rows[0];
       if (!r) throw new Error("ログが見つかりません");
-      return { id: r.id, kind: r.kind, title: r.title, body: r.body, created_at: r.createdAt.toISOString() };
+      // レビュー適用ログ → 改訂（差分・変更前後の値）の解決。
+      // 新しいログは related が ("review", レビューID) で改訂へ直接引ける。
+      // それ以前のログ（related が ("character", キャラID)）は、本文の
+      // 「変更項目:」一覧と改訂の差分項目が完全一致し、記録時刻も近い
+      // 改訂がちょうど1件だけある場合に限り、その改訂として扱う
+      // （曖昧な場合は結び付けない）。
+      let revisionRow: typeof schema.settingRevisions.$inferSelect | undefined;
+      if (r.relatedType === "review" && r.relatedId != null) {
+        const revRows = await db
+          .select()
+          .from(schema.settingRevisions)
+          .where(eq(schema.settingRevisions.reviewId, r.relatedId));
+        revisionRow = revRows[0];
+      } else if (
+        r.relatedType === "character" &&
+        r.relatedId != null &&
+        ((r.kind === "review" && r.title.endsWith("（適用）")) ||
+          (r.kind === "settings" && r.body.startsWith("レビューの見直しで設定が自動適用されました。変更項目:")))
+      ) {
+        const m = /変更項目: ([^\n]+)/.exec(r.body);
+        if (m) {
+          const pathsText = m[1]!.trim();
+          const candidates = await db
+            .select()
+            .from(schema.settingRevisions)
+            .where(eq(schema.settingRevisions.characterId, r.relatedId));
+          const matched = candidates.filter((cand) => {
+            if (Math.abs(cand.createdAt.getTime() - r.createdAt.getTime()) > 120_000) return false;
+            try {
+              const d = JSON.parse(cand.diff) as DiffEntry[];
+              return Array.isArray(d) && d.map((x) => x.path).join("、") === pathsText;
+            } catch {
+              return false;
+            }
+          });
+          if (matched.length === 1) revisionRow = matched[0];
+        }
+      }
+      let reviewRevision: {
+        diff: DiffEntry[];
+        before_json: string;
+        after_json: string;
+        reverted_at: string | null;
+      } | null = null;
+      if (revisionRow) {
+        let diff: DiffEntry[] = [];
+        try {
+          const parsed = JSON.parse(revisionRow.diff) as DiffEntry[];
+          if (Array.isArray(parsed)) diff = parsed;
+        } catch {
+          diff = [];
+        }
+        reviewRevision = {
+          diff,
+          before_json: revisionRow.beforeJson,
+          after_json: revisionRow.afterJson,
+          reverted_at: revisionRow.revertedAt ? revisionRow.revertedAt.toISOString() : null,
+        };
+      }
+      return {
+        id: r.id,
+        kind: r.kind,
+        title: r.title,
+        body: r.body,
+        created_at: r.createdAt.toISOString(),
+        review_revision: reviewRevision,
+      };
     },
   }),
 } satisfies ActionsModule;

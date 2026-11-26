@@ -45,7 +45,7 @@ export const TEXTS = {
     selectedCount: (n: number) => `選択中 ${n}人`,
     categoryEmpty: "このカテゴリのキャラクターはいません。",
     noCategoriesYet:
-      "まだカテゴリが登録されていません。一覧の「カテゴリ管理」から先にカテゴリを追加してください。",
+      "まだカテゴリが登録されていません。一覧の「その他」メニューの「カテゴリ管理」から先にカテゴリを追加してください。",
     categoryAria: (name: string) => `カテゴリ「${name}」`,
     categoryFilterGroupAria: "カテゴリの選択（複数選択可）",
   },
@@ -150,16 +150,16 @@ export const TEXTS = {
   characterMenu: {
     menuAria: (name: string) => `${name}の設定メニュー`,
     title: (name: string) => `${name}の設定`,
-    viewSettings: "概要を確認する",
-    viewSettingsDesc: "設定本文と関係・呼び方を確認します",
     editSettings: "設定を編集する",
-    editSettingsDesc: "項目ごとの入力欄で設定を書き換えます",
+    editSettingsDesc: "概要の確認と、項目ごとの入力欄での設定の書き換えをします",
     editImage: "画像を変更",
     editImageDesc: "画像を選んでトリミングして差し替えます",
     rename: "表示名を変更",
     renameDesc: "表示される名前だけを変えます",
     setCategory: "カテゴリを設定",
     setCategoryDesc: "カテゴリを選んで分類します（複数選択可）",
+    deleteCharacter: "キャラを削除する",
+    deleteCharacterDesc: "このキャラクターと会話ログを削除します。元には戻せません",
   },
 
   // ------------------------------------------------------------ キャラ設定の閲覧シート
@@ -172,7 +172,19 @@ export const TEXTS = {
     settingsTextHeading: "設定本文（生成に使われる内容）",
     relationTextHeading: "関係・呼び方",
     footerNote:
-      "設定の書き換えは設定メニューの「設定を編集する」から、発言への指摘はチャット画面のレビューモードから行えます。",
+      "発言への指摘はチャット画面のレビューモードから行えます。",
+    reviewHeading: "設定全体へのレビュー",
+    reviewDesc:
+      "特定の発言ではなく、このキャラクターの設定全体に対する指摘を送れます。送信すると、AIが設定全体を見直して自動で適用します。結果と差分はレビュー履歴に残り、履歴から取り消せます。",
+    reviewLabel: "設定全体への指摘",
+    reviewPlaceholder: "例: 一人称は「オレ様」のはずが、設定の話し方では「ボク」になっている",
+    reviewRequired: "指摘を入力してください。",
+    reviewSubmit: "レビューを送る",
+    reviewSending: "送信中…",
+    reviewRegistered:
+      "レビューを登録しました。見直しが終わると設定へ自動で反映されます。結果はレビュー履歴で確認できます。",
+    reviewFailed: "レビューの送信に失敗しました",
+    reviewOpenHistory: "レビュー履歴を見る",
   },
 
   // ------------------------------------------------------------ 設定の編集フォーム
@@ -183,6 +195,11 @@ export const TEXTS = {
       "このキャラクターは設定データ（avatar-profile形式）を保持していないため、ここからは編集できません。",
     intro:
       "保存すると、このアプリ内の設定が書き換わり、次の返信から反映されます（アバター管理ツール側の設定と表示名は変わりません）。",
+    sectionOverview: "概要",
+    overviewNote:
+      "生成に使われる設定本文と関係・呼び方は、上の項目を保存すると自動で組み直されます。",
+    showOutput: "出力を確認する",
+    hideOutput: "出力を閉じる",
     nameRequired: "名前を入力してください。",
     sectionBasic: "基本",
     sectionBackground: "背景",
@@ -238,7 +255,7 @@ export const TEXTS = {
     title: "カテゴリ管理",
     closeAria: "カテゴリ管理を閉じる",
     description:
-      "カテゴリはキャラ一覧の絞り込みに使います。カテゴリには親カテゴリを設定でき、子カテゴリ（サブカテゴリ）を作れます。親カテゴリで絞り込むと、その子・孫カテゴリのキャラもまとめて表示されます。1キャラに複数のカテゴリを設定でき、複数に登録したキャラはどのカテゴリで絞り込んでも表示されます。各キャラへの割り当ては、キャラの設定メニュー「カテゴリを設定」から行います。子カテゴリとその親カテゴリは同時には付けられず、両方が付いた状態になると子カテゴリだけが残ります（親子関係を後から変えた時も、既存の割り当ては自動で子だけに整理されます）。カテゴリを削除すると、その子カテゴリは削除したカテゴリの親の下へ移動し、各キャラからはそのカテゴリだけが外れます（他のカテゴリは残ります）。",
+      "カテゴリはキャラ一覧の絞り込みに使います。親カテゴリを設定して子カテゴリを作れ、親で絞り込むと子・孫のキャラもまとめて表示されます。\n1キャラに複数のカテゴリを設定でき、各キャラへの割り当てはキャラの設定メニュー「カテゴリを設定」から行います。",
     newNameLabel: "新しいカテゴリ名",
     namePlaceholder: "例: ゲーム",
     parentLabel: "親カテゴリ",
@@ -321,7 +338,7 @@ export const TEXTS = {
     submit: "レビューを送る",
     openHistoryForChar: "このキャラのレビュー履歴",
     panelNote:
-      "送信すると、AIがキャラ設定を見直して自動で適用します。結果と差分はレビュー履歴に残ります。",
+      "送信すると、AIがキャラ設定を見直して自動で適用します。結果と差分、改訂の意図はレビュー履歴に残ります。",
     selectMessageAria: (excerpt: string) => `この発言をレビュー対象に選ぶ: ${excerpt}`,
     registeredNotice:
       "レビューを登録しました。見直しが終わると設定へ自動で反映されます。結果はレビュー履歴で確認できます。",
@@ -338,23 +355,29 @@ export const TEXTS = {
     title: (name: string) => `${name}のレビュー履歴`,
     closeAria: "レビュー履歴を閉じる",
     description:
-      "指摘を受けてAIが見直した結果です。差分があった見直しは自動で設定に適用されています。適用済みの改訂は、変更前の設定へ取り消せます。",
+      "指摘を受けてAIが見直した結果です。各見直しには、改訂の意図（何を狙ってどう変えたか）もあわせて残ります。差分があった見直しは自動で設定に適用されています。適用済みの改訂は、変更前の設定へ取り消せます。",
     empty:
-      "まだレビューはありません。レビューモードでキャラの発言を選んで指摘を送ると、ここに記録されます。",
+      "まだレビューはありません。レビューモードでキャラの発言を選んで指摘を送るか、「設定を編集する」画面から設定全体へのレビューを送ると、ここに記録されます。",
     revertFailed: "取り消しに失敗しました",
     articleAria: (date: string) => `レビュー ${date}`,
     revertedBadge: "取り消し済み",
     groupMessage: "グループでの発言",
     chatMessage: "1対1での発言",
+    settingsMessage: "設定全体へのレビュー",
     targetHeading: "対象の発言",
+    settingsTargetBody: "（特定の発言ではなく、設定全体へのレビューです）",
     feedbackHeading: "指摘",
+    intentHeading: "改訂の意図",
     failedNoteSuffix: "（設定は変更されていません）",
     failDetailLabel: (detail: string) => `詳細: ${detail}`,
     noChangeNote: "見直しの結果、設定の変更はありませんでした。",
     diffHeading: (n: number) => `設定の差分（${n}件）`,
     diffBefore: "変更前: ",
     diffAfter: "変更後: ",
-    fullJsonSummary: "再出力された設定JSON全文",
+    diffChangedPart: "変わった部分",
+    diffFullSummary: "変更前・変更後の全文",
+    beforeJsonSummary: "変更前の設定JSON全文",
+    fullJsonSummary: "再出力された設定JSON全文（変更後）",
     copyJson: "JSONをコピー",
     copied: "コピーしました",
     revertConfirm:
@@ -370,9 +393,15 @@ export const TEXTS = {
     tabListAria: "チャットの種類",
     tabPersonal: "個人",
     tabGroup: "グループ",
-    charactersSectionAria: "キャラクター",
-    charactersHeading: "キャラクター",
+    charactersSectionAria: "個人チャット",
+    charactersHeading: "個人チャット",
     addCharacter: "キャラを追加",
+    other: "その他",
+    otherMenuAria: "その他のメニュー",
+    otherMenuTitle: "その他",
+    exportCharacters: "キャラ情報を出力",
+    exportCharactersDesc: "キャラクターを選んで、設定JSON（画像つきも可）をファイルに書き出します",
+    categoryManageDesc: "カテゴリの追加・名前変更・削除と、親子関係の設定をします",
     sortLabel: "並び替え",
     sortAdded: "追加順",
     sortGojuon: "五十音順",
@@ -381,7 +410,6 @@ export const TEXTS = {
     openChatAria: (name: string, unread: number) =>
       `${name}とのチャットを開く${unread > 0 ? `（未読の返信${unread}件）` : ""}`,
     settingsAria: (name: string) => `${name}の設定`,
-    deleteAria: (name: string) => `${name}を削除`,
     noCharacters:
       "まだキャラクターがいません。アバター総合管理のプロファイルを取り込むか、書き出しJSONを貼って追加できます。",
     bulkImport: "アバター管理から一括取り込み",
@@ -529,11 +557,17 @@ export const TEXTS = {
     } as Record<string, string>,
     bodyLoadFailed: "本文の読み込みに失敗しました。",
     bodyEmpty: "（本文なし）",
+    requestHeading: "リクエスト（AIへ送った内容）",
+    responseHeading: "レスポンス（AIから貰った返信）",
+    filterGroupAria: "ログの種別で絞り込む",
+    filterAll: "すべて",
+    filterAria: (label: string) => `「${label}」のログだけ表示`,
     title: "履歴（全体ログ）",
     description:
-      "あなたの送信、生成に使ったプロンプトと生レスポンス、レビュー、キャラクター設定の変更、自動生成の記録です。新しい順に最大100件まで残ります（古い物から消えます）。見出しをタップすると本文を開きます。",
+      "あなたの送信、生成に使ったプロンプトと生レスポンス、レビュー、キャラクター設定の変更、自動生成の記録です。新しい順に最大100件まで残ります（古い物から消えます）。見出しをタップすると本文を開きます。上のボタンで種別ごとに絞り込めます。",
     empty:
       "まだログがありません。チャットで送信したり、設定を変更したりすると、ここに記録されます。",
+    emptyForKind: (label: string) => `「${label}」のログはまだありません。`,
     toggleAria: (title: string, open: boolean) => `ログ「${title}」の本文を${open ? "閉じる" : "開く"}`,
   },
 
@@ -552,11 +586,32 @@ export const TEXTS = {
     bulkImportWithImages: "アバター管理から一括取り込み（画像つき）",
   },
 
+  // ------------------------------------------------------------ キャラ情報の出力シート
+  characterExport: {
+    title: "キャラ情報を出力",
+    description:
+      "選んだキャラクターの設定JSONを書き出します。1人だけの場合は character.json ファイルとして、その他の場合は「キャラ名」フォルダに character.json を入れた zip として出力します。",
+    selectAll: "全て選択",
+    clearAll: "選択を解除",
+    includeImages: "画像も書き出す",
+    includeImagesDesc:
+      "オンにすると、各キャラクターのフォルダに character.json とキャラ画像ファイルが入ります。",
+    noImageNote: "（画像なし）",
+    selectRequired: "キャラクターを1人以上選んでください。",
+    failed: "出力に失敗しました",
+    preparing: "出力中…",
+    exportButton: (n: number) => (n > 0 ? `${n}人を出力する` : "出力する"),
+    selectAria: (name: string) => `${name}を出力対象にする`,
+  },
+
   // ------------------------------------------------------------ グループ作成シート
   createGroup: {
     title: "グループを作る",
     nameLabel: "グループ名（任意）",
     namePlaceholder: "空欄なら参加キャラ名から自動で付けます",
+    autoTitleLabel: "名前はおまかせ",
+    autoTitleDesc:
+      "オンにすると、返信が生成されるたびに、その掛け合いの内容を要約したタイトルがグループ名に代入されます（入力した名前は最初の名前として使われます）。",
     membersHeading: "参加キャラクター（1〜8人）",
     membersNote:
       "1人だけでも作れます。作成後に「なりきり」を設定すると、自分がそのキャラとして参加できます。",
@@ -672,7 +727,7 @@ export const TEXTS = {
     editMembers: "グループチャットの参加者を変える",
     editMembersDesc:
       "参加キャラクターを1〜8人の間で増やしたり減らしたりできます（会話履歴は残ります）",
-    guestMob: "ゲスト・モブ・ナレーションの設定",
+    guestMob: "生成内容の設定",
     guestMobDesc:
       "参加者以外のキャラクター（ゲスト）や名前のない人々（モブ）が会話に混じることがあるかと、背景説明・場面転換のナレーションを入れるかを選びます",
     autoTopic: "自動の設定",
@@ -682,9 +737,9 @@ export const TEXTS = {
     deleteGroupDesc: GROUP_DELETE_DESC,
   },
 
-  // ------------------------------------------------------------ ゲスト・モブ・ナレーション設定シート
+  // ------------------------------------------------------------ 生成内容の設定シート（ゲスト・モブ・ナレーション）
   groupGuestMob: {
-    title: "ゲスト・モブ・ナレーションの設定",
+    title: "生成内容の設定",
     intro: "オンにすると、会話の流れに応じて参加者以外のキャラや人々が混じることがあります。",
     guestLabel: "ゲスト",
     guestDesc:
@@ -731,6 +786,9 @@ export const TEXTS = {
     description: "一覧やグループ画面で表示される名前を変えます。参加者や会話履歴には影響しません。",
     label: "グループ名",
     nameRequired: "グループ名を入力してください。",
+    autoTitleLabel: "名前はおまかせ",
+    autoTitleDesc:
+      "オンにすると、返信が生成されるたびに、その掛け合いの内容を要約したタイトルがグループ名に代入され直します。",
   },
 
   // ------------------------------------------------------------ 参加者変更シート
