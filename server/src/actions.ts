@@ -17,9 +17,10 @@
 // 確定した経緯）を残し、次回の失敗で原因を追えるようにする。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
+import { categoryDescendantIds, pruneAncestorCategoryIds } from "./category-tree";
 
 const TEN_MIN_MS = 10 * 60 * 1000;
 // pending 放置の見張り（ローカル改善: 上流リポジトリには無い）: pending のまま
@@ -43,6 +44,43 @@ return ctx.db<typeof schema>();
 }
 type Db = ReturnType<typeof getDb>;
 
+type CharacterRow = typeof schema.characters.$inferSelect;
+type GroupRow = typeof schema.groups.$inferSelect;
+type ReviewRow = typeof schema.reviews.$inferSelect;
+
+// ------------------------------------------------------- 小物ヘルパー（共通化）
+
+/** 文字列でなければ空文字を返す型ガード（プロフィールJSONの読み取り用）。 */
+function strVal(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
+/** オブジェクトでなければ空オブジェクトを返す型ガード（配列もオブジェクトとして扱う）。 */
+function objVal(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+}
+
+/** レコードでなければ空オブジェクトを返す型ガード（配列はレコードとして扱わない）。 */
+function objRec(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+}
+
+/** キャラを取得し、無ければエラーを投げる（取得＋存在確認の定型）。 */
+async function getCharacterOrThrow(db: Db, id: number): Promise<CharacterRow> {
+  const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, id));
+  const c = rows[0];
+  if (!c) throw new Error("キャラクターが見つかりません");
+  return c;
+}
+
+/** グループを取得し、無ければエラーを投げる（取得＋存在確認の定型）。 */
+async function getGroupOrThrow(db: Db, id: number): Promise<GroupRow> {
+  const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, id));
+  const g = rows[0];
+  if (!g) throw new Error("グループが見つかりません");
+  return g;
+}
+
 // ---------------------------------------------------------------- helpers
 
 /** 開始から10分を超えた processing を failed(timeout) に確定し、戻し下書きを作る（設計書7章）。 */
@@ -58,21 +96,17 @@ async function sweepTimeouts(db: Db) {
       ),
     );
   for (const req of stale) {
-    const res = await db
-      .update(schema.replyRequests)
-      .set({
-        status: "failed",
-        failReason: "timeout",
-        failDetail: "生成開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
-        finishedAt: new Date(),
-      })
-      .where(and(eq(schema.replyRequests.id, req.id), eq(schema.replyRequests.status, "processing")))
-      .returning({ id: schema.replyRequests.id });
-    if (res.length) {
-      await materializeFailedDraft(db, req, "timeout");
-      await appendGenerationLog(db, req, "失敗", "理由: timeout（10分以内に生成が終わりませんでした）");
-      await closeOutAutoRequest(db, req, false, "timeout");
-    }
+    await failRequestRow(
+      db,
+      req,
+      "timeout",
+      "生成開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
+      {
+        fromStatuses: ["processing"],
+        logText: "理由: timeout（10分以内に生成が終わりませんでした）",
+        closeOut: true,
+      },
+    );
   }
 }
 
@@ -121,17 +155,13 @@ async function sweepStalePending(ctx: Ctx, db: Db) {
       }
     } else {
       const ageMin = Math.max(1, Math.round((now - req.createdAt.getTime()) / 60000));
-      const res = await db
-        .update(schema.replyRequests)
-        .set({
-          status: "failed",
-          failReason: "pending_timeout",
-          failDetail: `返信リクエストが pending（待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${req.kickCount}回試みても生成が始まらなかったため、失敗として確定しました。`,
-          finishedAt: new Date(now),
-        })
-        .where(and(eq(schema.replyRequests.id, req.id), eq(schema.replyRequests.status, "pending")))
-        .returning({ id: schema.replyRequests.id });
-      if (res.length) await materializeFailedDraft(db, req, "pending_timeout");
+      await failRequestRow(
+        db,
+        req,
+        "pending_timeout",
+        `返信リクエストが pending（待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${req.kickCount}回試みても生成が始まらなかったため、失敗として確定しました。`,
+        { fromStatuses: ["pending"] },
+      );
     }
   }
 
@@ -159,15 +189,13 @@ async function sweepStalePending(ctx: Ctx, db: Db) {
       }
     } else {
       const ageMin = Math.max(1, Math.round((now - rev.createdAt.getTime()) / 60000));
-      await db
-        .update(schema.reviews)
-        .set({
-          status: "failed",
-          failReason: "pending_timeout",
-          failDetail: `レビューが pending（処理待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${rev.kickCount}回試みても見直しが始まらなかったため、失敗として確定しました。`,
-          finishedAt: new Date(now),
-        })
-        .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "pending")));
+      await failReviewRow(
+        db,
+        rev,
+        "pending_timeout",
+        `レビューが pending（処理待ち）のまま${ageMin}分間開始されませんでした。仲介の叩き直しを${rev.kickCount}回試みても見直しが始まらなかったため、失敗として確定しました。`,
+        { fromStatuses: ["pending"] },
+      );
     }
   }
 
@@ -182,11 +210,129 @@ const rows = await db.select().from(schema.meta).where(eq(schema.meta.key, key))
 return rows[0]?.value?? "";
 }
 
+/** meta の複数キーを1クエリでまとめて取得する（キーが無いものは Map に含まれない）。 */
+async function getMetaMany(db: Db, keys: string[]): Promise<Map<string, string>> {
+  if (!keys.length) return new Map();
+  const rows = await db.select().from(schema.meta).where(inArray(schema.meta.key, keys));
+  return new Map(rows.map((r) => [r.key, r.value]));
+}
+
 async function setMeta(db: Db, key: string, value: string) {
 await db
 .insert(schema.meta)
 .values({ key, value})
 .onConflictDoUpdate({ target: schema.meta.key, set: { value}});
+}
+
+// ------------------------------------------------------- 失敗確定の共通処理
+//
+// 「対象行を failed に更新（状態条件つき）→失敗下書きの実体化→生成ログへ
+// 失敗を追記→自動リクエストの後始末」という手順骨格は、タイムアウトの
+// 見張り・仲介からの失敗報告・生成結果の検証失敗で共通のため、差分
+// （理由・詳細・ログ文面・後始末の有無）だけを引数で受ける形に寄せる。
+
+/**
+ * 返信リクエストを failed に確定させる共通処理。状態条件（fromStatuses）に
+ * 合わなければ何もせず false を返す。logText を渡した場合だけ生成ログへ
+ * 失敗を追記し、closeOut が true の時だけ自動リクエストの後始末を行う。
+ */
+async function failRequestRow(
+  db: Db,
+  req: RequestRow,
+  reason: string,
+  detail: string,
+  opts: { fromStatuses?: ("pending" | "processing")[]; logText?: string; closeOut?: boolean } = {},
+): Promise<boolean> {
+  const where = opts.fromStatuses?.length
+    ? and(eq(schema.replyRequests.id, req.id), inArray(schema.replyRequests.status, opts.fromStatuses))
+    : eq(schema.replyRequests.id, req.id);
+  const res = await db
+    .update(schema.replyRequests)
+    .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
+    .where(where)
+    .returning({ id: schema.replyRequests.id });
+  if (!res.length) return false;
+  await materializeFailedDraft(db, req, reason);
+  if (opts.logText !== undefined) await appendGenerationLog(db, req, "失敗", opts.logText);
+  if (opts.closeOut) await closeOutAutoRequest(db, req, false, reason);
+  return true;
+}
+
+/** レビューの失敗を全体ログへ記録する（見出し・本文の組み立ては失敗経路で共通）。 */
+async function addReviewFailLog(db: Db, rev: ReviewRow, resultLine: string) {
+  const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
+  await addAppLog(
+    db,
+    "review",
+    `レビュー結果: ${crows[0]?.displayName ?? "（削除済みのキャラクター）"}（失敗）`,
+    `指摘: ${rev.feedback}\n${resultLine}`,
+    "character",
+    rev.characterId,
+  );
+}
+
+/**
+ * レビューを failed に確定させる共通処理。状態条件に合わなければ何もせず
+ * false を返す。logResult を渡した場合だけ全体ログへ失敗を記録する。
+ */
+async function failReviewRow(
+  db: Db,
+  rev: ReviewRow,
+  reason: string,
+  detail: string,
+  opts: { fromStatuses?: ("pending" | "processing")[]; logResult?: string } = {},
+): Promise<boolean> {
+  const where = opts.fromStatuses?.length
+    ? and(eq(schema.reviews.id, rev.id), inArray(schema.reviews.status, opts.fromStatuses))
+    : eq(schema.reviews.id, rev.id);
+  const res = await db
+    .update(schema.reviews)
+    .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
+    .where(where)
+    .returning({ id: schema.reviews.id });
+  if (!res.length) return false;
+  if (opts.logResult !== undefined) await addReviewFailLog(db, rev, opts.logResult);
+  return true;
+}
+
+// ------------------------------------------------------- 返信を考えるAI（設計書 v3.5）
+//
+// 全体設定で、返信生成を担うAIを全チャット・グループ共通で切り替える。
+// - "claude"（既定）: 従来通り、分離した Claude Code プロセスが生成する。
+//   モデルは "sonnet"（既定）/ "opus" / "haiku" / "auto" から選べ、
+//   "auto" 以外は仲介が生成コマンドへ --model として渡す。"auto" は
+//   --model 自体を付けず、Claude Code 側の既定のモデル選択に任せる。
+// - "muse": 返信の見張り・仲介をしている Muse（エージェント）自身が、
+//   getWorkItems の材料（システム/ユーザープロンプト）に従って返信文を
+//   考え、completeRequest へそのまま代入する。エージェント側のモデルは
+//   実行環境で固定されていて、アプリからは選べない（そのため muse 選択時は
+//   モデル欄自体を出さない）。
+// 対象は返信生成だけ。レビューの見直しと「自動」の議題作成は、この設定に
+// かかわらず従来通り（レビューは分離 Claude Code、議題は仲介エージェント）。
+// 使ったAIは、生成の全体ログの見出しへ併記する（ensureGenerationPromptLog）。
+
+const REPLY_ENGINE_KEY = "pref_reply_engine";
+const CLAUDE_MODEL_KEY = "pref_claude_model";
+// 返信AIの値集合の正はこの2定数。検証（zod enum）もフォールバック判定もここを参照する。
+const REPLY_ENGINES = ["claude", "muse"] as const;
+const CLAUDE_MODELS = ["sonnet", "opus", "haiku", "auto"] as const;
+const CLAUDE_MODEL_LABELS: Record<string, string> = { sonnet: "Sonnet", opus: "Opus", haiku: "Haiku", auto: "自動" };
+
+type ReplyAiSettings = { engine: (typeof REPLY_ENGINES)[number]; model: (typeof CLAUDE_MODELS)[number] };
+
+async function readReplyAiSettings(db: Db): Promise<ReplyAiSettings> {
+  const m = await getMetaMany(db, [REPLY_ENGINE_KEY, CLAUDE_MODEL_KEY]);
+  const engineRaw = m.get(REPLY_ENGINE_KEY) ?? "";
+  const modelRaw = m.get(CLAUDE_MODEL_KEY) ?? "";
+  return {
+    engine: engineRaw === "muse" ? "muse" : "claude",
+    model: modelRaw === "opus" || modelRaw === "haiku" || modelRaw === "auto" ? modelRaw : "sonnet",
+  };
+}
+
+/** 全体ログの見出し等に使う、使用AIの表示名（例: "Claude / Sonnet"、"Muse"）。 */
+function replyAiLabel(s: ReplyAiSettings): string {
+  return s.engine === "muse" ? "Muse" : `Claude / ${CLAUDE_MODEL_LABELS[s.model] ?? "Sonnet"}`;
 }
 
 // ------------------------------------------------------- 全体ログ（設計書 v2.0 / D）
@@ -207,10 +353,16 @@ async function addAppLog(
     .insert(schema.appLogs)
     .values({ kind, title, body, relatedType: relatedType ?? null, relatedId: relatedId ?? null })
     .returning({ id: schema.appLogs.id });
-  const ids = await db.select({ id: schema.appLogs.id }).from(schema.appLogs).orderBy(asc(schema.appLogs.id));
-  if (ids.length > APP_LOG_LIMIT) {
-    const excess = ids.slice(0, ids.length - APP_LOG_LIMIT).map((r) => r.id);
-    if (excess.length) await db.delete(schema.appLogs).where(inArray(schema.appLogs.id, excess));
+  // 切り捨て: 新しい方から APP_LOG_LIMIT 件目の ID を境界に、それ以下を
+  // まとめて削除する（全 ID を読み出す必要はない）。
+  const boundary = await db
+    .select({ id: schema.appLogs.id })
+    .from(schema.appLogs)
+    .orderBy(desc(schema.appLogs.id))
+    .limit(1)
+    .offset(APP_LOG_LIMIT - 1);
+  if (boundary[0]) {
+    await db.delete(schema.appLogs).where(lt(schema.appLogs.id, boundary[0].id));
   }
   return ins[0]!.id;
 }
@@ -249,13 +401,23 @@ async function findGenerationLog(db: Db, requestId: number) {
  * 自動生成で「AIへ送信した内容」が履歴に残らない事象があった。組み立てた
  * サーバ自身が記録することで、手動・自動を問わず確実に残す。
  */
-async function ensureGenerationPromptLog(db: Db, req: RequestRow, systemPrompt: string, userPrompt: string) {
+async function ensureGenerationPromptLog(
+  db: Db,
+  req: RequestRow,
+  systemPrompt: string,
+  userPrompt: string,
+  known?: { ai: ReplyAiSettings; targetName: string },
+) {
   if (await findGenerationLog(db, req.id)) return;
-  const name = await requestTargetName(db, req);
+  const name = known?.targetName ?? (await requestTargetName(db, req));
+  // 使ったAIの記録（設計書 v3.5）: 生成時点の全体設定（返信を考えるAI）を
+  // 見出しへ併記し、履歴の一覧でそのまま見える形にする。呼び出し側が
+  // 組み立て時点の設定を持っている場合はそれを使う（再読しない）。
+  const ai = known?.ai ?? (await readReplyAiSettings(db));
   await addAppLog(
     db,
     "generation",
-    `生成: ${name}${req.origin === "auto" ? "（自動生成）" : ""}`,
+    `生成: ${name}${req.origin === "auto" ? "（自動生成）" : ""}【${replyAiLabel(ai)}】`,
     `--- システムプロンプト ---\n${systemPrompt}\n\n--- ユーザープロンプト ---\n${userPrompt}`,
     "request",
     req.id,
@@ -367,7 +529,8 @@ async function appendGenerationLog(db: Db, req: RequestRow, sectionTitle: string
     return;
   }
   const name = await requestTargetName(db, req);
-  await addAppLog(db, "generation", `生成: ${name}`, `--- ${sectionTitle} ---\n${text}`, "request", req.id);
+  const ai = await readReplyAiSettings(db);
+  await addAppLog(db, "generation", `生成: ${name}【${replyAiLabel(ai)}】`, `--- ${sectionTitle} ---\n${text}`, "request", req.id);
 }
 
 type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -428,22 +591,34 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-function parseJsonIntArray(text: string): number[] {
+/** JSON配列文字列をパースし、述語に合う要素だけを返す（parse 系の共通骨格）。 */
+function parseJsonArray<T>(text: string, pred: (x: unknown) => x is T): T[] {
   try {
     const v = JSON.parse(text) as unknown;
-    return Array.isArray(v) ? v.filter((x): x is number => typeof x === "number" && Number.isInteger(x)) : [];
+    return Array.isArray(v) ? v.filter(pred) : [];
   } catch {
     return [];
   }
 }
 
+function parseJsonIntArray(text: string): number[] {
+  return parseJsonArray(text, (x): x is number => typeof x === "number" && Number.isInteger(x));
+}
+
 function parseJsonStringArray(text: string): string[] {
-  try {
-    const v = JSON.parse(text) as unknown;
-    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-  } catch {
-    return [];
-  }
+  return parseJsonArray(text, (x): x is string => typeof x === "string");
+}
+
+/** ミリ秒を JST の暦成分（年・月・日・時・分）に分解する。JST は UTC+9 固定。 */
+function jstParts(ms: number): { year: number; month: number; day: number; hours: number; minutes: number } {
+  const d = new Date(ms + JST_OFFSET_MS);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hours: d.getUTCHours(),
+    minutes: d.getUTCMinutes(),
+  };
 }
 
 /**
@@ -467,7 +642,8 @@ function latestUnprocessedSlot(s: ScheduleRow, nowMs: number): { key: string; at
       const [h = 0, m = 0] = t.split(":").map(Number);
       const atMs = dayStart + (h * 60 + m) * 60_000 - JST_OFFSET_MS;
       if (atMs > nowMs) continue;
-      const key = `${day.getUTCFullYear()}-${pad2(day.getUTCMonth() + 1)}-${pad2(day.getUTCDate())} ${t}`;
+      const kp = jstParts(atMs);
+      const key = `${kp.year}-${pad2(kp.month)}-${pad2(kp.day)} ${t}`;
       if (s.lastFiredSlot && key <= s.lastFiredSlot) continue;
       if (!best || atMs > best.atMs) best = { key, atMs };
     }
@@ -550,7 +726,7 @@ async function createRandomGroup(
     allowGuests: number;
     allowMobs: number;
     allowNarration: number;
-    backgroundText: string;
+    flavors: string[];
     name: string | null;
   },
 ): Promise<{ groupId: number; name: string; picked: CharacterRow[] } | null> {
@@ -574,7 +750,7 @@ async function createRandomGroup(
       allowGuests: opts.allowGuests,
       allowMobs: opts.allowMobs,
       allowNarration: opts.allowNarration,
-      backgroundText: opts.backgroundText,
+      flavors: JSON.stringify(opts.flavors),
     })
     .returning({ id: schema.groups.id });
   const gid = ins[0]!.id;
@@ -615,8 +791,8 @@ async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: n
     );
     return null;
   }
-  const jst = new Date(nowMs + JST_OFFSET_MS);
-  const stamp = `${jst.getUTCMonth() + 1}/${jst.getUTCDate()} ${pad2(jst.getUTCHours())}:${pad2(jst.getUTCMinutes())}`;
+  const jp = jstParts(nowMs);
+  const stamp = `${jp.month}/${jp.day} ${pad2(jp.hours)}:${pad2(jp.minutes)}`;
   // 作成そのものは「今すぐランダム作成」と共通の経路（createRandomGroup）に寄せる。
   // 生成キック（返信リクエストの作成）はスケジュール側だけの処理としてここに残す。
   const created = await createRandomGroup(db, {
@@ -626,7 +802,7 @@ async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: n
     allowGuests: s.allowGuests,
     allowMobs: s.allowMobs,
     allowNarration: s.allowNarration,
-    backgroundText: s.backgroundText,
+    flavors: parseFlavors(s.flavors),
     name: `${s.name} ${stamp}`,
   });
   if (!created) return null;
@@ -691,43 +867,61 @@ async function evaluateSchedules(db: Db): Promise<string[]> {
 
 /** 最後に done になったリクエストの upto_seq（未返信判定の基準）。 */
 async function lastDoneUpto(db: Db, kind: "chat" | "group", targetId: number): Promise<number> {
-const rows = await db
-.select()
-.from(schema.replyRequests)
-.where(
-and(
-eq(schema.replyRequests.targetKind, kind),
-eq(schema.replyRequests.targetId, targetId),
-eq(schema.replyRequests.status, "done"),
-),
-)
-.orderBy(asc(schema.replyRequests.uptoSeq));
-return rows.length? rows[rows.length - 1]!.uptoSeq: 0;
+  const rows = await db
+    .select({ uptoSeq: schema.replyRequests.uptoSeq })
+    .from(schema.replyRequests)
+    .where(
+      and(
+        eq(schema.replyRequests.targetKind, kind),
+        eq(schema.replyRequests.targetId, targetId),
+        eq(schema.replyRequests.status, "done"),
+      ),
+    )
+    .orderBy(desc(schema.replyRequests.uptoSeq))
+    .limit(1);
+  return rows[0]?.uptoSeq ?? 0;
 }
 
 /** 有効な（pending / processing）リクエスト。同一対象に最大1件。 */
 async function activeRequest(db: Db, kind: "chat" | "group", targetId: number) {
-const rows = await db
-.select()
-.from(schema.replyRequests)
-.where(
-and(
-eq(schema.replyRequests.targetKind, kind),
-eq(schema.replyRequests.targetId, targetId),
-inArray(schema.replyRequests.status, ["pending", "processing"]),
-),
-)
-.orderBy(asc(schema.replyRequests.id));
-return rows[rows.length - 1]?? null;
+  const rows = await db
+    .select()
+    .from(schema.replyRequests)
+    .where(
+      and(
+        eq(schema.replyRequests.targetKind, kind),
+        eq(schema.replyRequests.targetId, targetId),
+        inArray(schema.replyRequests.status, ["pending", "processing"]),
+      ),
+    )
+    .orderBy(desc(schema.replyRequests.id))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 async function latestRequest(db: Db, kind: "chat" | "group", targetId: number) {
-const rows = await db
-.select()
-.from(schema.replyRequests)
-.where(and(eq(schema.replyRequests.targetKind, kind), eq(schema.replyRequests.targetId, targetId)))
-.orderBy(asc(schema.replyRequests.id));
-return rows[rows.length - 1]?? null;
+  const rows = await db
+    .select()
+    .from(schema.replyRequests)
+    .where(and(eq(schema.replyRequests.targetKind, kind), eq(schema.replyRequests.targetId, targetId)))
+    .orderBy(desc(schema.replyRequests.id))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * 対象のリクエスト状態解決（状態取得・一覧で共通）: 有効なリクエストを取り、
+ * 無い場合だけ最新リクエストも取る（requestInfo は有効なリクエストがある時
+ * 最新側を見ないため、必要な時だけ読む）。
+ */
+async function resolveRequestState(
+  db: Db,
+  kind: "chat" | "group",
+  targetId: number,
+): Promise<{ active: RequestRow | null; latest: RequestRow | null }> {
+  const active = await activeRequest(db, kind, targetId);
+  const latest = active ? null : await latestRequest(db, kind, targetId);
+  return { active, latest };
 }
 
 type RequestRow = typeof schema.replyRequests.$inferSelect;
@@ -857,6 +1051,41 @@ async function ackFailure(db: Db, kind: "chat" | "group", targetId: number, requ
   if (requestId > cur) await setMeta(db, `fail_ack:${kind}:${targetId}`, String(requestId));
 }
 
+/**
+ * 状態取得（1対1／グループ共通の後半処理）: リクエスト情報と戻し下書きを
+ * 組み立て、失敗があれば今回の応答で返した後で表示済みに進める。次回の
+ * 状態取得からは失敗バナーも下書きの失敗理由も返らない（下書きの本文＝
+ * 入力欄へ戻す文章は残す）。
+ */
+async function resolveInfoAndDraft(
+  db: Db,
+  kind: "chat" | "group",
+  targetId: number,
+  active: RequestRow | null,
+  latest: RequestRow | null,
+  unrepliedCount: number,
+) {
+  const acked = await failAckedId(db, kind, targetId);
+  const info = requestInfo(active, latest, unrepliedCount, acked);
+  const draftRow = await getDraft(db, kind, targetId);
+  const failedUnseen = latest?.status === "failed" && latest.id > acked;
+  const draft = draftRow
+    ? { body: draftRow.body, fail_reason: failedUnseen ? draftRow.fail_reason : "" }
+    : null;
+  if (latest?.status === "failed") await ackFailure(db, kind, targetId, latest.id);
+  return { info, draft };
+}
+
+/** 既読化の共通処理: 最新 seq が既読位置より先なら、対象テーブルへ書き込む。 */
+async function applyMarkRead(db: Db, kind: "chat" | "group", targetId: number, lastReadSeq: number, maxSeq: number) {
+  if (maxSeq <= lastReadSeq) return;
+  if (kind === "chat") {
+    await db.update(schema.characters).set({ lastReadSeq: maxSeq }).where(eq(schema.characters.id, targetId));
+  } else {
+    await db.update(schema.groups).set({ lastReadSeq: maxSeq }).where(eq(schema.groups.id, targetId));
+  }
+}
+
 function requestInfo(
 active: RequestRow | null,
 latest: RequestRow | null,
@@ -924,23 +1153,27 @@ await db
 // 実績のある正規の無効化手段）、加えて専用設定フォルダの settings.json
 // にも同じ env を書いて二重に止める。生成そのものには影響しない。
 const MEDIATOR_MESSAGE = [
-"あなたは「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）の返信・レビュー仲介です。返信文や見直し結果を自分で書いてはいけません。生成は必ず下記の分離Claude Codeコマンドの出力を使い、原文のまま受け渡してください（要約・改変・補足・人格の混入は禁止）。",
+"あなたは「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）の返信・レビュー仲介です。返信の作り方は item ごとの engine で決まります。engine が \"claude\" の返信と、レビューの見直しは、自分で書いてはいけません。必ず下記の分離Claude Codeコマンドの出力を使い、原文のまま受け渡してください（要約・改変・補足・人格の混入は禁止）。engine が \"muse\" の返信だけは例外で、あなた自身が材料に従って返信文を考え、そのまま受け渡します。",
 "",
 "手順:",
 "1. artifact.invoke_action で slug=kiyaratiyatuto の getWorkItems と getReviewWorkItems を両方呼ぶ。両方の items が空の場合、起動直後は対象の反映が間に合っていないことがあるため、直ちに終了せず、シェルで約20秒待ってから両方を呼び直す（最大3回まで繰り返す）。3回とも両方とも空なら、処理件数0件と短く報告してそのまま終了する。getWorkItems が空でも getReviewWorkItems に items があれば終了せず、手順2を飛ばして手順3のレビュー処理へ進むこと（返信待ちが無いことは、レビュー処理をしない理由にならない）。",
 "2. 各 item について順番に処理する:",
 " a. beginRequest({request_id: item.request_id}) を呼ぶ。ok=false ならその item は飛ばす。（プロンプトの全体ログへの記録は getWorkItems の時点でサーバ側が済ませているため、beginRequest へプロンプトを渡す必要はない）",
-" b. item.system_prompt を ~/workspace/your_files/chara-chat/runtime/<request_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
-" c. 専用設定フォルダ ~/workspace/your_files/chara-chat/claude-config が無ければ作成する。フォルダの有無にかかわらず、毎回 ~/.claude/.credentials.json をそこへ上書きコピーして最新のログイン状態に合わせる（コピー側が古いままだと、本体へ再ログインしても認証切れのまま失敗し続けるため）。さらに、テレメトリ無効化のため、毎回そのフォルダへ settings.json を次の内容で上書きする: {\"env\": {\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\", \"DISABLE_TELEMETRY\": \"1\"}}（この設定フォルダは生成専用なので、このファイルは生成用プロセスにしか効かない）。作業フォルダ ~/workspace/your_files/chara-chat/workdir が無ければ空で作成する。",
-" d. workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
-" e. 終了コード0で出力が空でなければ completeRequest({request_id, output: 標準出力}) を呼ぶ。",
-" f. 失敗・空出力なら failRequest({request_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login / \"not logged in\" 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。failRequest で失敗が確定すると、対象の利用者発言はサーバ側で自動的に入力欄への戻し下書きになる（仲介側の追加処理は不要）。",
-"3. 返信 item を全て処理したら、レビューの見直しも処理する（手順1で数えた分に加え、返信処理の間に新しく登録されたレビューも拾えるよう、ここで改めて取得し直す）:",
+" b. item.engine が \"muse\" の場合（あなた自身が返信を考える。分離Claude Codeコマンドは実行しない）:",
+"  - item.system_prompt と item.user_prompt が生成材料の全てである。system_prompt の「キャラクター設定」と「返答のルール／掛け合いのルール」に厳密に従い、user_prompt の対象発言への返信文を自分で書く。出力形式も system_prompt の指定通りとする（1対1は返答本文のみ。グループは「表示名：セリフ」形式の行のみで、ナレーションが許可されているグループではそのルールにも従う）。前置き・説明・引用・マークダウン・コードフェンスは付けない。あなた自身の人格・口調や、この仲介作業に関する事情を返信文へ混ぜてはいけない。",
+"  - 書いた返信文を、そのまま completeRequest({request_id: item.request_id, output: 返信文}) へ渡す（要約・整形・補足はしない）。材料が壊れていて返信文を書けない場合だけ、failRequest({request_id: item.request_id, reason: \"generation_error\", detail: 書けなかった理由}) を呼ぶ。",
+" c. item.engine が \"claude\" の場合は、従来通り分離Claude Codeで生成する:",
+"  - item.system_prompt を ~/workspace/your_files/chara-chat/runtime/<request_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
+"  - 専用設定フォルダ ~/workspace/your_files/chara-chat/claude-config が無ければ作成する。フォルダの有無にかかわらず、毎回 ~/.claude/.credentials.json をそこへ上書きコピーして最新のログイン状態に合わせる（コピー側が古いままだと、本体へ再ログインしても認証切れのまま失敗し続けるため）。さらに、テレメトリ無効化のため、毎回そのフォルダへ settings.json を次の内容で上書きする: {\"env\": {\"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\", \"DISABLE_TELEMETRY\": \"1\"}}（この設定フォルダは生成専用なので、このファイルは生成用プロセスにしか効かない）。作業フォルダ ~/workspace/your_files/chara-chat/workdir が無ければ空で作成する。",
+"  - workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --model <item.model> --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text（--model には item.model の値（sonnet / opus / haiku）をそのまま入れる。ただし item.model が \"auto\" の場合は --model オプション自体を付けないこと（モデルを指定せず、Claude Code 側の既定のモデル選択に任せる））",
+"  - 終了コード0で出力が空でなければ completeRequest({request_id, output: 標準出力}) を呼ぶ。",
+"  - 失敗・空出力なら failRequest({request_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login / \"not logged in\" 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。failRequest で失敗が確定すると、対象の利用者発言はサーバ側で自動的に入力欄への戻し下書きになる（仲介側の追加処理は不要）。",
+"3. 返信 item を全て処理したら、レビューの見直しも処理する（レビューは全体設定の engine にかかわらず、常に従来通り分離Claude Codeで処理する。--model は付けない。手順1で数えた分に加え、返信処理の間に新しく登録されたレビューも拾えるよう、ここで改めて取得し直す）:",
 " a. artifact.invoke_action で slug=kiyaratiyatuto の getReviewWorkItems を呼ぶ。items が空なら手順4へ。",
 " b. 各 review item について順番に（1件ずつ直列に）処理する:",
 "  - beginReview({review_id: item.review_id}) を呼ぶ。ok=false ならその item は飛ばす。",
 "  - item.system_prompt を ~/workspace/your_files/chara-chat/runtime/review-<review_id>/system.txt に、item.user_prompt を user.txt に書き出す（フォルダは作成する）。",
-"  - 手順2cと同じ専用設定フォルダと作業フォルダを使い（settings.json の上書きも手順2cと同様に済ませてから）、workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
+"  - 手順2の claude 生成と同じ専用設定フォルダと作業フォルダを使い（settings.json の上書きも同様に済ませてから）、workdir の中で次を実行し、標準出力を取得する: cat <user.txtのパス> | CLAUDE_CONFIG_DIR=$HOME/workspace/your_files/chara-chat/claude-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 timeout 300 $HOME/.local/bin/claude -p --system-prompt-file <system.txtのパス> --tools \"\" --no-session-persistence --output-format text",
 "  - 終了コード0で出力が空でなければ completeReview({review_id, output: 標準出力}) を呼ぶ。出力は修正後JSONの原文のまま渡すこと（要約・整形・抜粋は禁止）。",
 "  - 失敗・空出力なら failReview({review_id, reason, detail}) を呼ぶ。reason は、出力やエラーに認証切れ・ログイン切れを示す語（authenticate / OAuth / login 等）があれば \"auth_error\"、利用上限・rate・limit を示す語があれば \"rate_limited\"、timeout で終わっていれば \"timeout\"、それ以外は \"generation_error\"。detail には、コマンドの終了コードと、標準エラー・標準出力の末尾（最後の500字程度）を原文のまま入れること（次に失敗した時に原因を追えるよう、要約せずそのまま渡す。成功時は不要）。",
 "4. 全て処理したら、処理件数を短く報告して終了する。通知（返信到着・ログイン切れ）の受け渡しは別の配送経路が担うため、getPendingNotifications / ackNotifications は呼ばないこと。",
@@ -1008,10 +1241,11 @@ type ImportStatusData = {
 };
 
 async function readImportStatus(db: Db): Promise<ImportStatusData> {
-  const rawState = await getMeta(db, "import_state");
-  const startedRaw = Number((await getMeta(db, "import_started_at")) || "0");
-  const finishedRaw = Number((await getMeta(db, "import_finished_at")) || "0");
-  const note = await getMeta(db, "import_note");
+  const m = await getMetaMany(db, ["import_state", "import_started_at", "import_finished_at", "import_note"]);
+  const rawState = m.get("import_state") ?? "";
+  const startedRaw = Number(m.get("import_started_at") || "0");
+  const finishedRaw = Number(m.get("import_finished_at") || "0");
+  const note = m.get("import_note") ?? "";
   const state: ImportStatusData["state"] =
     rawState === "running" || rawState === "done" || rawState === "failed" ? rawState : "idle";
   if (state === "running" && startedRaw > 0 && Date.now() - startedRaw > IMPORT_TIMEOUT_MS) {
@@ -1143,13 +1377,9 @@ function todayJstLabel(): string {
   return `${get("year")}年${get("month")}月${get("day")}日（${get("weekday")}）`;
 }
 
-async function topicPendingSince(db: Db, kind: "chat" | "group", targetId: number): Promise<number> {
-  const v = Number((await getMeta(db, `topic_pending:${kind}:${targetId}`)) || "0");
-  return Number.isFinite(v) ? v : 0;
-}
-
 async function isTopicPending(db: Db, kind: "chat" | "group", targetId: number): Promise<boolean> {
-  const t = await topicPendingSince(db, kind, targetId);
+  const v = Number((await getMeta(db, `topic_pending:${kind}:${targetId}`)) || "0");
+  const t = Number.isFinite(v) ? v : 0;
   return t > 0 && Date.now() - t < TOPIC_PENDING_MS;
 }
 
@@ -1231,8 +1461,8 @@ function profileToParts(profile: Record<string, unknown>): ProfileParts {
 if (!profile || profile["format"]!== "avatar-profile") {
 throw new Error("avatar-profile 形式ではないJSONです（アバター総合管理アプリの書き出しを使ってください）");
 }
-const str = (v: unknown): string => (typeof v === "string"? v: "");
-const obj = (v: unknown): Record<string, unknown> => (v && typeof v === "object"? (v as Record<string, unknown>): {});
+const str = strVal;
+const obj = objVal;
 const parts: (string | null)[] = [];
 parts.push(section("名前", profile["name"]));
 parts.push(section("概要", profile["summary"]));
@@ -1432,9 +1662,10 @@ const NARRATION_MARKER = "【ナレーション】";
 /**
  * グループ出力の分割（設計書8章）: 名簿完全一致→新規発言 / 名前形だが名簿外→raw / それ以外→直前の続き。
  * ゲスト・モブ許可時（v1.24、opts.extraSpeakers）は名簿外の名前形も発言として受理する:
- * 登録済みキャラ（名前・表示名のどちらかで一致）に当たればそのキャラの発言として
- * characterId を付け、どちらにも当たらなければ characterId=null・speakerName=見出しの
- * まま（未登録ゲスト／モブ）として保存する。異常（raw）にはしない。
+ * 常に characterId=null・speakerName=見出しのまま（ゲスト／モブ）として保存する。
+ * 異常（raw）にはしない。登録済みキャラとの名前照合はしない（2026-11-26 再調整で
+ * 廃止）: ゲスト名が登録キャラと同名でも、そのキャラとは結び付けず、画面では
+ * 頭文字アバターで表示される。
  * ナレーション許可時（v3.1、opts.allowNarration）は「【ナレーション】」で始まる行を
  * 発言者を持たない narration として分ける。許可されていないグループではマーカー行も
  * 通常の行として扱う（従来通り）。
@@ -1446,17 +1677,10 @@ const NARRATION_MARKER = "【ナレーション】";
 function splitGroupOutput(
 output: string,
 members: { characterId: number; displayName: string}[],
-opts?: { extraSpeakers?: boolean; guestCandidates?: { characterId: number; displayName: string; name: string}[]; allowNarration?: boolean},
+opts?: { extraSpeakers?: boolean; allowNarration?: boolean},
 ): { lines: SplitLine[]; abnormal: boolean} {
 const byNorm = new Map<string, { characterId: number; displayName: string}>();
 for (const m of members) byNorm.set(normalizeForNameMatch(m.displayName), m);
-const guestByNorm = new Map<string, { characterId: number; displayName: string}>();
-for (const cand of opts?.guestCandidates ?? []) {
-for (const key of [cand.displayName, cand.name]) {
-const norm = normalizeForNameMatch(key);
-if (norm && !guestByNorm.has(norm)) guestByNorm.set(norm, { characterId: cand.characterId, displayName: cand.displayName });
-}
-}
 const lines: SplitLine[] = [];
 let abnormal = false;
 // 直前の行が空行だったか（＝次の非空行は新しい段落の始まりか）。
@@ -1491,12 +1715,7 @@ lines.push({ kind: "character", characterId: hit.characterId, speakerName: hit.d
 handled = true;
 } else if (head.trim().length <= 20 &&!/\s/.test(head.trim())) {
 if (opts?.extraSpeakers) {
-const guest = guestByNorm.get(normalizeForNameMatch(head));
-if (guest) {
-lines.push({ kind: "character", characterId: guest.characterId, speakerName: guest.displayName, body: rest});
-} else {
 lines.push({ kind: "character", characterId: null, speakerName: head.trim(), body: rest});
-}
 } else {
 lines.push({ kind: "raw", characterId: null, speakerName: "", body: line});
 abnormal = true;
@@ -1549,28 +1768,16 @@ async function sweepReviewTimeouts(db: Db) {
       ),
     );
   for (const r of stale) {
-    const res = await db
-      .update(schema.reviews)
-      .set({
-        status: "failed",
-        failReason: "timeout",
-        failDetail: "見直し開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
-        finishedAt: new Date(),
-      })
-      .where(and(eq(schema.reviews.id, r.id), eq(schema.reviews.status, "processing")))
-      .returning({ id: schema.reviews.id });
-    if (res.length) {
-      const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, r.characterId));
-      const cname = crows[0]?.displayName ?? "（削除済みのキャラクター）";
-      await addAppLog(
-        db,
-        "review",
-        `レビュー結果: ${cname}（失敗）`,
-        `指摘: ${r.feedback}\n結果: 見直しがタイムアウトしました（10分以内に終わりませんでした）。設定は変更されていません。`,
-        "character",
-        r.characterId,
-      );
-    }
+    await failReviewRow(
+      db,
+      r,
+      "timeout",
+      "見直し開始（processing）から10分を超えても完了しなかったため、タイムアウトとして失敗に確定しました。",
+      {
+        fromStatuses: ["processing"],
+        logResult: "結果: 見直しがタイムアウトしました（10分以内に終わりませんでした）。設定は変更されていません。",
+      },
+    );
   }
 }
 
@@ -1583,9 +1790,14 @@ async function applyProfileToCharacter(
   existing: CharacterRow,
   profile: Record<string, unknown>,
   jsonStr: string,
+  opts?: { keepDisplayName?: boolean },
 ): Promise<string> {
   const parts = profileToParts(profile);
-  const displayName = await uniqueDisplayName(db, parts.name, existing.id);
+  // keepDisplayName: 表示名を名前に合わせて付け直さず、既存の表示名を保持する
+  // （アプリ内の「設定を編集する」は表示名を扱わない設計のため）。
+  const displayName = opts?.keepDisplayName
+    ? existing.displayName
+    : await uniqueDisplayName(db, parts.name, existing.id);
   await db
     .update(schema.characters)
     .set({
@@ -1626,13 +1838,6 @@ function collectDiff(path: string, before: unknown, after: unknown, out: DiffEnt
   }
 }
 
-/** 変更前後のプロファイルJSONを項目単位で比較し、差分（パス・変更前・変更後）を作る。 */
-function diffProfiles(before: unknown, after: unknown): DiffEntry[] {
-  const out: DiffEntry[] = [];
-  collectDiff("", before, after, out);
-  return out;
-}
-
 // ------------------------------------------------------- shared state builders
 
 const characterOut = z.object({
@@ -1646,9 +1851,9 @@ unreplied_count: z.number(),
 unread_count: z.number(),
 request_status: z.string(),
 // カテゴリ分類（v1.25）: そのキャラが属する全カテゴリのID。複数可。未分類は空配列。
+// 正は character_categories 結合テーブルのみ。旧カラム（characters.category_id）由来の
+// 互換項目 category_id は撤去済み（カラム自体は移行時点の値を保持するだけで読み書きしない）。
 category_ids: z.array(z.number()),
-// 互換用: 先頭カテゴリ（無ければ null）。新規コードは category_ids を使う。
-category_id: z.number().nullable(),
 // 「新着」区切り（設計書 v1.8 / 4.9章）: 現時点の未読の先頭キャラ発言の seq。
 // 会話を開く直前に一覧が計算した値をチャット画面へ渡し、区切り位置を固定する。
 // 未読が無ければ null。
@@ -1674,8 +1879,6 @@ origin: z.string(),
 });
 
 const draftOut = z.object({ body: z.string(), fail_reason: z.string() }).nullable();
-
-type CharacterRow = typeof schema.characters.$inferSelect;
 
 async function charImageUrl(ctx: Ctx, row: CharacterRow): Promise<string | null> {
 if (!row.imageBlobKey) return null;
@@ -1709,63 +1912,9 @@ async function allCategoryRows(db: Db): Promise<CategoryRow[]> {
   return await db.select().from(schema.categories).orderBy(asc(schema.categories.id));
 }
 
-/**
- * カテゴリ id の子孫ID集合（自分自身を含む）を返す（v1.26・階層化）。
- * 親子関係が壊れて循環していても無限ループしないよう訪問済みで打ち切る。
- */
-function categoryDescendantIds(rows: CategoryRow[], id: number): Set<number> {
-  const childrenByParent = new Map<number, number[]>();
-  for (const r of rows) {
-    if (r.parentId != null) {
-      const arr = childrenByParent.get(r.parentId) ?? [];
-      arr.push(r.id);
-      childrenByParent.set(r.parentId, arr);
-    }
-  }
-  const out = new Set<number>([id]);
-  const stack = [id];
-  while (stack.length) {
-    const cur = stack.pop()!;
-    for (const child of childrenByParent.get(cur) ?? []) {
-      if (!out.has(child)) {
-        out.add(child);
-        stack.push(child);
-      }
-    }
-  }
-  return out;
-}
-
-/**
- * カテゴリ id の祖先ID集合（親・祖父…。自分自身は含まない）を返す（v1.27・設計書 v1.7.1）。
- * 親子関係が壊れて循環していても訪問済みで打ち切る。
- */
-function categoryAncestorIds(rows: CategoryRow[], id: number): Set<number> {
-  const parentById = new Map(rows.map((r) => [r.id, r.parentId ?? null]));
-  const out = new Set<number>();
-  let cur = parentById.get(id) ?? null;
-  while (cur != null && !out.has(cur)) {
-    out.add(cur);
-    cur = parentById.get(cur) ?? null;
-  }
-  out.delete(id);
-  return out;
-}
-
-/**
- * 割り当て集合の祖先除外（v1.27・設計書 v1.7.1）: 集合内に自分の子孫が存在する
- * カテゴリ（祖先側）を落とし、より深い側（子）だけを残す。子カテゴリとその
- * 祖先カテゴリは同時に付けられない、という規則の実体。
- */
-function pruneAncestorCategoryIds(rows: CategoryRow[], ids: number[]): number[] {
-  const set = new Set(ids);
-  return ids.filter((id) => {
-    for (const other of set) {
-      if (other !== id && categoryAncestorIds(rows, other).has(id)) return false;
-    }
-    return true;
-  });
-}
+// カテゴリ木ロジック（子孫展開・祖先集合・祖先除外）は共用モジュール
+// ./category-tree が正（クライアントと同一実装を使う。冗長性レビュー B-6 で
+// 一本化）。CategoryRow は { id, parentId } の形がそのまま渡せる。
 
 /**
  * 全キャラの割り当てへ祖先除外ルールを適用し直す（v1.27・設計書 v1.7.1）。
@@ -1794,26 +1943,105 @@ async function replaceCharacterCategories(db: Db, characterId: number, categoryI
   }
 }
 
+// ------------------------------------------------------- 未返信・未読・最終活動の共通計算
+//
+// 1対1／グループの対ヘルパーは、差分が「どのテーブルの行を、どの発言者条件で
+// 拾うか」だけで、行を取り出した後の計算は同一。そのため計算は行配列に
+// 対する共通関数へ寄せ、各ヘルパーは行の取得と条件だけを持つ薄い形にする。
+// 一覧（listHome）では対象ごとに発言を1回だけ読み、未返信・未読・先頭未読・
+// 最終活動を同じ行配列から算出する（chatHomeStats / groupHomeStats）。
+
+/** seq 昇順の行から、境界（最後に done になった upto_seq）より後の件数と末尾 seq を出す。 */
+function unrepliedFromRows(rows: { seq: number }[], doneUpto: number): { count: number; lastUserSeq: number } {
+  const un = rows.filter((r) => r.seq > doneUpto);
+  return { count: un.length, lastUserSeq: un.length ? un[un.length - 1]!.seq : 0 };
+}
+
+/** 行から、既読位置より後の件数と先頭（最小 seq）を出す。 */
+function unreadFromRows(rows: { seq: number }[], lastReadSeq: number): { count: number; firstSeq: number | null } {
+  let count = 0;
+  let firstSeq: number | null = null;
+  for (const r of rows) {
+    if (r.seq > lastReadSeq) {
+      count++;
+      if (firstSeq === null || r.seq < firstSeq) firstSeq = r.seq;
+    }
+  }
+  return { count, firstSeq };
+}
+
+/** 行の最終活動時刻（ISO文字列）。行が無ければ fallback（無ければ null）。 */
+function lastActivityFromRows(rows: { createdAt: Date }[], fallback: Date | null): string | null {
+  let max: number | null = fallback?.getTime() ?? null;
+  for (const r of rows) {
+    const t = r.createdAt.getTime();
+    if (max === null || t > max) max = t;
+  }
+  return max === null ? null : new Date(max).toISOString();
+}
+
+type TargetHomeStats = {
+  unrepliedCount: number;
+  unreadCount: number;
+  firstUnreadSeq: number | null;
+  lastActivityAt: string | null;
+};
+
+/** 一覧用: 1対1の発言を1回だけ読み、未返信数・未読数・先頭未読・最終活動を同じ行集合から算出する。 */
+async function chatHomeStats(db: Db, c: CharacterRow): Promise<TargetHomeStats> {
+  const doneUpto = await lastDoneUpto(db, "chat", c.id);
+  const rows = await db
+    .select({ seq: schema.messages.seq, speaker: schema.messages.speaker, createdAt: schema.messages.createdAt })
+    .from(schema.messages)
+    .where(eq(schema.messages.characterId, c.id))
+    .orderBy(asc(schema.messages.seq));
+  const un = unrepliedFromRows(rows.filter((r) => r.speaker === "user"), doneUpto);
+  const unread = unreadFromRows(rows.filter((r) => r.speaker === "character"), c.lastReadSeq);
+  return {
+    unrepliedCount: un.count,
+    unreadCount: unread.count,
+    firstUnreadSeq: unread.firstSeq,
+    lastActivityAt: lastActivityFromRows(rows, null),
+  };
+}
+
+/** 一覧用: グループの発言を1回だけ読み、未返信数・未読数・先頭未読・最終活動を同じ行集合から算出する。 */
+async function groupHomeStats(db: Db, g: GroupRow): Promise<TargetHomeStats> {
+  const doneUpto = await lastDoneUpto(db, "group", g.id);
+  const rows = await db
+    .select({ seq: schema.groupMessages.seq, kind: schema.groupMessages.kind, createdAt: schema.groupMessages.createdAt })
+    .from(schema.groupMessages)
+    .where(eq(schema.groupMessages.groupId, g.id))
+    .orderBy(asc(schema.groupMessages.seq));
+  const un = unrepliedFromRows(rows.filter((r) => r.kind === "user"), doneUpto);
+  // ナレーション（v3.1）も通常発言と同じく未読に数える。
+  const unread = unreadFromRows(rows.filter((r) => r.kind === "character" || r.kind === "narration"), g.lastReadSeq);
+  return {
+    unrepliedCount: un.count,
+    unreadCount: unread.count,
+    firstUnreadSeq: unread.firstSeq,
+    lastActivityAt: lastActivityFromRows(rows, g.createdAt) ?? g.createdAt.toISOString(),
+  };
+}
+
 async function chatUnreplied(db: Db, characterId: number): Promise<{ count: number; lastUserSeq: number}> {
 const doneUpto = await lastDoneUpto(db, "chat", characterId);
 const rows = await db
-.select()
+.select({ seq: schema.messages.seq })
 .from(schema.messages)
 .where(and(eq(schema.messages.characterId, characterId), eq(schema.messages.speaker, "user")))
 .orderBy(asc(schema.messages.seq));
-const un = rows.filter((r) => r.seq > doneUpto);
-return { count: un.length, lastUserSeq: un.length? un[un.length - 1]!.seq: 0};
+return unrepliedFromRows(rows, doneUpto);
 }
 
 async function groupUnreplied(db: Db, groupId: number): Promise<{ count: number; lastUserSeq: number}> {
 const doneUpto = await lastDoneUpto(db, "group", groupId);
 const rows = await db
-.select()
+.select({ seq: schema.groupMessages.seq })
 .from(schema.groupMessages)
 .where(and(eq(schema.groupMessages.groupId, groupId), eq(schema.groupMessages.kind, "user")))
 .orderBy(asc(schema.groupMessages.seq));
-const un = rows.filter((r) => r.seq > doneUpto);
-return { count: un.length, lastUserSeq: un.length? un[un.length - 1]!.seq: 0};
+return unrepliedFromRows(rows, doneUpto);
 }
 
 // ------------------------------------------------------- 未読（設計書 v1.5 / 4.5章）
@@ -1823,75 +2051,37 @@ return { count: un.length, lastUserSeq: un.length? un[un.length - 1]!.seq: 0};
 // 既読化は会話画面の状態取得（getChatState / getGroupState）でのみ行う。
 // 仲介用の取得（getWorkItems 等）は既読化しない。
 
-async function chatUnreadCount(db: Db, characterId: number, lastReadSeq: number): Promise<number> {
-const rows = await db
-.select({ seq: schema.messages.seq })
-.from(schema.messages)
-.where(and(eq(schema.messages.characterId, characterId), eq(schema.messages.speaker, "character")));
-return rows.filter((r) => r.seq > lastReadSeq).length;
-}
-
-async function groupUnreadCount(db: Db, groupId: number, lastReadSeq: number): Promise<number> {
-// ナレーション（v3.1）も通常発言と同じく未読に数える。
-const rows = await db
-.select({ seq: schema.groupMessages.seq })
-.from(schema.groupMessages)
-.where(and(eq(schema.groupMessages.groupId, groupId), inArray(schema.groupMessages.kind, ["character", "narration"])));
-return rows.filter((r) => r.seq > lastReadSeq).length;
-}
-
-/** 未読の先頭キャラ発言の seq（「新着」区切りの位置）。未読が無ければ null。 */
-async function chatFirstUnreadSeq(db: Db, characterId: number, lastReadSeq: number): Promise<number | null> {
-const rows = await db
-.select({ seq: schema.messages.seq })
-.from(schema.messages)
-.where(and(eq(schema.messages.characterId, characterId), eq(schema.messages.speaker, "character")))
-.orderBy(asc(schema.messages.seq));
-const first = rows.find((r) => r.seq > lastReadSeq);
-return first ? first.seq : null;
-}
-
-async function groupFirstUnreadSeq(db: Db, groupId: number, lastReadSeq: number): Promise<number | null> {
-const rows = await db
-.select({ seq: schema.groupMessages.seq })
-.from(schema.groupMessages)
-.where(and(eq(schema.groupMessages.groupId, groupId), inArray(schema.groupMessages.kind, ["character", "narration"])))
-.orderBy(asc(schema.groupMessages.seq));
-const first = rows.find((r) => r.seq > lastReadSeq);
-return first ? first.seq : null;
-}
-
-/** そのキャラとの1対1で最後に発言があった時刻（ISO文字列）。会話が無ければ null。 */
-async function chatLastActivityAt(db: Db, characterId: number): Promise<string | null> {
-const rows = await db
-.select({ createdAt: schema.messages.createdAt })
-.from(schema.messages)
-.where(eq(schema.messages.characterId, characterId));
-if (rows.length === 0) return null;
-let max = 0;
-for (const r of rows) max = Math.max(max, r.createdAt.getTime());
-return new Date(max).toISOString();
-}
-
-/** グループの最終活動時刻（ISO文字列）。最終発言の時刻で、発言が無ければグループ作成時刻（設計書 v2.0 / A）。 */
-async function groupLastActivityAt(db: Db, groupId: number, createdAt: Date): Promise<string> {
-const rows = await db
-.select({ createdAt: schema.groupMessages.createdAt })
-.from(schema.groupMessages)
-.where(eq(schema.groupMessages.groupId, groupId));
-let max = createdAt.getTime();
-for (const r of rows) max = Math.max(max, r.createdAt.getTime());
-return new Date(max).toISOString();
-}
-
 async function groupMemberRows(db: Db, groupId: number) {
 const links = await db.select().from(schema.groupMembers).where(eq(schema.groupMembers.groupId, groupId)).orderBy(asc(schema.groupMembers.id));
-const out: { characterId: number; character: CharacterRow | null}[] = [];
-for (const link of links) {
-const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, link.characterId));
-out.push({ characterId: link.characterId, character: rows[0]?? null});
+if (!links.length) return [] as { characterId: number; character: CharacterRow | null }[];
+const chars = await db.select().from(schema.characters).where(inArray(schema.characters.id, links.map((l) => l.characterId)));
+const byId = new Map(chars.map((c) => [c.id, c]));
+return links.map((link) => ({ characterId: link.characterId, character: byId.get(link.characterId) ?? null }));
 }
-return out;
+
+/** ゲスト候補の母集団: 参加者を除く全キャラクター。 */
+async function guestCandidateRows(db: Db, memberIds: Set<number>): Promise<CharacterRow[]> {
+  const allChars = await db.select().from(schema.characters);
+  return allChars.filter((c) => !memberIds.has(c.id));
+}
+
+/** 生成材料へ送信するゲスト候補（2026-11-26、利用者指定で送信量を削減）:
+ * 参加者のいずれかと「完全に同じカテゴリに直接属する」非参加キャラだけを
+ * 返す。全員分の設定を送ると無駄が多いため、候補から外れたキャラの設定は
+ * 生成材料に含めない。同カテゴリの判定は直接の所属だけを見る: 祖先
+ * カテゴリへの展開も、子孫カテゴリへの展開もしない（2026-11-26 再調整で、
+ * 階層を考慮する旧判定から変更）。カテゴリを持たない参加者・候補は
+ * どのカテゴリとも一致しない。 */
+async function guestPromptCandidateRows(db: Db, memberIds: Set<number>): Promise<CharacterRow[]> {
+  const candidates = await guestCandidateRows(db, memberIds);
+  if (!candidates.length || !memberIds.size) return [];
+  const catMap = await categoryIdsByCharacter(db);
+  const memberCats = new Set<number>();
+  for (const mid of memberIds) {
+    for (const cid of catMap.get(mid) ?? []) memberCats.add(cid);
+  }
+  if (!memberCats.size) return [];
+  return candidates.filter((c) => (catMap.get(c.id) ?? []).some((cid) => memberCats.has(cid)));
 }
 
 /**
@@ -1917,14 +2107,66 @@ async function ensureAutoRequest(db: Db, kind: "chat" | "group", targetId: numbe
 }
 
 /**
+ * 投稿の保存直後の共通後処理（1対1／グループ／議題で同一の末尾一式）:
+ * 戻し下書きの消去→利用者送信ログ→自動リクエストの確保→合図実行。
+ * ログが不要な経路（議題の投稿）では log を渡さない。作成・統合した
+ * リクエストIDを返す。
+ */
+async function finishPost(
+  ctx: Ctx,
+  db: Db,
+  kind: "chat" | "group",
+  targetId: number,
+  log?: { title: string; body: string; relatedType: string; relatedId: number },
+): Promise<number> {
+  await clearDraft(db, kind, targetId);
+  if (log) await addAppLog(db, "user_send", log.title, log.body, log.relatedType, log.relatedId);
+  const requestId = await ensureAutoRequest(db, kind, targetId);
+  ctx.invalidateQueries();
+  // 生成の開始は signalAll と同一の共通経路（runSignalAll）を通す（v1.4.1）。
+  // 投稿対象については ensureAutoRequest が直前に pending を確保済みなので、
+  // その情報を渡して runSignalAll 内での再判定（未返信判定＋有効リクエスト
+  // 取得のやり直し）を省略する（冗長性レビュー B-2）。
+  await runSignalAll(ctx, db, { kind, targetId, requestId });
+  return requestId;
+}
+
+/** 投稿の保存直後の後処理のうち、リクエスト作成を含まない前段（下書き消去＋送信ログ）。
+ * なりきり発言への返信のように、リクエストの作り方が通常と異なる経路で使う。 */
+async function recordUserPost(
+  db: Db,
+  kind: "chat" | "group",
+  targetId: number,
+  log: { title: string; body: string; relatedType: string; relatedId: number },
+) {
+  await clearDraft(db, kind, targetId);
+  await addAppLog(db, "user_send", log.title, log.body, log.relatedType, log.relatedId);
+}
+
+/**
  * 生成開始の共通経路（v1.4.1）。signalAll アクションの本体であり、postMessage /
  * postGroupPrompt も発言保存後にこの関数を呼ぶ。本番で signalAll 経由の起動だけが
  * 機能した事象への対策として、発言系アクションは独自のキック経路を持たず、
  * 必ずこの経路（未返信のある全対象の走査 → リクエスト作成・統合 → 仲介起動）を
  * 通すことで、起動の仕組みを signalAll と完全に同一にする。
  * failed のまま新着発言が無い対象と、生成中・解散済みは除く。
+ *
+ * ensured（冗長性レビュー B-2）: 投稿側がこの呼び出しの直前に、その対象の
+ * pending リクエストを作成・統合済みである場合に、その対象とリクエストIDを
+ * 渡す。渡された対象については、走査側の判定（未返信判定＋有効リクエスト
+ * 取得→pending として対象に含め、upto_seq は前進のみ）をやり直しても結果が
+ * 同じになることが直前の処理で保証されている（ensureAutoRequest が upto_seq
+ * を最新発言まで進めた pending を返した直後であり、その間に同じ対象への
+ * 投稿は「返信待ちの間は投稿不可」のサーバ側ガードで入らない）ため、再判定を
+ * 省略して対象として数えるだけにする。それ以外の対象・見張り・スケジュール
+ * 発火・レビューの走査は従来どおり全件行う（v1.4.1 の「signalAll と同一経路」
+ * という堅牢性は、投稿対象以外の拾い漏れ防止として維持する）。
  */
-async function runSignalAll(ctx: Ctx, db: Db): Promise<{ created: number; targets: string[]; review_targets: string[] }> {
+async function runSignalAll(
+  ctx: Ctx,
+  db: Db,
+  ensured?: { kind: "chat" | "group"; targetId: number; requestId: number },
+): Promise<{ created: number; targets: string[]; review_targets: string[] }> {
   await sweepTimeouts(db);
   await sweepReviewTimeouts(db);
   // pending のまま仲介に拾われていないリクエスト／レビューの見張り
@@ -1936,6 +2178,14 @@ async function runSignalAll(ctx: Ctx, db: Db): Promise<{ created: number; target
   let firstRequestId = 0;
   const chars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
   for (const c of chars) {
+    if (ensured?.kind === "chat" && ensured.targetId === c.id) {
+      // 投稿直後で pending 確保済みの対象: 再判定しても「pending として対象に
+      // 含まれ、upto_seq の前進は不要」という同じ結果になるため、対象として
+      // 数えるだけにする（B-2）。
+      targets.push(`${c.displayName}（1対1）`);
+      if (!firstRequestId) firstRequestId = ensured.requestId;
+      continue;
+    }
     const un = await chatUnreplied(db, c.id);
     if (un.count === 0) continue;
     const active = await activeRequest(db, "chat", c.id);
@@ -1960,6 +2210,14 @@ async function runSignalAll(ctx: Ctx, db: Db): Promise<{ created: number; target
   }
   const groupRows = await db.select().from(schema.groups).where(eq(schema.groups.status, "active")).orderBy(asc(schema.groups.id));
   for (const g of groupRows) {
+    if (ensured?.kind === "group" && ensured.targetId === g.id) {
+      // 投稿直後で pending 確保済みの対象: 1対1側と同じ理由で再判定を省略し、
+      // 対象として数えるだけにする（B-2）。投稿時にグループが active である
+      // ことは投稿側で確認済み。
+      targets.push(`${g.name}（グループ）`);
+      if (!firstRequestId) firstRequestId = ensured.requestId;
+      continue;
+    }
     const active = await activeRequest(db, "group", g.id);
     if (active?.status === "processing") continue;
     if (active?.status === "pending") {
@@ -2030,12 +2288,13 @@ async function logImportSettingsChange(db: Db, batchId: string | undefined, disp
   }
   const namesKey = `import_batch_names:${batchId}`;
   const logKey = `import_batch_log:${batchId}`;
-  const names = parseJsonStringArray(await getMeta(db, namesKey));
+  const batchMeta = await getMetaMany(db, [namesKey, logKey]);
+  const names = parseJsonStringArray(batchMeta.get(namesKey) ?? "");
   names.push(displayName);
   await setMeta(db, namesKey, JSON.stringify(names));
   const title = `キャラを取り込み（${names.length}件）`;
   const body = `一括取り込みで次のキャラクターを取り込みました: ${names.join("、")}`;
-  const logId = Number((await getMeta(db, logKey)) || "0");
+  const logId = Number(batchMeta.get(logKey) || "0");
   if (logId > 0) {
     await db.update(schema.appLogs).set({ title, body }).where(eq(schema.appLogs.id, logId));
   } else {
@@ -2063,8 +2322,7 @@ type ImportOneResult = { id: number; name: string; display_name: string; is_new:
  * 順で、http で始まるもの）。
  */
 function profileImageUrl(profile: Record<string, unknown>): string | undefined {
-  const obj = (v: unknown): Record<string, unknown> =>
-    v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  const obj = objVal;
   const imgs = Array.isArray(profile["images"]) ? (profile["images"] as unknown[]) : [];
   const primary = imgs.find((i) => !!obj(i)["is_primary"]) ?? imgs[0];
   const candidates = [obj(primary)["url"], obj(primary)["file"], obj(profile["image_base"])["image_ref"]];
@@ -2085,11 +2343,19 @@ function profileImageUrl(profile: Record<string, unknown>): string | undefined {
  * 既存の画像を保持する。会話履歴・カテゴリ・参加グループはキャラ行に
  * 紐付くため、更新でも保持される。取り込み時点の元プロファイル更新日時
  * （JSON内の updated_at）は source_updated_at として記録される。
+ *
+ * opts.existing（冗長性レビュー B-3）: 一括取り込み（importCharactersBulk）は
+ * 全キャラの照合マップを既に持っているため、照合済みの既存行（一致なしは
+ * null）を渡せる。undefined でない場合はその行を照合結果として使い、この
+ * 関数内の DB 照合（ID照合＋名前照合）は行わない。単発取り込み
+ * （importCharacter）は渡さないため、従来どおり DB 照合する。照合規則そのもの
+ * は呼び出し側と同一（ID優先、無ければ名前の完全一致で最小ID）でなければ
+ * ならない。
  */
 async function importOneProfile(
   ctx: Ctx,
   db: Db,
-  opts: { json: string; imageUrl?: string; imageBase64?: string; batchId?: string },
+  opts: { json: string; imageUrl?: string; imageBase64?: string; batchId?: string; existing?: CharacterRow | null },
 ): Promise<ImportOneResult> {
   let profile: Record<string, unknown>;
   try {
@@ -2120,13 +2386,19 @@ async function importOneProfile(
       await ctx.blobs.put(imageBlobKey, bytes, { contentType: mime });
     }
   }
-  let existing = parts.sourceProfileId
-    ? (await db.select().from(schema.characters).where(eq(schema.characters.sourceProfileId, parts.sourceProfileId)))[0] ?? null
-    : null;
-  if (!existing) {
-    const byName = await db.select().from(schema.characters).where(eq(schema.characters.name, parts.name));
-    // 同名が複数ある場合は、最初に登録された（IDが最も小さい）ものを正とする。
-    existing = byName.sort((a, b) => a.id - b.id)[0] ?? null;
+  let existing: CharacterRow | null;
+  if (opts.existing !== undefined) {
+    // 呼び出し側（一括取り込み）が照合済み。その結果を正とし、DB 照合はしない。
+    existing = opts.existing;
+  } else {
+    existing = parts.sourceProfileId
+      ? (await db.select().from(schema.characters).where(eq(schema.characters.sourceProfileId, parts.sourceProfileId)))[0] ?? null
+      : null;
+    if (!existing) {
+      const byName = await db.select().from(schema.characters).where(eq(schema.characters.name, parts.name));
+      // 同名が複数ある場合は、最初に登録された（IDが最も小さい）ものを正とする。
+      existing = byName.sort((a, b) => a.id - b.id)[0] ?? null;
+    }
   }
   if (existing) {
     const displayName = await applyProfileToCharacter(db, existing, profile, opts.json);
@@ -2168,6 +2440,11 @@ async function importOneProfile(
   return { id: ins[0]!.id, name: parts.name, display_name: displayName, is_new: true, has_image: !!imageBlobKey };
 }
 
+// フレーバーの上限（1チャットあたりの件数と、1件の文字数）。スケジュール
+// 入力スキーマからも参照するため、フレーバーのヘルパーより前に置く。
+const FLAVOR_MAX_PER_TARGET = 20;
+const FLAVOR_TEXT_MAX = 20000;
+
 // ------------------------------------------------------- スケジュール入出力（設計書 v2.0 / B・E）
 
 const scheduleOutSchema = z.object({
@@ -2186,7 +2463,7 @@ const scheduleOutSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
-  background_text: z.string(),
+  flavors: z.array(z.string()),
   last_fired_slot: z.string().nullable(),
   last_group_id: z.number().nullable(),
 });
@@ -2208,7 +2485,7 @@ function scheduleToOut(s: ScheduleRow, targetGroupName: string | null): z.infer<
     allow_guests: s.allowGuests === 1,
     allow_mobs: s.allowMobs === 1,
     allow_narration: s.allowNarration === 1,
-    background_text: s.backgroundText,
+    flavors: parseFlavors(s.flavors),
     last_fired_slot: s.lastFiredSlot,
     last_group_id: s.lastGroupId,
   };
@@ -2231,14 +2508,13 @@ const scheduleInputSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
-  background_text: z.string().max(5000),
+  flavors: z.array(z.string().trim().min(1).max(FLAVOR_TEXT_MAX)).max(FLAVOR_MAX_PER_TARGET),
 });
 
 type ScheduleInput = z.infer<typeof scheduleInputSchema>;
 
 /** スケジュール入力の検証（作成・更新・有効化で共通）。対象グループのなりきり設定もここで弾く。 */
 async function validateScheduleInput(db: Db, input: ScheduleInput) {
-  if (!input.times.length) throw new Error("生成時刻を1つ以上選んでください");
   if (input.frequency === "weekly" && ![...new Set(input.weekdays)].length) {
     throw new Error("毎週の場合は曜日を1つ以上選んでください");
   }
@@ -2279,7 +2555,27 @@ function scheduleInputToValues(input: ScheduleInput) {
     allowGuests: input.allow_guests ? 1 : 0,
     allowMobs: input.allow_mobs ? 1 : 0,
     allowNarration: input.allow_narration ? 1 : 0,
-    backgroundText: input.target_type === "new" ? input.background_text : "",
+    flavors: JSON.stringify(input.target_type === "new" ? input.flavors : []),
+  };
+}
+
+/** スケジュール行を入力形式（ScheduleInput）へ戻す（有効化時の再検証などで使う）。 */
+function scheduleRowToInput(s: ScheduleRow): ScheduleInput {
+  return {
+    name: s.name,
+    enabled: s.enabled === 1,
+    frequency: s.frequency,
+    weekdays: parseJsonIntArray(s.weekdays),
+    times: parseJsonStringArray(s.times),
+    target_type: s.targetType,
+    target_group_id: s.targetGroupId,
+    category_ids: parseJsonIntArray(s.categoryIds),
+    min_members: s.minMembers,
+    max_members: s.maxMembers,
+    allow_guests: s.allowGuests === 1,
+    allow_mobs: s.allowMobs === 1,
+    allow_narration: s.allowNarration === 1,
+    flavors: parseFlavors(s.flavors),
   };
 }
 
@@ -2312,13 +2608,96 @@ function segmentDateLabels(msgs: { segmentNo: number; noHistory: number; created
   }
   const labels = new Map<number, string>();
   for (const [seg, t] of firstBySegment) {
-    const jst = new Date(t + JST_OFFSET_MS);
-    labels.set(
-      seg,
-      `${jst.getUTCFullYear()}/${pad2(jst.getUTCMonth() + 1)}/${pad2(jst.getUTCDate())} ${pad2(jst.getUTCHours())}:${pad2(jst.getUTCMinutes())}`,
-    );
+    const p = jstParts(t);
+    labels.set(seg, `${p.year}/${pad2(p.month)}/${pad2(p.day)} ${pad2(p.hours)}:${pad2(p.minutes)}`);
   }
   return labels;
+}
+
+// ------------------------------------------------------- フレーバー（旧「背景情報」の置き換え）
+//
+// フレーバーは、フレーバーツールで出力されたテキストをそのまま貼った文字列。
+// 1つのチャット（1対1／グループ）に複数指定でき、生成時は全件が絶対の
+// ルールとしてプロンプトへ含まれる（旧背景情報の扱い3条を全件へ適用）。
+// 指定したフレーバーは、アプリ全体で共有する「フレーバー履歴」へ最大10件
+// まで残る（meta の flavor_history、JSON配列文字列・新しい順）。履歴へ
+// 登録されるのは、新しく指定された時だけ: すでに履歴にある同一内容は
+// 重複登録せず、使い回しても履歴の内容・並びは変えない。10件を超えたら
+// 古いもの（末尾）から外れる。
+
+const FLAVOR_HISTORY_META_KEY = "flavor_history";
+const FLAVOR_HISTORY_MAX = 10;
+
+/** flavors カラム（JSON配列文字列）を文字列配列へ戻す。壊れた値は空として扱う。 */
+function parseFlavors(raw: string): string[] {
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    return v
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** フレーバーの見出し: 貼られたテキストの先頭の非空行。履歴や一覧の省略表示に使う。 */
+function flavorTitle(text: string): string {
+  const first = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return first.length > 60 ? `${first.slice(0, 60)}…` : first;
+}
+
+/** フレーバー履歴（アプリ全体で共有）を新しい順に読む。 */
+async function readFlavorHistory(db: Db): Promise<string[]> {
+  return parseFlavors(await getMeta(db, FLAVOR_HISTORY_META_KEY));
+}
+
+/**
+ * 新しく指定されたフレーバーを履歴へ登録する。登録は「履歴に未登録の
+ * テキスト」に対してだけ行い、すでに履歴にある同一内容は重複登録せず、
+ * その場合は履歴の内容・並びも一切変えない（再指定・使い回しでは登録
+ * されない）。複数が一度に新しく指定された場合は、指定された順に1件
+ * ずつ登録する（後に指定されたものほど新しい扱い）。10件を超えた分は、
+ * 初回登録が古いものから外れる（履歴は新しい順なので末尾から落ちる）。
+ */
+async function registerFlavorHistory(db: Db, texts: string[]): Promise<void> {
+  const fresh = [...new Set(texts.map((t) => t.trim()).filter((t) => t.length > 0))];
+  if (!fresh.length) return;
+  const current = await readFlavorHistory(db);
+  const known = new Set(current);
+  const adding = fresh.filter((t) => !known.has(t));
+  if (!adding.length) return;
+  // 指定順に1件ずつ先頭へ積む: 同時指定の中では、先に指定されたものが
+  // 初回登録順でも古くなる。まとめて先頭へ入れる旧実装は同時指定の
+  // 先頭側を新しいものとして扱い、追い出しの順序が初回登録順と逆転した。
+  const next = [...current];
+  for (const t of adding) next.unshift(t);
+  await setMeta(db, FLAVOR_HISTORY_META_KEY, JSON.stringify(next.slice(0, FLAVOR_HISTORY_MAX)));
+}
+
+/**
+ * 生成プロンプトへ含めるフレーバーのセクション（見出し＋全件＋扱い3条）。
+ * フレーバーが無い場合は空配列を返し、プロンプトは従来と同一になる。
+ * 扱い3条は旧「背景情報の扱い」と同じ内容をフレーバーへ読み替えたもの:
+ * 絶対のルール／過去の履歴より優先／キャラクター自身は内容を認識して
+ * おらず台詞で直接口にしない。
+ */
+function flavorPromptSection(flavors: string[]): string[] {
+  const list = flavors.map((f) => f.trim()).filter((f) => f.length > 0);
+  if (!list.length) return [];
+  const lines: string[] = ["--- フレーバー ---"];
+  list.forEach((f, i) => {
+    lines.push(`【フレーバー${i + 1}】`, f, "");
+  });
+  lines.push(
+    "--- フレーバーの扱い ---",
+    "- フレーバーに書かれた内容は絶対のルールです。すべてのキャラクターは、フレーバーの内容に基づいて振る舞わなければなりません。キャラクター設定やこれまでの掛け合いと食い違う場合は、フレーバーを優先してください。",
+    "- これまでの掛け合いの中でフレーバーに沿っていない部分があっても、それに引きずられないでください。今後の掛け合いは、必ずフレーバーに従ってください。",
+    "- フレーバーの内容そのものは、キャラクター自身が認識している事柄ではありません。キャラクターがフレーバーの内容を直接口にしたり、説明したりしないでください。フレーバーは、キャラクターの振る舞いや状況の前提としてだけ静かに反映してください。",
+    "",
+  );
+  return lines;
 }
 
 // ------------------------------------------------------- actions
@@ -2370,10 +2749,9 @@ export const Actions = {
       const catMap = await categoryIdsByCharacter(db);
       const charList = [];
       for (const c of chars) {
-        const un = await chatUnreplied(db, c.id);
-        const active = await activeRequest(db, "chat", c.id);
-        const latest = active ? null : await latestRequest(db, "chat", c.id);
-        const info = requestInfo(active, latest, un.count, await failAckedId(db, "chat", c.id));
+        const stats = await chatHomeStats(db, c);
+        const { active, latest } = await resolveRequestState(db, "chat", c.id);
+        const info = requestInfo(active, latest, stats.unrepliedCount, await failAckedId(db, "chat", c.id));
         const catIds = catMap.get(c.id) ?? [];
         charList.push({
           id: c.id,
@@ -2382,13 +2760,12 @@ export const Actions = {
           image_url: await charImageUrl(ctx, c),
           has_image: !!c.imageBlobKey,
           theme_color: c.themeColor,
-          unreplied_count: un.count,
-          unread_count: await chatUnreadCount(db, c.id, c.lastReadSeq),
+          unreplied_count: stats.unrepliedCount,
+          unread_count: stats.unreadCount,
           request_status: info.status,
           category_ids: catIds,
-          category_id: catIds[0] ?? null,
-          first_unread_seq: await chatFirstUnreadSeq(db, c.id, c.lastReadSeq),
-          last_activity_at: await chatLastActivityAt(db, c.id),
+          first_unread_seq: stats.firstUnreadSeq,
+          last_activity_at: stats.lastActivityAt,
           auto_topic_enabled: c.autoTopicEnabled === 1,
         });
       }
@@ -2396,21 +2773,20 @@ export const Actions = {
       const groupList = [];
       for (const g of groupRows) {
         const members = await groupMemberRows(db, g.id);
-        const un = await groupUnreplied(db, g.id);
-        const active = await activeRequest(db, "group", g.id);
-        const latest = active ? null : await latestRequest(db, "group", g.id);
-        const info = requestInfo(active, latest, un.count, await failAckedId(db, "group", g.id));
+        const stats = await groupHomeStats(db, g);
+        const { active, latest } = await resolveRequestState(db, "group", g.id);
+        const info = requestInfo(active, latest, stats.unrepliedCount, await failAckedId(db, "group", g.id));
         groupList.push({
           id: g.id,
           name: g.name,
           status: g.status,
           member_names: members.map((m) => m.character?.displayName ?? "（削除済み）"),
           member_image_urls: await Promise.all(members.map((m) => (m.character ? charImageUrl(ctx, m.character) : Promise.resolve(null)))),
-          unreplied_count: un.count,
-          unread_count: await groupUnreadCount(db, g.id, g.lastReadSeq),
+          unreplied_count: stats.unrepliedCount,
+          unread_count: stats.unreadCount,
           request_status: info.status,
-          first_unread_seq: await groupFirstUnreadSeq(db, g.id, g.lastReadSeq),
-          last_activity_at: await groupLastActivityAt(db, g.id, g.createdAt),
+          first_unread_seq: stats.firstUnreadSeq,
+          last_activity_at: stats.lastActivityAt ?? g.createdAt.toISOString(),
         });
       }
       const savedSortRaw = await getMeta(db, "pref_char_sort");
@@ -2552,8 +2928,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      if (!rows[0]) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const uniq = [...new Set(args.category_ids)];
       const catRows = await allCategoryRows(db);
       if (uniq.length > 0 && uniq.some((id) => !catRows.some((c) => c.id === id))) {
@@ -2566,7 +2941,7 @@ export const Actions = {
       await addAppLog(
         db,
         "settings",
-        `キャラ設定を変更: ${rows[0]!.displayName}`,
+        `キャラ設定を変更: ${c.displayName}`,
         catNames.length ? `カテゴリを変更しました: ${catNames.join("、")}` : "カテゴリを全て外しました（未分類）。",
         "character",
         args.character_id,
@@ -2589,6 +2964,9 @@ export const Actions = {
       }),
       // 履歴の使用設定（設計書 v3.2）: false の間は生成に過去の履歴を含めない。
       use_history: z.boolean(),
+      // フレーバー: このチャットで指定されているフレーバー一式（貼られた
+      // テキストそのままの配列）。生成時は全件が絶対のルールとして含まれる。
+      flavors: z.array(z.string()),
       messages: z.array(
         z.object({
           id: z.number(),
@@ -2616,9 +2994,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const msgs = await db
         .select()
         .from(schema.messages)
@@ -2627,23 +3003,10 @@ export const Actions = {
       // 既読化（設計書 v1.5 / 4.5章）: 会話画面の状態取得をもって、その時点までの
       // 全発言を既読にする。開いたまま到着した返信も次の状態取得で既読になる。
       const maxSeq = msgs.length ? msgs[msgs.length - 1]!.seq : 0;
-      if (maxSeq > c.lastReadSeq) {
-        await db.update(schema.characters).set({ lastReadSeq: maxSeq }).where(eq(schema.characters.id, c.id));
-      }
+      await applyMarkRead(db, "chat", c.id, c.lastReadSeq, maxSeq);
       const un = await chatUnreplied(db, c.id);
-      const active = await activeRequest(db, "chat", c.id);
-      const latest = active ? null : await latestRequest(db, "chat", c.id);
-      // 失敗通知の表示済み管理（v1.19）: 今回の応答では失敗を返し、その後で
-      // 表示済みに進める。次回の状態取得からは失敗バナーも下書きの失敗理由も
-      // 返らない（下書きの本文＝入力欄へ戻す文章は残す）。
-      const acked = await failAckedId(db, "chat", c.id);
-      const info = requestInfo(active, latest, un.count, acked);
-      const draftRow = await getDraft(db, "chat", c.id);
-      const failedUnseen = latest?.status === "failed" && latest.id > acked;
-      const draft = draftRow
-        ? { body: draftRow.body, fail_reason: failedUnseen ? draftRow.fail_reason : "" }
-        : null;
-      if (latest?.status === "failed") await ackFailure(db, "chat", c.id, latest.id);
+      const { active, latest } = await resolveRequestState(db, "chat", c.id);
+      const { info, draft } = await resolveInfoAndDraft(db, "chat", c.id, active, latest, un.count);
       const segDates = segmentDateLabels(msgs);
       return {
         character: {
@@ -2654,6 +3017,7 @@ export const Actions = {
           theme_color: c.themeColor,
         },
         use_history: c.useHistory === 1,
+        flavors: parseFlavors(c.flavors),
         messages: msgs.map((m) => ({
           id: m.id,
           speaker: m.speaker,
@@ -2681,9 +3045,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       // 返信待ち（pending / 生成中）がある間は送信できない（二重送信の防止）。
       // 画面側でも送信を止めるが、サーバ側でも保証する。
       const active = await activeRequest(db, "chat", c.id);
@@ -2695,15 +3057,12 @@ export const Actions = {
         db.update(schema.characters).set({ nextSeq: seq + 1, autoTopicCount: 0 }).where(eq(schema.characters.id, c.id)),
       ];
       await db.batch(stmts);
-      await clearDraft(db, "chat", c.id);
-      // 全体ログ（設計書 v2.0 / D）: 利用者の送信は送信イベントとして記録する
-      // （生成プロンプトのログとは分ける）。
-      await addAppLog(db, "user_send", `送信: ${c.displayName}とのチャット`, args.body, "character", c.id);
-      const requestId = await ensureAutoRequest(db, "chat", c.id);
-      ctx.invalidateQueries();
-      // 生成の開始は signalAll と同一の共通経路（runSignalAll）を通す（v1.4.1）。
-      // 作成済みの pending は runSignalAll 側で対象として拾われ、仲介が起動する。
-      await runSignalAll(ctx, db);
+      const requestId = await finishPost(ctx, db, "chat", c.id, {
+        title: `送信: ${c.displayName}とのチャット`,
+        body: args.body,
+        relatedType: "character",
+        relatedId: c.id,
+      });
       return { seq, request_id: requestId };
     },
   }),
@@ -2768,9 +3127,7 @@ export const Actions = {
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       await guardDestructive(db, "chat", c.id);
       const links = await db.select().from(schema.groupMembers).where(eq(schema.groupMembers.characterId, c.id));
       const groupIds = [...new Set(links.map((l) => l.groupId))];
@@ -2826,9 +3183,7 @@ export const Actions = {
     response: z.object({ image_url: z.string().nullable() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const allowed = ["image/png", "image/jpeg", "image/webp"];
       if (!allowed.includes(args.image_mime)) throw new Error("対応していない画像形式です（PNG / JPEG / WebP のいずれか）");
       const bytes = new Uint8Array(Buffer.from(args.image_base64, "base64"));
@@ -2866,9 +3221,7 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       return {
         id: c.id,
         name: c.name,
@@ -2891,9 +3244,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       await db.update(schema.characters).set({ displayName: args.display_name }).where(eq(schema.characters.id, c.id));
       await addAppLog(db, "settings", `キャラ設定を変更: ${args.display_name}`, `表示名を変更しました: ${c.displayName} → ${args.display_name}`, "character", c.id);
       ctx.invalidateQueries();
@@ -2937,9 +3288,7 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const base = {
         id: c.id,
         display_name: c.displayName,
@@ -2972,9 +3321,8 @@ export const Actions = {
         profile = null;
       }
       if (!profile || profile["format"] !== "avatar-profile") return base;
-      const str = (v: unknown): string => (typeof v === "string" ? v : "");
-      const obj = (v: unknown): Record<string, unknown> =>
-        v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+      const str = strVal;
+      const obj = objRec;
       const bg = obj(profile["background"]);
       const speech = obj(profile["speech"]);
       const st = obj(speech["structured"]);
@@ -3060,9 +3408,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       let profile: Record<string, unknown>;
       try {
         profile = JSON.parse(c.sourceJson) as Record<string, unknown>;
@@ -3072,8 +3418,7 @@ export const Actions = {
       if (!profile || typeof profile !== "object" || profile["format"] !== "avatar-profile") {
         throw new Error("保存されている設定が avatar-profile 形式ではないため、編集できません");
       }
-      const obj = (v: unknown): Record<string, unknown> =>
-        v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+      const obj = objRec;
       const orNull = (s: string): string | null => (s.trim() ? s : null);
 
       profile["name"] = args.name;
@@ -3139,14 +3484,9 @@ export const Actions = {
 
       const jsonStr = JSON.stringify(profile, null, 2);
       // 妥当性検証を兼ねて、レビュー適用と同じ経路で設定本文へ反映する。
-      // applyProfileToCharacter は表示名も名前に合わせて付け直すため、
-      // この編集では表示名を扱わない設計に従い、保存前の表示名へ戻す。
+      // この編集では表示名を扱わない設計のため、表示名は保持させる。
       const prevDisplayName = c.displayName;
-      await applyProfileToCharacter(db, c, profile, jsonStr);
-      await db
-        .update(schema.characters)
-        .set({ displayName: prevDisplayName })
-        .where(eq(schema.characters.id, c.id));
+      await applyProfileToCharacter(db, c, profile, jsonStr, { keepDisplayName: true });
       await addAppLog(db, "settings", `キャラ設定を変更: ${prevDisplayName}`, "「設定を編集する」のフォームから設定を書き換えました。", "character", c.id);
       ctx.invalidateQueries();
       return { ok: true };
@@ -3249,6 +3589,14 @@ export const Actions = {
             results.push({ profile_id: entry.id, name: matchedById.name, status: "skipped", character_id: matchedById.id, reason: "" });
             continue;
           }
+          // 照合はこのマップで完結させる（B-3）: importOneProfile と同じ規則
+          // （ID優先、無ければ名前の完全一致で最小IDの行）で既存行を確定し、
+          // 照合済みとして渡すことで、取り込み側の DB 再照合を無くす。名前は
+          // importOneProfile が profileToParts で導出する値（trim 済み、空なら
+          // 「名称なし」）と一致させる。bulk のマップは ID 昇順に走査して
+          // 最初の行だけを保持するため、名前照合の「最小IDが正」とも一致する。
+          const matchName = strVal(entry.profile["name"]).trim() || "名称なし";
+          const matched = matchedById ?? byName.get(matchName) ?? null;
           // 本体JSONへ ID と更新日時をエントリ側の値で確実に載せる
           // （source_profile_id / source_updated_at の記録を差分判定の
           // キーと一致させるため）。
@@ -3258,6 +3606,7 @@ export const Actions = {
             json,
             imageUrl: profileImageUrl(profile),
             batchId,
+            existing: matched,
           });
           if (result.is_new) {
             added++;
@@ -3388,9 +3737,7 @@ export const Actions = {
       if (ids.length < 1) throw new Error("キャラクターは1人以上選んでください");
       const chars: CharacterRow[] = [];
       for (const id of ids) {
-        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, id));
-        if (!rows[0]) throw new Error("キャラクターが見つかりません");
-        chars.push(rows[0]);
+        chars.push(await getCharacterOrThrow(db, id));
       }
       const name = args.name || chars.map((c) => c.displayName).join("・").slice(0, 60);
       const ins = await db
@@ -3410,7 +3757,7 @@ export const Actions = {
   // スケジュールの新規チャット型と同じサーバ側の共通経路（createRandomGroup）で
   // グループを作成する。条件はボタン専用に固定: 対象は全キャラ（カテゴリ指定
   // なし）、人数は3〜8人からランダム、ゲスト/モブ/ナレーションの可否は
-  // ランダム、背景情報なし。作成のみで、生成（返信リクエスト）は開始しない。
+  // ランダム、フレーバーなし。作成のみで、生成（返信リクエスト）は開始しない。
   createRandomGroupNow: defineAction({
     description: "登録済みの全キャラクターからランダムに3〜8人を選び、ゲスト/モブ/ナレーションの可否もランダムに決めて、グループチャットをその場で1件作成します（スケジュールの新規チャット型と共通の作成経路）。作成のみで会話の生成は開始しません。キャラクターが3人未満の場合は作成せずエラーを返します。",
     request: z.object({}),
@@ -3418,9 +3765,6 @@ export const Actions = {
     async handler(ctx) {
       const db = getDb(ctx);
       const allChars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
-      if (allChars.length < 3) {
-        throw new Error(`グループを自動作成するにはキャラクターが3人以上必要です（現在${allChars.length}人）。キャラを追加してください。`);
-      }
       const created = await createRandomGroup(db, {
         population: allChars,
         minMembers: 3,
@@ -3428,7 +3772,7 @@ export const Actions = {
         allowGuests: Math.random() < 0.5 ? 1 : 0,
         allowMobs: Math.random() < 0.5 ? 1 : 0,
         allowNarration: Math.random() < 0.5 ? 1 : 0,
-        backgroundText: "",
+        flavors: [],
         name: null,
       });
       if (!created) {
@@ -3443,7 +3787,10 @@ export const Actions = {
     description: "グループチャットの参加者・ログ・リクエスト状態を返します。members には現在の参加者（in_group=true）に加え、参加者変更で外れた元参加者も in_group=false で含めます（過去の発言の名前・画像の参照用。生成には参加しません）。",
     request: z.object({ group_id: z.number().int().positive() }),
     response: z.object({
-      group: z.object({ id: z.number(), name: z.string(), status: z.string(), background_text: z.string() }),
+      group: z.object({ id: z.number(), name: z.string(), status: z.string() }),
+      // フレーバー: このグループで指定されているフレーバー一式（貼られた
+      // テキストそのままの配列）。生成時は全件が絶対のルールとして含まれる。
+      flavors: z.array(z.string()),
       // なりきり設定（v1.19 / v1.20）: なりきり中のキャラID（未設定は null）と、
       // 「なりきりキャラの台詞」の扱い（true = AIも演じる / false = 自分だけが演じる）。
       roleplay_character_id: z.number().nullable(),
@@ -3501,9 +3848,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       const memberRows = await groupMemberRows(db, g.id);
       const members = [];
       for (const m of memberRows) {
@@ -3548,25 +3893,14 @@ export const Actions = {
       }
       // 既読化（設計書 v1.5 / 4.5章）: 1対1と同様、状態取得で既読にする。
       const maxSeq = msgs.length ? msgs[msgs.length - 1]!.seq : 0;
-      if (maxSeq > g.lastReadSeq) {
-        await db.update(schema.groups).set({ lastReadSeq: maxSeq }).where(eq(schema.groups.id, g.id));
-      }
+      await applyMarkRead(db, "group", g.id, g.lastReadSeq, maxSeq);
       const un = await groupUnreplied(db, g.id);
-      const active = await activeRequest(db, "group", g.id);
-      const latest = active ? null : await latestRequest(db, "group", g.id);
-      // 失敗通知の表示済み管理（v1.19）: 1対1と同じ。今回の応答で失敗を返し、
-      // 次回からは返さない（下書きの本文は残す）。
-      const acked = await failAckedId(db, "group", g.id);
-      const info = requestInfo(active, latest, un.count, acked);
-      const draftRow = await getDraft(db, "group", g.id);
-      const failedUnseen = latest?.status === "failed" && latest.id > acked;
-      const draft = draftRow
-        ? { body: draftRow.body, fail_reason: failedUnseen ? draftRow.fail_reason : "" }
-        : null;
-      if (latest?.status === "failed") await ackFailure(db, "group", g.id, latest.id);
+      const { active, latest } = await resolveRequestState(db, "group", g.id);
+      const { info, draft } = await resolveInfoAndDraft(db, "group", g.id, active, latest, un.count);
       const segDates = segmentDateLabels(msgs);
       return {
-        group: { id: g.id, name: g.name, status: g.status, background_text: g.backgroundText },
+        group: { id: g.id, name: g.name, status: g.status },
+        flavors: parseFlavors(g.flavors),
         roleplay_character_id: g.roleplayCharacterId,
         roleplay_continue: g.roleplayContinue === 1,
         allow_guests: g.allowGuests === 1,
@@ -3608,9 +3942,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループではなりきり設定を変更できません");
       if (args.character_id !== null) {
         // スケジューリングとの相互排他（設計書 v2.0 / B）: 有効なスケジュールの
@@ -3635,8 +3967,7 @@ export const Actions = {
           .from(schema.groupMembers)
           .where(and(eq(schema.groupMembers.groupId, g.id), eq(schema.groupMembers.characterId, args.character_id)));
         if (!links[0]) throw new Error("そのキャラクターはこのグループに参加していません");
-        const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-        if (!crows[0]) throw new Error("キャラクターが見つかりません");
+        await getCharacterOrThrow(db, args.character_id);
       }
       await db
         .update(schema.groups)
@@ -3656,9 +3987,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループの名前は変更できません");
       await db.update(schema.groups).set({ name: args.name }).where(eq(schema.groups.id, g.id));
       ctx.invalidateQueries();
@@ -3676,15 +4005,11 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true; roleplay_cleared: boolean }> {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループの参加者は変更できません");
       const ids = [...new Set(args.character_ids)];
-      if (ids.length < 1 || ids.length > 8) throw new Error("参加者は1〜8人で選んでください");
       for (const id of ids) {
-        const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, id));
-        if (!crows[0]) throw new Error("キャラクターが見つかりません");
+        await getCharacterOrThrow(db, id);
       }
       const active = await activeRequest(db, "group", g.id);
       if (active) throw new Error("返信待ち・生成中は参加者を変更できません。返信が届いてからお試しください。");
@@ -3713,9 +4038,7 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
       await db
         .update(schema.groups)
@@ -3726,22 +4049,46 @@ export const Actions = {
     },
   }),
 
-  updateGroupBackground: defineAction({
-    description: "グループチャットの背景情報を保存します。背景情報は、そのグループの生成（通常・自動の両方）のシステムプロンプトへ「背景情報」として常時含まれます。一度書けば使われ続け、空にすると含まれなくなります。自動生成の有無にかかわらず設定できます（設計書 v2.0 / C）。",
+  setFlavors: defineAction({
+    description: "1対1チャット／グループチャットのフレーバー一式を保存します（旧「背景情報」の置き換え）。フレーバーはフレーバーツールの出力テキストをそのまま貼った文字列で、複数指定できます。生成（通常・自動の両方）では全件がシステムプロンプトへ常時含まれ、絶対のルールとして扱われます（過去の掛け合いが沿っていなくても今後は必ず優先され、キャラクター自身は内容を認識しておらず台詞で直接口にしません）。今回の保存で新しく指定されたフレーバー（そのチャットで今まで指定されていなかったもの）は、アプリ全体で共有するフレーバー履歴へ登録されます（最大10件・同一内容は重複登録しません）。",
     request: z.object({
-      group_id: z.number().int().positive(),
-      background_text: z.string().max(5000),
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+      flavors: z.array(z.string().trim().min(1).max(FLAVOR_TEXT_MAX)).max(FLAVOR_MAX_PER_TARGET),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
-      if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
-      await db.update(schema.groups).set({ backgroundText: args.background_text }).where(eq(schema.groups.id, g.id));
+      const next = [...new Set(args.flavors)];
+      if (args.target_kind === "chat") {
+        const c = await getCharacterOrThrow(db, args.target_id);
+        // 履歴へ登録するのは、このチャットで新しく指定されたものだけ。
+        // すでに指定されていたフレーバーの使い回しでは登録しない。
+        const before = new Set(parseFlavors(c.flavors));
+        await db.update(schema.characters).set({ flavors: JSON.stringify(next) }).where(eq(schema.characters.id, c.id));
+        await registerFlavorHistory(db, next.filter((f) => !before.has(f)));
+      } else {
+        const g = await getGroupOrThrow(db, args.target_id);
+        if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
+        const before = new Set(parseFlavors(g.flavors));
+        await db.update(schema.groups).set({ flavors: JSON.stringify(next) }).where(eq(schema.groups.id, g.id));
+        await registerFlavorHistory(db, next.filter((f) => !before.has(f)));
+      }
       ctx.invalidateQueries();
       return { ok: true };
+    },
+  }),
+
+  getFlavorHistory: defineAction({
+    description: "フレーバー履歴（アプリ全体で共有・最大10件・新しい順）を返します。各項目は貼られたテキスト全文と、その先頭行から作った見出しです。履歴の項目を選ぶと、そのフレーバーをチャットへ追加できます。履歴へ登録されるのは、フレーバーが新しく指定された時だけです。",
+    request: z.object({}),
+    response: z.object({
+      items: z.array(z.object({ text: z.string(), title: z.string() })),
+    }),
+    async handler(ctx) {
+      const db = getDb(ctx);
+      const history = await readFlavorHistory(db);
+      return { items: history.map((text) => ({ text, title: flavorTitle(text) })) };
     },
   }),
 
@@ -3756,9 +4103,7 @@ export const Actions = {
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       if (args.target_kind === "chat") {
-        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
-        const c = rows[0];
-        if (!c) throw new Error("キャラクターが見つかりません");
+        const c = await getCharacterOrThrow(db, args.target_id);
         if ((c.useHistory === 1) === args.use_history) return { ok: true };
         if (args.use_history) {
           await db.update(schema.characters).set({ useHistory: 1 }).where(eq(schema.characters.id, c.id));
@@ -3773,9 +4118,7 @@ export const Actions = {
             .where(eq(schema.characters.id, c.id));
         }
       } else {
-        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
-        const g = rows[0];
-        if (!g) throw new Error("グループが見つかりません");
+        const g = await getGroupOrThrow(db, args.target_id);
         if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
         if ((g.useHistory === 1) === args.use_history) return { ok: true };
         if (args.use_history) {
@@ -3802,17 +4145,13 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const msgs = await db
         .select({ seq: schema.messages.seq })
         .from(schema.messages)
         .where(eq(schema.messages.characterId, c.id));
       const maxSeq = msgs.reduce((m, r) => Math.max(m, r.seq), 0);
-      if (maxSeq > c.lastReadSeq) {
-        await db.update(schema.characters).set({ lastReadSeq: maxSeq }).where(eq(schema.characters.id, c.id));
-      }
+      await applyMarkRead(db, "chat", c.id, c.lastReadSeq, maxSeq);
       return { ok: true as const };
     },
   }),
@@ -3823,17 +4162,13 @@ export const Actions = {
     response: okResponse,
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       const msgs = await db
         .select({ seq: schema.groupMessages.seq })
         .from(schema.groupMessages)
         .where(eq(schema.groupMessages.groupId, g.id));
       const maxSeq = msgs.reduce((m, r) => Math.max(m, r.seq), 0);
-      if (maxSeq > g.lastReadSeq) {
-        await db.update(schema.groups).set({ lastReadSeq: maxSeq }).where(eq(schema.groups.id, g.id));
-      }
+      await applyMarkRead(db, "group", g.id, g.lastReadSeq, maxSeq);
       return { ok: true as const };
     },
   }),
@@ -3844,9 +4179,7 @@ export const Actions = {
     response: z.object({ text: z.string() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.character_id));
-      const c = rows[0];
-      if (!c) throw new Error("キャラクターが見つかりません");
+      const c = await getCharacterOrThrow(db, args.character_id);
       const msgs = await db
         .select()
         .from(schema.messages)
@@ -3863,8 +4196,7 @@ export const Actions = {
     response: z.object({ text: z.string() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      if (!rows[0]) throw new Error("グループが見つかりません");
+      await getGroupOrThrow(db, args.group_id);
       const msgs = await db
         .select()
         .from(schema.groupMessages)
@@ -3888,9 +4220,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = getDb(ctx);
       await sweepTimeouts(db);
-      const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.group_id));
-      const g = rows[0];
-      if (!g) throw new Error("グループが見つかりません");
+      const g = await getGroupOrThrow(db, args.group_id);
       if (g.status !== "active") throw new Error("解散したグループには投稿できません");
       // 返信待ち（pending / 生成中）がある間は投稿できない（二重送信の防止）。
       // ただし pending の自動生成（auto）がある場合は、その auto を取り消して
@@ -3934,8 +4264,12 @@ export const Actions = {
               .where(eq(schema.groups.id, g.id)),
           ];
           await db.batch(stmts);
-          await clearDraft(db, "group", g.id);
-          await addAppLog(db, "user_send", `送信: グループ「${g.name}」`, args.body, "group", g.id);
+          await recordUserPost(db, "group", g.id, {
+            title: `送信: グループ「${g.name}」`,
+            body: args.body,
+            relatedType: "group",
+            relatedId: g.id,
+          });
           let requestId = 0;
           {
             const memberRows = await groupMemberRows(db, g.id);
@@ -3953,7 +4287,11 @@ export const Actions = {
             }
           }
           ctx.invalidateQueries();
-          if (requestId) await runSignalAll(ctx, db);
+          // 直前に pending を作成済みの対象は、runSignalAll での再判定を省略
+          // する（B-2）。このリクエストの upto_seq は最新の発言（なりきり発言
+          // 自身）の seq で、未返信の通常話題の末尾 seq はそれより大きくなら
+          // ないため、全走査の pending 分岐（前進のみ）でも結果は変わらない。
+          if (requestId) await runSignalAll(ctx, db, { kind: "group", targetId: g.id, requestId });
           return { seq, request_id: requestId };
         }
         // なりきり先のキャラが削除されていたら、設定を解除して通常投稿として扱う。
@@ -3966,33 +4304,13 @@ export const Actions = {
         db.update(schema.groups).set({ nextSeq: seq + 1, autoTopicCount: 0 }).where(eq(schema.groups.id, g.id)),
       ];
       await db.batch(stmts);
-      await clearDraft(db, "group", g.id);
-      await addAppLog(db, "user_send", `送信: グループ「${g.name}」`, args.body, "group", g.id);
-      const requestId = await ensureAutoRequest(db, "group", g.id);
-      ctx.invalidateQueries();
-      // 生成の開始は signalAll と同一の共通経路（runSignalAll）を通す（v1.4.1）。
-      await runSignalAll(ctx, db);
+      const requestId = await finishPost(ctx, db, "group", g.id, {
+        title: `送信: グループ「${g.name}」`,
+        body: args.body,
+        relatedType: "group",
+        relatedId: g.id,
+      });
       return { seq, request_id: requestId };
-    },
-  }),
-
-  clearGroupHistory: defineAction({
-    description: "グループチャットの履歴をクリアします（seq の採番は戻しません）。生成中は実行できません。",
-    request: z.object({ group_id: z.number().int().positive() }),
-    response: okResponse,
-    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = getDb(ctx);
-      await sweepTimeouts(db);
-      await guardDestructive(db, "group", args.group_id);
-      await db.delete(schema.groupMessages).where(eq(schema.groupMessages.groupId, args.group_id));
-      await db
-        .delete(schema.replyRequests)
-        .where(and(eq(schema.replyRequests.targetKind, "group"), eq(schema.replyRequests.targetId, args.group_id)));
-      // 履歴が無くなったので、自動議題の連続自動投稿も数え直す（ローカル改善）。
-      await db.update(schema.groups).set({ autoTopicCount: 0 }).where(eq(schema.groups.id, args.group_id));
-      await clearDraft(db, "group", args.group_id);
-      ctx.invalidateQueries();
-      return { ok: true };
     },
   }),
 
@@ -4209,12 +4527,9 @@ export const Actions = {
       const db = getDb(ctx);
       await sweepTimeouts(db);
       if (args.target_kind === "chat") {
-        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
-        if (!rows[0]) throw new Error("キャラクターが見つかりません");
+        await getCharacterOrThrow(db, args.target_id);
       } else {
-        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
-        const g = rows[0];
-        if (!g) throw new Error("グループが見つかりません");
+        const g = await getGroupOrThrow(db, args.target_id);
         if (g.status !== "active") throw new Error("解散したグループには議題を投下できません");
       }
       const active = await activeRequest(db, args.target_kind, args.target_id);
@@ -4239,16 +4554,13 @@ export const Actions = {
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       if (args.target_kind === "chat") {
-        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
-        if (!rows[0]) throw new Error("キャラクターが見つかりません");
+        await getCharacterOrThrow(db, args.target_id);
         await db
           .update(schema.characters)
           .set({ autoTopicEnabled: args.enabled ? 1 : 0 })
           .where(eq(schema.characters.id, args.target_id));
       } else {
-        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
-        const g = rows[0];
-        if (!g) throw new Error("グループが見つかりません");
+        const g = await getGroupOrThrow(db, args.target_id);
         if (g.status !== "active") throw new Error("解散したグループの設定は変更できません");
         await db
           .update(schema.groups)
@@ -4359,9 +4671,10 @@ export const Actions = {
       events.push(`このアプリには今、キャラクターが${allChars.length}人いる`);
       const activeGroups = await db.select().from(schema.groups).where(eq(schema.groups.status, "active"));
       if (activeGroups.length) events.push(`グループチャットは${activeGroups.length}件ある`);
-      const impState = await getMeta(db, "import_state");
-      const impFinished = Number((await getMeta(db, "import_finished_at")) || "0");
-      const impNote = await getMeta(db, "import_note");
+      const imp = await getMetaMany(db, ["import_state", "import_finished_at", "import_note"]);
+      const impState = imp.get("import_state") ?? "";
+      const impFinished = Number(imp.get("import_finished_at") || "0");
+      const impNote = imp.get("import_note") ?? "";
       if (impState === "done" && impFinished > 0 && now - impFinished < 14 * 24 * 3600 * 1000 && impNote) {
         events.push(`最近、アバター管理からの一括取り込みが行われた（${impNote.slice(0, 120)}）`);
       }
@@ -4386,9 +4699,7 @@ export const Actions = {
       if (active) throw new Error("返信待ち・生成中のため、議題を投稿できません");
       let seq = 0;
       if (args.target_kind === "chat") {
-        const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
-        const c = rows[0];
-        if (!c) throw new Error("キャラクターが見つかりません");
+        const c = await getCharacterOrThrow(db, args.target_id);
         seq = c.nextSeq;
         const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
           db.insert(schema.messages).values({
@@ -4406,9 +4717,7 @@ export const Actions = {
         ];
         await db.batch(stmts);
       } else {
-        const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, args.target_id));
-        const g = rows[0];
-        if (!g) throw new Error("グループが見つかりません");
+        const g = await getGroupOrThrow(db, args.target_id);
         if (g.status !== "active") throw new Error("解散したグループには議題を投稿できません");
         seq = g.nextSeq;
         const stmts: [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]] = [
@@ -4429,11 +4738,7 @@ export const Actions = {
         await db.batch(stmts);
       }
       await setMeta(db, `topic_pending:${args.target_kind}:${args.target_id}`, "");
-      await clearDraft(db, args.target_kind, args.target_id);
-      const requestId = await ensureAutoRequest(db, args.target_kind, args.target_id);
-      ctx.invalidateQueries();
-      // 生成の開始は signalAll と同一の共通経路（runSignalAll）を通す。
-      await runSignalAll(ctx, db);
+      const requestId = await finishPost(ctx, db, args.target_kind, args.target_id);
       return { ok: true, seq, request_id: requestId };
     },
   }),
@@ -4456,7 +4761,7 @@ export const Actions = {
   // ----------------------------------------------------- mediation API
 
   getWorkItems: defineAction({
-    description: "仲介用: pending の返信リクエストと、生成に必要な材料（システムプロンプト・ユーザープロンプト）を組み立てて返します。",
+    description: "仲介用: pending の返信リクエストと、生成に必要な材料（システムプロンプト・ユーザープロンプト）を組み立てて返します。各 item の engine は全体設定「返信を考えるAI」（claude = 分離Claude Codeで生成し model を --model に渡す / muse = 仲介エージェント自身が材料に従って返信文を考えて completeRequest へ代入する）で、model は engine が claude の時に使うモデル（sonnet / opus / haiku / auto。auto の時は --model を付けず Claude Code 側の既定のモデル選択に任せる）です。",
     request: z.object({}),
     response: z.object({
       items: z.array(
@@ -4466,12 +4771,16 @@ export const Actions = {
           target_name: z.string(),
           system_prompt: z.string(),
           user_prompt: z.string(),
+          engine: z.string(),
+          model: z.string(),
         }),
       ),
     }),
     async handler(ctx) {
       const db = getDb(ctx);
       await sweepTimeouts(db);
+      // 返信を考えるAI（設計書 v3.5）: 全 item 共通で、組み立て時点の全体設定を使う。
+      const ai = await readReplyAiSettings(db);
       const pendings = await db
         .select()
         .from(schema.replyRequests)
@@ -4506,6 +4815,10 @@ export const Actions = {
             (m) => !targetIds.has(m.id) && !(m.speaker === "user" && m.seq > req.uptoSeq),
           );
           const history = historyRange(c.useHistory === 1, c.historyBoundarySeq, historyCandidates);
+          // フレーバー: このチャットで指定されているフレーバー全件を、絶対の
+          // ルールとしてキャラクター設定の直後へ含める。フレーバーが無い
+          // チャットのプロンプトは従来と同一。
+          const chatFlavorSection = flavorPromptSection(parseFlavors(c.flavors));
           const systemPrompt = [
             "あなたは、キャラクター本人として1対1の会話を楽しむための返答を書きます。以下の「キャラクター設定」が絶対の基準です。会話の流れで、口調・性格・設定・関係性が変わることはありません。",
             "",
@@ -4514,7 +4827,9 @@ export const Actions = {
             ...(c.relationText
               ? ["", "--- 対話相手との関係・呼び方（この相手にだけ適用する） ---", c.relationText]
               : []),
-            "",
+            // フレーバーセクションは末尾の空行まで含むため、区切りの空行は
+            // フレーバーが無い時だけここで足す。
+            ...(chatFlavorSection.length ? ["", ...chatFlavorSection] : [""]),
             "--- 返答のルール ---",
             "- 返答本文だけを返す。前置き、説明、引用、マークダウン、名前の見出しは付けない。",
             "- 普段は140字程度で、文脈上必要な場合だけ最大500字まで。",
@@ -4533,14 +4848,15 @@ export const Actions = {
           ].join("\n");
           // プロンプトの全体ログ記録はサーバ側でここで行う（v2.1）。仲介の
           // 転送に依存しないため、手動・自動とも確実に履歴へ残る。
-          await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt);
+          // 対象名とAI設定は組み立て中のものを持っているため、再読せず渡す。
+          await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt, { ai, targetName: `${c.displayName}（1対1）` });
           // 履歴なし生成の記録（設計書 v3.2）: completeRequest が保存時に
           // 区切り線の印を付けるために使う。組み立てのたびに同じ値で上書きする。
           await db
             .update(schema.replyRequests)
             .set({ noHistory: c.useHistory === 1 ? 0 : 1 })
             .where(eq(schema.replyRequests.id, req.id));
-          items.push({ request_id: req.id, target_kind: "chat", target_name: c.displayName, system_prompt: systemPrompt, user_prompt: userPrompt });
+          items.push({ request_id: req.id, target_kind: "chat", target_name: c.displayName, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model });
         } else {
           const grows = await db.select().from(schema.groups).where(eq(schema.groups.id, req.targetId));
           const g = grows[0];
@@ -4593,16 +4909,18 @@ export const Actions = {
           // グループのプロンプトは従来と完全に同一にする。
           const allowGuests = g.allowGuests === 1;
           const allowMobs = g.allowMobs === 1;
+          // 送信するゲスト候補は、参加者と完全に同じカテゴリに直接属する
+          // キャラだけに絞る（2026-11-26、祖先・子孫への展開はしない）。
+          // 全員分を送ると無駄が多いため。
           let guestCandidates: CharacterRow[] = [];
           if (allowGuests) {
             const memberIds = new Set(present.map((m) => m.characterId));
-            const allChars = await db.select().from(schema.characters);
-            guestCandidates = allChars.filter((c) => !memberIds.has(c.id));
+            guestCandidates = await guestPromptCandidateRows(db, memberIds);
           }
           const guestMobSections: string[] =
             allowGuests && guestCandidates.length
               ? [
-                  "--- ゲスト候補（このアプリに登録済みの、参加者以外のキャラクター） ---",
+                  "--- ゲスト候補（このアプリに登録済みの、参加者と同カテゴリのキャラクター） ---",
                   ...guestCandidates.map((c) => `【${c.displayName}】\n${c.settingsText.slice(0, GUEST_SETTINGS_LIMIT)}`),
                   "",
                 ]
@@ -4617,7 +4935,7 @@ export const Actions = {
           }
           if (allowGuests) {
             guestMobRules.push(
-              "- ゲスト: 参加キャラクター以外のキャラクターが、場面に応じてゲストとして登場して発言することがあります。ゲストの発言も「名前：セリフ」の形式で、そのキャラクターの名前で書いてください。上の「ゲスト候補」にいるキャラクターを登場させる時は、その設定に沿って演じてください。ゲスト候補にいない実在のキャラクター（作品の登場人物など）をゲストとして登場させても構いません。",
+              "- ゲスト: 参加キャラクター以外のキャラクターが、場面に応じてゲストとして登場して発言することがあります。ゲストの発言も「名前：セリフ」の形式で、そのキャラクターの名前で書いてください。「ゲスト候補」に挙がっているキャラクター（参加者と同カテゴリの登録キャラクター）を登場させる時は、その設定に沿って演じてください。ゲスト候補にいない実在のキャラクター（作品の登場人物など）をゲストとして登場させても構いません。",
             );
           }
           if (allowMobs) {
@@ -4678,15 +4996,18 @@ export const Actions = {
             "- キャラクター同士の関係は、設定に無い場合は初対面として振る舞い、捏造しない。",
             `- ${RULE_NO_FABRICATION}。${RULE_NO_DISCLOSURE}。`,
           ].join("\n");
-          // 背景情報（設計書 v2.0 / C）: グループの背景情報は、通常生成・自動生成の
-          // どちらでも、またプロンプト変種によらず、システムプロンプトへ常時含める。
-          const backgroundSection = g.backgroundText.trim()
-            ? ["--- 背景情報 ---", g.backgroundText.trim(), ""]
-            : [];
+          // フレーバー（旧「背景情報」）: グループで指定されているフレーバー
+          // 全件は、通常生成・自動生成のどちらでも、またプロンプト変種に
+          // よらず、システムプロンプトへ常時含める。適用度（2026-11-26、
+          // 利用者指定）は旧背景情報と同じ3条（絶対のルール／履歴が沿って
+          // いなくても今後は必ず従う／内容そのものはキャラクター自身が認識
+          // しておらず台詞で直接口にしない）を全フレーバーへ適用する。
+          // フレーバーが無いグループのプロンプトは従来と同一のまま。
+          const flavorSection = flavorPromptSection(parseFlavors(g.flavors));
           // ゲスト・モブの材料は、上の3つのプロンプト変種すべてへ末尾に足す（v1.24）。
           // ナレーションのルールも同じく末尾に足す（v3.1）。
-          // 背景情報もゲスト・モブもナレーションも無いグループでは systemPromptBase のまま（従来と同一）。
-          const extraSections = [...backgroundSection, ...guestMobSections];
+          // フレーバーもゲスト・モブもナレーションも無いグループでは systemPromptBase のまま（従来と同一）。
+          const extraSections = [...flavorSection, ...guestMobSections];
           const systemPrompt =
             extraSections.length || guestMobRules.length || narrationRules.length
               ? `${systemPromptBase}\n\n${[
@@ -4702,39 +5023,40 @@ export const Actions = {
             if (m.kind === "narration") return `${NARRATION_MARKER}${m.body}`;
             return `（話者不明）: ${m.body}`;
           };
+          // ユーザープロンプトは3変種とも「履歴の見出し＋履歴＋空行」の頭が共通で、
+          // 末尾（開始指示／なりきり発言／話題・指示）だけがモードで変わる。
+          const historyHead = [
+            "--- これまでの掛け合い（直近） ---",
+            ...(history.length ? history.map(historyLine) : ["（履歴なし）"]),
+            "",
+          ];
           const userPrompt = isAuto
             ? [
-                "--- これまでの掛け合い（直近） ---",
-                ...(history.length ? history.map(historyLine) : ["（履歴なし）"]),
-                "",
+                ...historyHead,
                 "--- 会話開始の指示 ---",
-                "新しい話題の提供はありません。背景情報と、これまでの掛け合いを材料に、キャラクター同士で自由に会話を始めてください。",
+                "新しい話題の提供はありません。フレーバーと、これまでの掛け合いを材料に、キャラクター同士で自由に会話を始めてください。",
               ].join("\n")
             : rpChar
             ? [
-                "--- これまでの掛け合い（直近） ---",
-                ...(history.length ? history.map(historyLine) : ["（履歴なし）"]),
-                "",
+                ...historyHead,
                 `--- 今回の「${rpChar.displayName}」の発言（利用者がなりきりで書いたもの） ---`,
                 ...target.map((m) => `${m.speakerName}: ${m.body}`),
                 "",
                 "この発言に続く掛け合いを書いてください。",
               ].join("\n")
             : [
-                "--- これまでの掛け合い（直近） ---",
-                ...(history.length ? history.map(historyLine) : ["（履歴なし）"]),
-                "",
+                ...historyHead,
                 "--- 今回の話題・指示 ---",
                 ...target.map((m) => m.body),
               ].join("\n");
           // プロンプトの全体ログ記録はサーバ側でここで行う（v2.1、チャット側と同じ）。
-          await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt);
+          await ensureGenerationPromptLog(db, req, systemPrompt, userPrompt, { ai, targetName: `グループ「${g.name}」` });
           // 履歴なし生成の記録（設計書 v3.2）: チャット側と同じ。
           await db
             .update(schema.replyRequests)
             .set({ noHistory: g.useHistory === 1 ? 0 : 1 })
             .where(eq(schema.replyRequests.id, req.id));
-          items.push({ request_id: req.id, target_kind: "group", target_name: g.name, system_prompt: systemPrompt, user_prompt: userPrompt });
+          items.push({ request_id: req.id, target_kind: "group", target_name: g.name, system_prompt: systemPrompt, user_prompt: userPrompt, engine: ai.engine, model: ai.model });
         }
       }
       return { items };
@@ -4792,14 +5114,7 @@ export const Actions = {
       if (!req || req.status !== "processing") return { accepted: false, saved_messages: 0 };
       const output = args.output.trim();
       const failWith = async (reason: string, detail = "") => {
-        await db
-          .update(schema.replyRequests)
-          .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
-          .where(eq(schema.replyRequests.id, req.id));
-        await materializeFailedDraft(db, req, reason);
-        // 全体ログ（設計書 v2.0 / D）: 失敗時は生レスポンスが無いため理由のみ記録する。
-        await appendGenerationLog(db, req, "失敗", `理由: ${reason}`);
-        await closeOutAutoRequest(db, req, false, reason);
+        await failRequestRow(db, req, reason, detail, { logText: `理由: ${reason}`, closeOut: true });
         ctx.invalidateQueries();
         return { accepted: true, saved_messages: 0 };
       };
@@ -4863,24 +5178,17 @@ export const Actions = {
       const memberRows = await groupMemberRows(db, g.id);
       const present = memberRows.filter((m) => m.character);
       // ゲスト・モブ（v1.24）: 許可されているグループでは、名簿外の名前形の行も
-      // ゲスト／モブの発言として受理する。ゲストが登録済みキャラ（参加者は除く）に
-      // 当たれば、そのキャラとして characterId を付ける（アイコン・設定の参照用）。
+      // ゲスト／モブの発言として受理する。登録済みキャラとの名前照合はしない
+      // （2026-11-26 再調整で廃止）: ゲストは同名の登録キャラとは結び付けず、
+      // characterId=null のまま保存され、画面では頭文字アバターで表示される。
       const extraSpeakers = g.allowGuests === 1 || g.allowMobs === 1;
-      let guestCandidates: { characterId: number; displayName: string; name: string }[] = [];
-      if (g.allowGuests === 1) {
-        const memberIds = new Set(present.map((m) => m.characterId));
-        const allChars = await db.select().from(schema.characters);
-        guestCandidates = allChars
-          .filter((c) => !memberIds.has(c.id))
-          .map((c) => ({ characterId: c.id, displayName: c.displayName, name: c.name }));
-      }
       // ナレーション（v3.1）: 許可されているグループでは「【ナレーション】」行を
       // 発言者を持たない narration として分けて保存する。
       const allowNarration = g.allowNarration === 1;
       const { lines, abnormal } = splitGroupOutput(
         output,
         present.map((m) => ({ characterId: m.characterId, displayName: m.character!.displayName })),
-        extraSpeakers || allowNarration ? { extraSpeakers, guestCandidates, allowNarration } : undefined,
+        extraSpeakers || allowNarration ? { extraSpeakers, allowNarration } : undefined,
       );
       let seq = g.nextSeq;
       const stmts: BatchItem<"sqlite">[] = [];
@@ -4953,20 +5261,12 @@ export const Actions = {
       const rows = await db.select().from(schema.replyRequests).where(eq(schema.replyRequests.id, args.request_id));
       const req = rows[0];
       if (!req || (req.status !== "pending" && req.status !== "processing")) return { ok: false };
-      const res = await db
-        .update(schema.replyRequests)
-        .set({ status: "failed", failReason: args.reason, failDetail: (args.detail ?? "").trim(), finishedAt: new Date() })
-        .where(
-          and(
-            eq(schema.replyRequests.id, args.request_id),
-            inArray(schema.replyRequests.status, ["pending", "processing"]),
-          ),
-        )
-        .returning({ id: schema.replyRequests.id });
-      if (res.length) {
-        await materializeFailedDraft(db, req, args.reason);
-        await appendGenerationLog(db, req, "失敗", `理由: ${args.reason}`);
-        await closeOutAutoRequest(db, req, false, args.reason);
+      const ok = await failRequestRow(db, req, args.reason, (args.detail ?? "").trim(), {
+        fromStatuses: ["pending", "processing"],
+        logText: `理由: ${args.reason}`,
+        closeOut: true,
+      });
+      if (ok) {
         // ログイン切れ（トークン切れ）は全体設定にかかわらず Claude へ通知する（v2.1）。
         if (args.reason === "auth_error") {
           const name = await requestTargetName(db, req);
@@ -4974,7 +5274,7 @@ export const Actions = {
         }
       }
       ctx.invalidateQueries();
-      return { ok: res.length > 0 };
+      return { ok };
     },
   }),
 
@@ -5155,19 +5455,10 @@ export const Actions = {
       const rev = rows[0];
       if (!rev || rev.status !== "processing") return { accepted: false, outcome: "" };
       const failWith = async (reason: string, detail = "") => {
-        await db
-          .update(schema.reviews)
-          .set({ status: "failed", failReason: reason, failDetail: detail, finishedAt: new Date() })
-          .where(and(eq(schema.reviews.id, rev.id), eq(schema.reviews.status, "processing")));
-        const fcrows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
-        await addAppLog(
-          db,
-          "review",
-          `レビュー結果: ${fcrows[0]?.displayName ?? "（削除済みのキャラクター）"}（失敗）`,
-          `指摘: ${rev.feedback}\n結果: 見直しに失敗しました（理由: ${reason}）。設定は変更されていません。`,
-          "character",
-          rev.characterId,
-        );
+        await failReviewRow(db, rev, reason, detail, {
+          fromStatuses: ["processing"],
+          logResult: `結果: 見直しに失敗しました（理由: ${reason}）。設定は変更されていません。`,
+        });
         ctx.invalidateQueries();
         return { accepted: true, outcome: "failed" };
       };
@@ -5199,7 +5490,8 @@ export const Actions = {
       } catch {
         beforeParsed = {};
       }
-      const diff = diffProfiles(beforeParsed, parsed);
+      const diff: DiffEntry[] = [];
+      collectDiff("", beforeParsed, parsed, diff);
       if (!diff.length) {
         await db
           .update(schema.reviews)
@@ -5271,37 +5563,20 @@ export const Actions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = getDb(ctx);
-      const res = await db
-        .update(schema.reviews)
-        .set({ status: "failed", failReason: args.reason, failDetail: (args.detail ?? "").trim(), finishedAt: new Date() })
-        .where(
-          and(
-            eq(schema.reviews.id, args.review_id),
-            inArray(schema.reviews.status, ["pending", "processing"]),
-          ),
-        )
-        .returning({ id: schema.reviews.id });
-      if (res.length) {
-        const rrows = await db.select().from(schema.reviews).where(eq(schema.reviews.id, args.review_id));
-        const rev = rrows[0];
-        if (rev) {
-          const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
-          await addAppLog(
-            db,
-            "review",
-            `レビュー結果: ${crows[0]?.displayName ?? "（削除済みのキャラクター）"}（失敗）`,
-            `指摘: ${rev.feedback}\n結果: 見直しに失敗しました（理由: ${args.reason}）。設定は変更されていません。`,
-            "character",
-            rev.characterId,
-          );
-          // ログイン切れ（トークン切れ）は全体設定にかかわらず Claude へ通知する（v2.1）。
-          if (args.reason === "auth_error") {
-            await notifyAuthFailure(db, `${crows[0]?.displayName ?? "キャラクター"}の設定見直し`);
-          }
-        }
+      const rrows = await db.select().from(schema.reviews).where(eq(schema.reviews.id, args.review_id));
+      const rev = rrows[0];
+      if (!rev) return { ok: false };
+      const ok = await failReviewRow(db, rev, args.reason, (args.detail ?? "").trim(), {
+        fromStatuses: ["pending", "processing"],
+        logResult: `結果: 見直しに失敗しました（理由: ${args.reason}）。設定は変更されていません。`,
+      });
+      if (ok && args.reason === "auth_error") {
+        // ログイン切れ（トークン切れ）は全体設定にかかわらず Claude へ通知する（v2.1）。
+        const crows = await db.select().from(schema.characters).where(eq(schema.characters.id, rev.characterId));
+        await notifyAuthFailure(db, `${crows[0]?.displayName ?? "キャラクター"}の設定見直し`);
       }
       ctx.invalidateQueries();
-      return { ok: res.length > 0 };
+      return { ok };
     },
   }),
 
@@ -5369,13 +5644,16 @@ export const Actions = {
         .insert(schema.schedules)
         .values(scheduleInputToValues(args))
         .returning({ id: schema.schedules.id });
+      // 新規チャット型で指定されたフレーバーは「新しく指定された」ものとして
+      // フレーバー履歴へ登録する（すでに履歴にある同一内容は登録されない）。
+      if (args.target_type === "new") await registerFlavorHistory(db, args.flavors);
       ctx.invalidateQueries();
       return { id: ins[0]!.id };
     },
   }),
 
   updateSchedule: defineAction({
-    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・背景情報）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
+    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・フレーバー）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
     request: scheduleInputSchema.extend({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
@@ -5387,6 +5665,8 @@ export const Actions = {
         .update(schema.schedules)
         .set({ ...scheduleInputToValues(args), updatedAt: new Date() })
         .where(eq(schema.schedules.id, args.id));
+      // 作成時と同様、新規チャット型で新しく指定されたフレーバーは履歴へ登録する。
+      if (args.target_type === "new") await registerFlavorHistory(db, args.flavors);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5414,22 +5694,7 @@ export const Actions = {
       const s = rows[0];
       if (!s) throw new Error("スケジュールが見つかりません");
       if (args.enabled) {
-        await validateScheduleInput(db, {
-          name: s.name,
-          enabled: true,
-          frequency: s.frequency,
-          weekdays: parseJsonIntArray(s.weekdays),
-          times: parseJsonStringArray(s.times),
-          target_type: s.targetType,
-          target_group_id: s.targetGroupId,
-          category_ids: parseJsonIntArray(s.categoryIds),
-          min_members: s.minMembers,
-          max_members: s.maxMembers,
-          allow_guests: s.allowGuests === 1,
-          allow_mobs: s.allowMobs === 1,
-          allow_narration: s.allowNarration === 1,
-          background_text: s.backgroundText,
-        });
+        await validateScheduleInput(db, { ...scheduleRowToInput(s), enabled: true });
       }
       await db
         .update(schema.schedules)
@@ -5474,22 +5739,37 @@ export const Actions = {
   // ----------------------------------------------------- 全体設定（v2.1）
 
   getGlobalSettings: defineAction({
-    description: "全体設定を返します。notify_reply は「返信が届いたらClaudeに通知する」の ON/OFF です（既定は OFF）。Claudeのログイン切れによる生成失敗の通知は、この設定にかかわらず送られます。",
+    description: "全体設定を返します。notify_reply は「返信が届いたらMuseに通知する」の ON/OFF です（既定は OFF）。Claudeのログイン切れによる生成失敗の通知は、この設定にかかわらず送られます。reply_engine は「返信を考えるAI」（claude = 分離Claude Code、既定 / muse = 見張り役のClaudeが自分で考える）で、全チャット・グループ共通です。claude_model は reply_engine が claude の時に使うモデル（sonnet = 既定 / opus / haiku / auto = モデルを指定せず Claude Code 側の既定の選択に任せる）です。レビューの見直しと「自動」の議題作成は reply_engine の影響を受けません。",
     request: z.object({}),
-    response: z.object({ notify_reply: z.boolean() }),
+    response: z.object({
+      notify_reply: z.boolean(),
+      reply_engine: z.enum(REPLY_ENGINES),
+      claude_model: z.enum(CLAUDE_MODELS),
+    }),
     async handler(ctx) {
       const db = getDb(ctx);
-      return { notify_reply: (await getMeta(db, "pref_notify_reply")) === "1" };
+      const ai = await readReplyAiSettings(db);
+      return {
+        notify_reply: (await getMeta(db, "pref_notify_reply")) === "1",
+        reply_engine: ai.engine,
+        claude_model: ai.model,
+      };
     },
   }),
 
   saveGlobalSettings: defineAction({
-    description: "全体設定を保存します。notify_reply=true で、返信が届いた時にClaudeへ通知メッセージを送るようになります。",
-    request: z.object({ notify_reply: z.boolean() }),
+    description: "全体設定を保存します。notify_reply=true で、返信が届いた時にMuseへ通知メッセージを送るようになります。reply_engine / claude_model は「返信を考えるAI」の選択で、省略した項目は現在の値を維持します。",
+    request: z.object({
+      notify_reply: z.boolean(),
+      reply_engine: z.enum(REPLY_ENGINES).optional(),
+      claude_model: z.enum(CLAUDE_MODELS).optional(),
+    }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
       await setMeta(db, "pref_notify_reply", args.notify_reply ? "1" : "0");
+      if (args.reply_engine !== undefined) await setMeta(db, REPLY_ENGINE_KEY, args.reply_engine);
+      if (args.claude_model !== undefined) await setMeta(db, CLAUDE_MODEL_KEY, args.claude_model);
       ctx.invalidateQueries();
       return { ok: true };
     },
