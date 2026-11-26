@@ -1,8 +1,14 @@
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type InputHTMLAttributes, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim, setFailureNoticeText } from "@hatch/space-sdk/client";
 import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
 import type { Actions } from "../../server/src/actions";
+import {
+  categoryAncestorIds,
+  categoryDescendantIds,
+  pruneAncestorCategoryIds as pruneAncestorCategoryIdsShared,
+  type CategoryTreeNode,
+} from "../../server/src/category-tree";
 import { api, type ApiResponse } from "./api";
 import { TEXTS as T } from "./display-texts";
 
@@ -42,11 +48,26 @@ const FAIL_REASONS: Record<string, string> = {
   rate_limited: T.failReasons.rateLimited,
   auth_error: T.failReasons.authError,
   generation_error: T.failReasons.generationError,
-  pending_timeout: "返信の生成が始まらないまま時間切れになりました。時間をおいて再度お試しください",
+  pending_timeout: T.failReasons.pendingTimeout,
 };
 
+/** 失敗理由コード→表示文の共通解決（理由マップ→詳細つき文→フォールバック）。 */
+function labelFrom(
+  map: Record<string, string>,
+  reason: string,
+  withDetail: (reason: string) => string,
+  fallback: string,
+): string {
+  return map[reason] ?? (reason ? withDetail(reason) : fallback);
+}
+
 function failReasonLabel(reason: string): string {
-  return FAIL_REASONS[reason] ?? (reason ? T.failReasons.withDetail(reason) : T.failReasons.fallback);
+  return labelFrom(FAIL_REASONS, reason, T.failReasons.withDetail, T.failReasons.fallback);
+}
+
+/** エラーから表示用メッセージを取り出す（Error でなければ fallback を使う）。 */
+function errMsg(e: unknown, fallback: string): string {
+  return e instanceof Error ? e.message : fallback;
 }
 
 function formatClock(iso: string): string {
@@ -67,6 +88,59 @@ function formatElapsed(totalSeconds: number): string {
   const m = Math.floor(totalSeconds / 60);
   if (m < 60) return T.elapsed.minutes(m);
   return T.elapsed.hoursMinutes(Math.floor(m / 60), m % 60);
+}
+
+/** 現在時刻を一定間隔で更新する（経過時間の表示用）。enabled の間だけ回す。 */
+function useNow(enabled: boolean, intervalMs = 5000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const t = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(t);
+  }, [enabled, intervalMs]);
+  return now;
+}
+
+/** ISO日時から現在時刻までの経過秒（負にはならない）。 */
+function elapsedSecondsSince(iso: string | null | undefined, now: number): number {
+  if (!iso) return 0;
+  return Math.max(0, Math.floor((now - new Date(iso).getTime()) / 1000));
+}
+
+/**
+ * 一括取り込みの状態まわり（一覧と取り込みシートで共用）: キック、状態の
+ * ポーリング、running→done/failed 遷移時の一覧再取得、取り込み中の
+ * 経過表示用の現在時刻。
+ */
+function useImportStatus() {
+  const queryClient = useQueryClient();
+  const importKick = useMutation({
+    mutationFn: async () => await api.requestImport({}),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+      queryClient.invalidateQueries({ queryKey: ["import-status"] });
+    },
+  });
+  // 一括取り込みのステータス（ローカル改善4の復元）: 状態をポーリングし、
+  // 取り込み中はバナーを出し、完了・失敗したら一覧を再取得して結果バナーを出す。
+  const importStatus = useQuery({
+    queryKey: ["import-status"],
+    queryFn: () => api.getImportStatus({}),
+    refetchInterval: (q) => (q.state.data?.state === "running" ? 5000 : 15000),
+  });
+  const prevImportStateRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const st = importStatus.data?.state;
+    if (!st) return;
+    const prev = prevImportStateRef.current;
+    prevImportStateRef.current = st;
+    if ((st === "done" || st === "failed") && prev === "running") {
+      queryClient.invalidateQueries({ queryKey: ["home"] });
+    }
+  }, [importStatus.data?.state, queryClient]);
+  // 取り込み中の経過時間表示用に現在時刻を定期更新する。
+  const now = useNow(importStatus.data?.state === "running");
+  return { importKick, importStatus, now };
 }
 
 // チャット画面のレイアウト固定（v1.16 で整理）: 対策は次の2つだけに絞る。
@@ -149,12 +223,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: boolean }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (request.status !== "pending" && request.status !== "processing") return;
-    const t = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, [request.status]);
+  const now = useNow(request.status === "pending" || request.status === "processing");
   if (request.status === "none") return null;
   if (request.status === "failed") {
     return (
@@ -167,7 +236,7 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
     );
   }
   const elapsed = request.requested_at
-    ? Math.max(0, Math.floor((now - new Date(request.requested_at).getTime()) / 1000))
+    ? elapsedSecondsSince(request.requested_at, now)
     : request.elapsed_seconds;
   return (
     <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
@@ -178,35 +247,114 @@ function RequestBanner({ request, isGroup }: { request: RequestInfo; isGroup?: b
   );
 }
 
-/** 「自動」の議題の出所ラベル（ローカル改善#6: 上流リポジトリには無い）。 */
-const TOPIC_SOURCE_LABELS: Record<string, string> = {
-  news: "時事ネタ",
-  interest: "キャラの興味",
-  profile: "プロフィール",
-  muse: "Museの出来事",
-  context: "会話の流れ",
-  season: "季節・今日は何の日",
-  hypothetical: "もしも・二択",
-  contrast: "キャラ対比",
-};
-
-/** 「自動」の短い説明文（ローカル改善#6改訂）。ボタンのそばと設定シートで共用する。 */
-const AUTO_TOPIC_HINT =
-  "トークの前ならランダムな議題、トーク中なら会話にちなんだ議題を出します。たまに無関係な話も出ます。";
-
 /** 「自動」の議題の投稿カード（ローカル改善）。利用者の発言ともキャラの発言とも
  *  区別できるよう、中央に「自動」と分かる形で表示する。 */
 function TopicCard({ body, source }: { body: string; source: string }) {
-  const label = TOPIC_SOURCE_LABELS[source];
+  const label = T.autoTopic.sourceLabels[source];
   return (
     <div
       className="w-full max-w-[92%] rounded-2xl px-4 py-3"
       style={{ background: "var(--accent-soft)", border: "1.5px dashed var(--gold)" }}
     >
       <p className="text-xs font-black" style={{ color: "var(--gold)" }}>
-        自動{label ? `（${label}）` : ""}
+        {T.autoTopic.cardHeading(label)}
       </p>
       <p className="mt-1 text-base whitespace-pre-wrap" style={{ color: "var(--text)" }}>{body}</p>
+    </div>
+  );
+}
+
+/** 送信取り消しボタン（返信待ちの間だけ、対象の利用者発言の下に出る）。
+ *  1対1／グループの各発言分岐で同じ見た目・文言を使うため部品化する。 */
+function CancelSendButton({
+  onCancel,
+  pending,
+  selfStart,
+}: {
+  onCancel: () => void;
+  pending: boolean;
+  selfStart?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onCancel}
+      disabled={pending}
+      aria-label={T.chat.cancelSendAria}
+      className={
+        selfStart
+          ? "mt-1 self-start rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+          : "mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+      }
+      style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
+    >
+      {T.chat.cancelSend}
+    </button>
+  );
+}
+
+/** ゲスト・モブ・ナレーションの許可チェック3点セット（スケジュール作成・
+ * グループ作成・グループ設定で共用）。variant は行の見た目:
+ * "simple" はラベルだけの行、"described" は説明つきの行。 */
+type GuestMobFlags = { guests: boolean; mobs: boolean; narration: boolean };
+
+function GuestMobToggles({
+  value,
+  onChange,
+  labels,
+  variant,
+  containerClassName,
+}: {
+  value: GuestMobFlags;
+  onChange: (next: GuestMobFlags) => void;
+  labels: {
+    guests: string;
+    mobs: string;
+    narration: string;
+    guestsDesc?: string;
+    mobsDesc?: string;
+    narrationDesc?: string;
+  };
+  variant: "simple" | "described";
+  containerClassName: string;
+}) {
+  const rows = [
+    { key: "guests" as const, checked: value.guests, aria: T.guestMob.allowGuestsAria, label: labels.guests, desc: labels.guestsDesc },
+    { key: "mobs" as const, checked: value.mobs, aria: T.guestMob.allowMobsAria, label: labels.mobs, desc: labels.mobsDesc },
+    { key: "narration" as const, checked: value.narration, aria: T.guestMob.allowNarrationAria, label: labels.narration, desc: labels.narrationDesc },
+  ];
+  return (
+    <div className={containerClassName}>
+      {rows.map((r) =>
+        variant === "described" ? (
+          <label key={r.key} className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: r.checked ? "var(--accent-soft)" : "var(--surface-alt)" }}>
+            <input
+              type="checkbox"
+              checked={r.checked}
+              onChange={(e) => onChange({ ...value, [r.key]: e.target.checked })}
+              aria-label={r.aria}
+              className="mt-0.5 h-5 w-5 shrink-0"
+            />
+            <span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>{r.label}</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+                {r.desc}
+              </span>
+            </span>
+          </label>
+        ) : (
+          <label key={r.key} className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: r.checked ? "var(--accent-soft)" : "transparent" }}>
+            <input
+              type="checkbox"
+              checked={r.checked}
+              onChange={(e) => onChange({ ...value, [r.key]: e.target.checked })}
+              aria-label={r.aria}
+              className="h-5 w-5 shrink-0"
+            />
+            <span className="font-bold" style={{ color: "var(--text)" }}>{r.label}</span>
+          </label>
+        ),
+      )}
     </div>
   );
 }
@@ -237,18 +385,18 @@ function AutoTopicSheet({
       queryClient.invalidateQueries({ queryKey: [targetKind === "chat" ? "chat" : "group", targetId] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "保存に失敗しました"),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label="自動の設定">
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.autoTopic.sheetAria}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>自動の設定</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.autoTopic.sheetTitle}</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>{targetName}</p>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          「自動」は、話題を自動で出してくれる機能です。{AUTO_TOPIC_HINT}出所は、時事ネタ（人気記事から）・キャラのプロフィールや興味・季節や今日は何の日・もしもや二択・キャラ同士の対比などです。
+          {T.autoTopic.sheetIntro(T.autoTopic.hint)}
         </p>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          自動投稿をオンにすると、会話が一区切りして、あなたの入力待ちのまま30分動きがなかった時に、議題が1つ自動で投稿されてキャラクターが反応します。あなたの発言がないままの自動投稿は連続3回までで止まり、あなたが発言すると数え直します。生成中・返信待ちの間は投稿されません。
+          {T.autoTopic.sheetAutoPostDesc}
         </p>
         <div className="mt-4 flex flex-col gap-2">
           <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: enabled ? "var(--accent-soft)" : "var(--surface-alt)" }}>
@@ -256,13 +404,13 @@ function AutoTopicSheet({
               type="checkbox"
               checked={enabled}
               onChange={(e) => setEnabled(e.target.checked)}
-              aria-label="自動の自動投稿をオンにする"
+              aria-label={T.autoTopic.autoPostToggleAria}
               className="mt-0.5 h-5 w-5 shrink-0"
             />
             <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>自動投稿</span>
+              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.autoTopic.autoPostLabel}</span>
               <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                入力待ちが30分続いたら、議題を自動で投稿します（既定はオフ）。
+                {T.autoTopic.autoPostDesc}
               </span>
             </span>
           </label>
@@ -270,7 +418,7 @@ function AutoTopicSheet({
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            キャンセル
+            {T.common.cancel}
           </button>
           <button
             type="button"
@@ -279,7 +427,7 @@ function AutoTopicSheet({
             className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
             style={{ background: "var(--accent)" }}
           >
-            {save.isPending ? "保存中…" : "保存する"}
+            {save.isPending ? T.common.saving : T.common.save}
           </button>
         </div>
       </div>
@@ -553,7 +701,7 @@ function ImageEditSheet({
       queryClient.invalidateQueries({ queryKey: ["group"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
 
   const baseScale = img ? Math.max(CROP_VIEW / img.naturalWidth, CROP_VIEW / img.naturalHeight) : 1;
@@ -774,7 +922,7 @@ function CharacterMenuSheet({
     { label: T.characterMenu.editImage, description: T.characterMenu.editImageDesc, onSelect: onEditImage },
     { label: T.characterMenu.rename, description: T.characterMenu.renameDesc, onSelect: onRename },
     { label: T.characterMenu.setCategory, description: T.characterMenu.setCategoryDesc, onSelect: onSetCategory },
-    { label: "自動の設定", description: "トークの前ならランダム、トーク中なら会話にちなんだ議題を自動で出します。入力待ちが30分続いた時の自動投稿もここで設定します（このキャラとの会話だけの設定です）", onSelect: onAutoTopic },
+    { label: T.autoTopic.menuLabel, description: T.autoTopic.menuDescChat, onSelect: onAutoTopic },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.characterMenu.menuAria(character.display_name)}>
@@ -1041,7 +1189,7 @@ function CharacterSettingsEditForm({
       queryClient.invalidateQueries({ queryKey: ["character-settings-form", character.id] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
 
   const submit = () => {
@@ -1255,27 +1403,43 @@ function CharacterSettingsEditSheet({ character, onClose }: { character: Charact
 }
 
 /** 表示名の変更シート。設定本文・会話履歴には影響しない。 */
-function RenameCharacterSheet({ character, onClose }: { character: CharacterItem; onClose: () => void }) {
+/** 名前変更シートの共通形（キャラの表示名／グループ名で共用）。
+ * 文言・入力欄の属性・保存処理・保存後に無効化するクエリは呼び出し側から渡す。 */
+function RenameSheet({
+  texts,
+  inputId,
+  fieldProps,
+  currentName,
+  onSave,
+  invalidateKeys,
+  onClose,
+}: {
+  texts: { title: string; description: string; label: string; nameRequired: string };
+  inputId: string;
+  fieldProps: Record<string, unknown>;
+  currentName: string;
+  onSave: (name: string) => Promise<unknown>;
+  invalidateKeys: unknown[][];
+  onClose: () => void;
+}) {
   const queryClient = useQueryClient();
-  const [name, setName] = useState(character.display_name);
+  const [name, setName] = useState(currentName);
   const [error, setError] = useState("");
   const rename = useMutation({
-    mutationFn: async (displayName: string) => await api.renameCharacter({ character_id: character.id, display_name: displayName }),
+    mutationFn: async (v: string) => await onSave(v),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-      queryClient.invalidateQueries({ queryKey: ["chat", character.id] });
-      queryClient.invalidateQueries({ queryKey: ["group"] });
+      for (const key of invalidateKeys) queryClient.invalidateQueries({ queryKey: key });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
+    onError: (e) => setError(errMsg(e, T.common.changeFailed)),
   });
   const submit = () => {
     const v = name.trim();
     if (!v) {
-      setError(T.renameCharacter.nameRequired);
+      setError(texts.nameRequired);
       return;
     }
-    if (v === character.display_name) {
+    if (v === currentName) {
       onClose();
       return;
     }
@@ -1283,18 +1447,18 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
     rename.mutate(v);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.renameCharacter.title}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={texts.title}>
       <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.renameCharacter.title}</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{texts.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          {T.renameCharacter.description}
+          {texts.description}
         </p>
-        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="rename-display-name">
-          {T.renameCharacter.label}
+        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor={inputId}>
+          {texts.label}
         </label>
         <input
-          id="rename-display-name"
-          {...FIELDS.renameCharacter.display_name}
+          id={inputId}
+          {...(fieldProps as InputHTMLAttributes<HTMLInputElement>)}
           value={name}
           onChange={(e) => setName(e.target.value)}
           className="mt-1 w-full rounded-2xl px-3 py-2.5"
@@ -1317,6 +1481,20 @@ function RenameCharacterSheet({ character, onClose }: { character: CharacterItem
         </div>
       </div>
     </div>
+  );
+}
+
+function RenameCharacterSheet({ character, onClose }: { character: CharacterItem; onClose: () => void }) {
+  return (
+    <RenameSheet
+      texts={T.renameCharacter}
+      inputId="rename-display-name"
+      fieldProps={FIELDS.renameCharacter.display_name}
+      currentName={character.display_name}
+      onSave={async (v) => await api.renameCharacter({ character_id: character.id, display_name: v })}
+      invalidateKeys={[["home"], ["chat", character.id], ["group"]]}
+      onClose={onClose}
+    />
   );
 }
 
@@ -1358,41 +1536,22 @@ function categoryTreeEntries(categories: CategoryItem[]): CategoryTreeEntry[] {
   return out;
 }
 
+// カテゴリ木ロジック（子孫展開・祖先集合・祖先除外）の実体は、サーバと共用の
+// 純粋関数モジュール（server/src/category-tree）が正（冗長性レビュー B-6 で
+// 一本化。以前は両側にほぼ逐語の二重実装があった）。ここでは応答の形
+// （parent_id）を共用モジュールの形（parentId）へ写して委譲するだけにする。
+function toCategoryTreeNodes(categories: CategoryItem[]): CategoryTreeNode[] {
+  return categories.map((c) => ({ id: c.id, parentId: c.parent_id ?? null }));
+}
+
 /** カテゴリ id の子孫ID集合（自分自身を含む）。絞り込みの共通判定に使う（v1.26）。 */
 function categoryDescendantIdSet(categories: CategoryItem[], id: number): Set<number> {
-  const childrenByParent = new Map<number, number[]>();
-  for (const c of categories) {
-    if (c.parent_id != null) {
-      const arr = childrenByParent.get(c.parent_id) ?? [];
-      arr.push(c.id);
-      childrenByParent.set(c.parent_id, arr);
-    }
-  }
-  const out = new Set<number>([id]);
-  const stack = [id];
-  while (stack.length) {
-    const cur = stack.pop()!;
-    for (const child of childrenByParent.get(cur) ?? []) {
-      if (!out.has(child)) {
-        out.add(child);
-        stack.push(child);
-      }
-    }
-  }
-  return out;
+  return categoryDescendantIds(toCategoryTreeNodes(categories), id);
 }
 
 /** カテゴリ id の祖先ID集合（親・祖父…。自分自身は含まない）（v1.27・設計書 v1.7.1）。 */
 function categoryAncestorIdSet(categories: CategoryItem[], id: number): Set<number> {
-  const parentById = new Map(categories.map((c) => [c.id, c.parent_id ?? null]));
-  const out = new Set<number>();
-  let cur = parentById.get(id) ?? null;
-  while (cur != null && !out.has(cur)) {
-    out.add(cur);
-    cur = parentById.get(cur) ?? null;
-  }
-  out.delete(id);
-  return out;
+  return categoryAncestorIds(toCategoryTreeNodes(categories), id);
 }
 
 /**
@@ -1400,19 +1559,58 @@ function categoryAncestorIdSet(categories: CategoryItem[], id: number): Set<numb
  * サーバ側の強制と同じ規則を、割り当てシートの初期表示・操作にも適用する。
  */
 function pruneAncestorCategoryIds(categories: CategoryItem[], ids: number[]): number[] {
-  const set = new Set(ids);
-  return ids.filter((id) => {
-    for (const other of set) {
-      if (other !== id && categoryAncestorIdSet(categories, other).has(id)) return false;
-    }
-    return true;
-  });
+  return pruneAncestorCategoryIdsShared(toCategoryTreeNodes(categories), ids);
 }
 
 /** キャラがカテゴリ filterId（その子孫カテゴリを含む）に属するか（v1.26）。 */
 function charMatchesCategory(c: CharacterItem, categories: CategoryItem[], filterId: number): boolean {
   const set = categoryDescendantIdSet(categories, filterId);
   return charCategoryIds(c).some((cid) => set.has(cid));
+}
+
+/** カテゴリ絞り込みの値: "all" = 全員 / "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。 */
+type CategoryFilter = "all" | "none" | number;
+
+/** キャラがカテゴリ絞り込みに一致するか（一覧・グループ作成・参加者変更で共用）。 */
+function charMatchesFilter(c: CharacterItem, categories: CategoryItem[], filter: CategoryFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "none") return charCategoryIds(c).length === 0;
+  return charMatchesCategory(c, categories, filter);
+}
+
+/** カテゴリ絞り込みセレクト（ラベル＋セレクト）。値の相互変換もここで担う。 */
+function CategoryFilterSelect({
+  id,
+  categories,
+  value,
+  onChange,
+}: {
+  id: string;
+  categories: CategoryItem[];
+  value: CategoryFilter;
+  onChange: (next: CategoryFilter) => void;
+}) {
+  return (
+    <>
+      <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor={id}>{T.common.category}</label>
+      <select
+        id={id}
+        value={value === "all" ? "all" : value === "none" ? "none" : String(value)}
+        onChange={(e) => {
+          const v = e.target.value;
+          onChange(v === "all" ? "all" : v === "none" ? "none" : Number(v));
+        }}
+        className="rounded-full px-3 py-1.5 text-sm font-bold"
+        style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+      >
+        <option value="all">{T.common.all}</option>
+        {categoryTreeEntries(categories).map(({ cat, depth }) => (
+          <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
+        ))}
+        <option value="none">{T.common.uncategorized}</option>
+      </select>
+    </>
+  );
 }
 
 /** セレクトの選択肢表示用の階段式ラベル（深さぶん全角スペースで字下げする）。 */
@@ -1440,7 +1638,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setError("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.categoryManage.addFailed),
+    onError: (e) => setError(errMsg(e, T.categoryManage.addFailed)),
   });
   const update = useMutation({
     mutationFn: async (v: { category_id: number; name: string; parent_id: number | null }) =>
@@ -1450,7 +1648,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setError("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
   const del = useMutation({
     mutationFn: async (id: number) => await api.deleteCategory({ category_id: id }),
@@ -1458,7 +1656,7 @@ function CategoryManageSheet({ categories, onClose }: { categories: CategoryItem
       setConfirmDelete(null);
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.deleteFailed),
+    onError: (e) => setError(errMsg(e, T.common.deleteFailed)),
   });
   const submit = () => {
     const v = name.trim();
@@ -1676,7 +1874,7 @@ function CategoryAssignSheet({
 }) {
   const queryClient = useQueryClient();
   const [error, setError] = useState("");
-  const rawInitialIds: number[] = character.category_ids ?? (character.category_id != null ? [character.category_id] : []);
+  const rawInitialIds: number[] = character.category_ids;
   // 初期表示も祖先除外ルールでそろえる（子と祖先が両方付いた古いデータは子だけ表示）。
   const initialIds: number[] = pruneAncestorCategoryIds(categories, rawInitialIds);
   const [selectedIds, setSelectedIds] = useState<number[]>(initialIds);
@@ -1686,7 +1884,7 @@ function CategoryAssignSheet({
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.categoryAssign.setFailed),
+    onError: (e) => setError(errMsg(e, T.categoryAssign.setFailed)),
   });
   const toggle = (id: number) => {
     setSelectedIds((prev) => {
@@ -1796,13 +1994,10 @@ function CategoryAssignSheet({
 
 type ReviewHistoryData = ApiResponse<typeof api, "getReviewHistory">;
 
-// 表示文は display-texts.ts に集約（設計書 v3.3）。ここでは参照だけを持つ。
-const REVIEW_STATUS_LABELS: Record<string, string> = T.review.statusLabels;
-
-const REVIEW_FAIL_REASONS: Record<string, string> = T.review.failReasons;
-
+// 表示文は display-texts.ts に集約（設計書 v3.3）。失敗理由の解決は
+// 返信側の failReasonLabel と共通の labelFrom を使う。
 function reviewFailLabel(reason: string): string {
-  return REVIEW_FAIL_REASONS[reason] ?? (reason ? T.review.failWithDetail(reason) : T.review.failFallback);
+  return labelFrom(T.review.failReasons, reason, T.review.failWithDetail, T.review.failFallback);
 }
 
 function formatDateTime(iso: string): string {
@@ -1918,7 +2113,7 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
       queryClient.invalidateQueries({ queryKey: ["chat"] });
       queryClient.invalidateQueries({ queryKey: ["group"] });
     },
-    onError: (e) => setRevertError(e instanceof Error ? e.message : T.reviewHistory.revertFailed),
+    onError: (e) => setRevertError(errMsg(e, T.reviewHistory.revertFailed)),
   });
   const copyJson = async (reviewId: number, json: string) => {
     try {
@@ -1959,7 +2154,7 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
                     color: r.status === "failed" ? "var(--danger)" : r.status === "done" ? "var(--gold)" : "var(--dim)",
                   }}
                 >
-                  {REVIEW_STATUS_LABELS[r.status] ?? r.status}
+                  {T.review.statusLabels[r.status] ?? r.status}
                 </span>
                 <span className="text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(r.created_at)}・{r.target_kind === "group" ? T.reviewHistory.groupMessage : T.reviewHistory.chatMessage}</span>
                 {r.revision?.reverted_at && (
@@ -2056,28 +2251,15 @@ function ReviewHistorySheet({ characterId, characterName, onClose }: { character
 
 type CharSort = "added" | "gojuon" | "recent";
 
-function loadCharSort(): CharSort {
-  try {
-    const v = window.localStorage.getItem("chara-chat.char-sort");
-    return v === "gojuon" || v === "recent" ? v : "added";
-  } catch {
-    return "added";
-  }
-}
-
-function loadCompact(): boolean {
-  try {
-    return window.localStorage.getItem("chara-chat.char-compact") === "1";
-  } catch {
-    return false;
-  }
-}
-
-// 並び替え・簡易表示の選択は、画面遷移で HomeView がアンマウントされても
-// 失われないようセッション内（モジュールスコープ）にも保持する（設計書 v1.8 / 4.8章）。
-// localStorage は埋め込み表示で保持されないことがあり、サーバ値の反映は
-// 一覧データの再取得タイミングに左右されるため、この画面で選んだ値を
-// その場で正として保持し、一覧へ戻った時に即座にその並びで表示する。
+// 並び替え・簡易表示の選択の保持は「サーバ保存値（meta）＋セッション内
+// （モジュールスコープ）ストア」に一本化した（冗長性レビュー B-7: 以前は
+// useState／モジュール変数／localStorage／サーバ値／React Query キャッシュ
+// への setQueryData の5系統で保持していた）。localStorage は埋め込み表示で
+// 保持されず実質的に初期値しか返さなかったため、その読み書きを撤去しても
+// 表示の挙動は変わらない。セッション内ストアは、画面遷移で HomeView が
+// アンマウントされても選択が失われず、一覧へ戻った時に即座にその並びで
+// 表示するために残す（設計書 v1.8 / 4.8章）。永続化の正はサーバ値で、
+// 一覧データ取得後に（この画面で変更していなければ）反映される。
 let sessionSort: CharSort | null = null;
 let sessionCompact: boolean | null = null;
 
@@ -2088,10 +2270,9 @@ let sessionGroupPage = 0;
 // 画面遷移で失われないようセッション内に保持する。
 let sessionHomeTab: "personal" | "group" = "personal";
 
-/** キャラが属するカテゴリID一覧（旧データ互換: category_ids が無ければ category_id から作る）。 */
+/** キャラが属するカテゴリID一覧（正はサーバが返す category_ids のみ。旧カラム由来のフォールバックは撤去済み）。 */
 function charCategoryIds(c: CharacterItem): number[] {
-  if (Array.isArray(c.category_ids)) return c.category_ids;
-  return c.category_id != null ? [c.category_id] : [];
+  return c.category_ids;
 }
 
 /** 選択中の並び替えでキャラ配列を並べ替える（一覧とグループ作成で共用）。 */
@@ -2173,9 +2354,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
   const [autoTopicChar, setAutoTopicChar] = useState<CharacterItem | null>(null);
   const [showCategoryManage, setShowCategoryManage] = useState(false);
   // カテゴリ絞り込み: "all" = 全て表示 / "none" = 未分類のみ / 数値 = そのカテゴリのみ。
-  const [categoryFilter, setCategoryFilter] = useState<"all" | "none" | number>("all");
-  const [sort, setSort] = useState<CharSort>(() => sessionSort ?? loadCharSort());
-  const [compact, setCompact] = useState<boolean>(() => sessionCompact ?? loadCompact());
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("all");
+  const [sort, setSort] = useState<CharSort>(() => sessionSort ?? "added");
+  const [compact, setCompact] = useState<boolean>(() => sessionCompact ?? false);
   // 一覧上部のタブ: 個人（キャラとの1対1）/ グループ。選んだ方のチャットだけ表示する。
   const [homeTab, setHomeTab] = useState<"personal" | "group">(sessionHomeTab);
   const changeHomeTab = (t: "personal" | "group") => {
@@ -2192,16 +2373,24 @@ function HomeView({ go }: { go: (v: View) => void }) {
   const schedulesQuery = useQuery({ queryKey: ["schedules"], queryFn: () => api.listSchedules({}), refetchInterval: 30000 });
   const [scheduleSheet, setScheduleSheet] = useState<{ mode: "create" } | { mode: "edit"; schedule: ScheduleItem } | null>(null);
   // 全体設定（v2.1）: 返信が届いたらClaudeへ通知する ON/OFF。サーバ側（meta）に保存する。
+  // 返信を考えるAI（v3.5）: reply_engine（claude / muse）と、claude の時の
+  // モデル claude_model も同じ全体設定に含まれる。全項目をまとめて送る。
   const globalSettings = useQuery({ queryKey: ["global-settings"], queryFn: () => api.getGlobalSettings({}) });
   const saveGlobalSettings = useMutation({
-    mutationFn: async (v: { notify_reply: boolean }) => await api.saveGlobalSettings(v),
+    mutationFn: async (v: { notify_reply: boolean; reply_engine: "claude" | "muse"; claude_model: "sonnet" | "opus" | "haiku" | "auto" }) =>
+      await api.saveGlobalSettings(v),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["global-settings"] }),
   });
+  const settingsNotify = globalSettings.data?.notify_reply ?? false;
+  const settingsEngine = globalSettings.data?.reply_engine ?? "claude";
+  const settingsModel = globalSettings.data?.claude_model ?? "sonnet";
+  const saveSettings = (patch: Partial<{ notify_reply: boolean; reply_engine: "claude" | "muse"; claude_model: "sonnet" | "opus" | "haiku" | "auto" }>) =>
+    saveGlobalSettings.mutate({ notify_reply: settingsNotify, reply_engine: settingsEngine, claude_model: settingsModel, ...patch });
 
-  // 並び替え・簡易表示の選択はサーバ側（meta）にも保存し、次回開いた時に復元する。
-  // この端末の localStorage は埋め込み表示では保持されないことがあるため、
-  // サーバ保存を正とする。利用者がこの画面で変更した後は、サーバ値で上書きしない。
-  // あわせてセッション内ストアと一覧キャッシュにも即時反映し、チャット画面へ
+  // 並び替え・簡易表示の選択はサーバ側（meta）に保存し、次回開いた時に復元する
+  // （永続化の正はサーバ値。B-7 で localStorage の読み書きは撤去した）。
+  // 利用者がこの画面で変更した後は、サーバ値で上書きしない（prefsTouchedRef）。
+  // 変更時はセッション内ストアと一覧キャッシュにも即時反映し、チャット画面へ
   // 遷移して戻った時も手動更新なしで選択中の並び順で表示されるようにする
   // （設計書 v1.8 / 4.8章）。
   const prefsTouchedRef = useRef(sessionSort !== null || sessionCompact !== null);
@@ -2216,17 +2405,12 @@ function HomeView({ go }: { go: (v: View) => void }) {
     sessionCompact = serverCompact;
     setSort(serverSort);
     setCompact(serverCompact);
-    try {
-      window.localStorage.setItem("chara-chat.char-sort", serverSort);
-      window.localStorage.setItem("chara-chat.char-compact", serverCompact ? "1" : "0");
-    } catch { /* ローカル保存は補助。失敗してもサーバ値で表示する */ }
   }, [serverSort, serverCompact]);
 
   const changeSort = (v: CharSort) => {
     prefsTouchedRef.current = true;
     sessionSort = v;
     setSort(v);
-    try { window.localStorage.setItem("chara-chat.char-sort", v); } catch { /* 保存できなくても並び替え自体は効く */ }
     // 一覧キャッシュにも即時反映する（戻ってきた時に古い値で上書きされないように）。
     queryClient.setQueryData<Home>(["home"], (old) => (old ? { ...old, char_sort: v } : old));
     savePrefs.mutate({ char_sort: v, char_compact: compact });
@@ -2235,7 +2419,6 @@ function HomeView({ go }: { go: (v: View) => void }) {
     prefsTouchedRef.current = true;
     sessionCompact = v;
     setCompact(v);
-    try { window.localStorage.setItem("chara-chat.char-compact", v ? "1" : "0"); } catch { /* 同上 */ }
     queryClient.setQueryData<Home>(["home"], (old) => (old ? { ...old, char_compact: v } : old));
     savePrefs.mutate({ char_sort: sort, char_compact: v });
   };
@@ -2278,7 +2461,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
     },
     onError: (e) => {
       setConfirmDeleteGroup(null);
-      setDeleteGroupError(e instanceof Error ? e.message : T.home.groupDeleteFailed);
+      setDeleteGroupError(errMsg(e, T.home.groupDeleteFailed));
     },
   });
   // グループの「今すぐランダム作成」（ローカル改善#7改訂: 上流リポジトリには無い）。
@@ -2294,44 +2477,14 @@ function HomeView({ go }: { go: (v: View) => void }) {
       queryClient.invalidateQueries({ queryKey: ["home"] });
       openView({ kind: "group", groupId: r.id, unreadFromSeq: null });
     },
-    onError: (e) => setAutoCreateError(e instanceof Error ? e.message : "グループの作成に失敗しました"),
+    onError: (e) => setAutoCreateError(errMsg(e, T.home.groupCreateFailed)),
   });
   // 「スケジュールで自動作成」ボタン: 同じグループタブ内にあるスケジュール
   // 管理セクションへのスクロール先。
   const scheduleSectionRef = useRef<HTMLDivElement>(null);
-  const importKick = useMutation({
-    mutationFn: async () => await api.requestImport({}),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-      queryClient.invalidateQueries({ queryKey: ["import-status"] });
-    },
-  });
-  // 一括取り込みのステータス（ローカル改善4の復元）: 状態をポーリングし、
-  // 取り込み中はバナーを出し、完了・失敗したら一覧を再取得して結果バナーを出す。
-  const importStatus = useQuery({
-    queryKey: ["import-status"],
-    queryFn: () => api.getImportStatus({}),
-    refetchInterval: (q) => (q.state.data?.state === "running" ? 5000 : 15000),
-  });
+  const { importKick, importStatus, now: importNow } = useImportStatus();
   const [importBannerDismissedFor, setImportBannerDismissedFor] = useState<string | null>(null);
   const importFinishedKey = importStatus.data?.finished_at ?? null;
-  const prevImportStateRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    const st = importStatus.data?.state;
-    if (!st) return;
-    const prev = prevImportStateRef.current;
-    prevImportStateRef.current = st;
-    if ((st === "done" || st === "failed") && prev === "running") {
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-    }
-  }, [importStatus.data?.state, queryClient]);
-  // 取り込み中の経過時間表示用に現在時刻を定期更新する。
-  const [importNow, setImportNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (importStatus.data?.state !== "running") return;
-    const t = setInterval(() => setImportNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, [importStatus.data?.state]);
   if (home.isPending) {
     return <p className="px-4 py-12 text-center text-sm" style={{ color: "var(--dim)" }}>{T.common.loading}</p>;
   }
@@ -2367,18 +2520,17 @@ function HomeView({ go }: { go: (v: View) => void }) {
   // 表示する。「未分類」はカテゴリが1つも無いキャラ。
   // グループ作成のキャラ選択はこの一覧設定とは独立（シート内でカテゴリ絞り込みを持ち、
   // 並びは常に五十音順。v1.23）。
-  const displayedCharacters: CharacterItem[] = (() => {
-    if (categoryFilter === "none") return sortCharactersBy(characters.filter((c) => charCategoryIds(c).length === 0), sort);
-    if (categoryFilter !== "all") return sortCharactersBy(characters.filter((c) => charMatchesCategory(c, categories, categoryFilter)), sort);
-    return sortCharactersBy(characters, sort);
-  })();
+  const displayedCharacters: CharacterItem[] = sortCharactersBy(
+    characters.filter((c) => charMatchesFilter(c, categories, categoryFilter)),
+    sort,
+  );
 
   // 「今すぐランダム作成」の実行（ローカル改善#7改訂）。キャラが3人未満なら
   // 作成せず、理由と現在の人数を表示する（サーバ側でも同じ文言で弾く）。
   // 3人以上ならサーバ側の共通経路で即作成する（抽選はサーバ側）。
   const handleAutoCreateGroup = () => {
     if (characters.length < 3) {
-      setAutoCreateError(`グループを自動作成するにはキャラクターが3人以上必要です（現在${characters.length}人）。キャラを追加してください。`);
+      setAutoCreateError(T.home.randomCreateNeedChars(characters.length));
       return;
     }
     setAutoCreateError("");
@@ -2538,7 +2690,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         <div className="mt-3 rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
           {T.importStatus.runningBanner(
             importStatus.data.started_at
-              ? formatElapsed(Math.max(0, Math.floor((importNow - new Date(importStatus.data.started_at).getTime()) / 1000)))
+              ? formatElapsed(elapsedSecondsSince(importStatus.data.started_at, importNow))
               : "",
           )}
         </div>
@@ -2594,23 +2746,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
             >
               {T.home.compactToggle(compact)}
             </button>
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="char-category-filter">{T.common.category}</label>
-            <select
-              id="char-category-filter"
-              value={categoryFilter === "all" ? "all" : categoryFilter === "none" ? "none" : String(categoryFilter)}
-              onChange={(e) => {
-                const v = e.target.value;
-                setCategoryFilter(v === "all" ? "all" : v === "none" ? "none" : Number(v));
-              }}
-              className="rounded-full px-3 py-1.5 text-sm font-bold"
-              style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
-            >
-              <option value="all">{T.common.all}</option>
-              {categoryTreeEntries(categories).map(({ cat, depth }) => (
-                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
-              ))}
-              <option value="none">{T.common.uncategorized}</option>
-            </select>
+            <CategoryFilterSelect id="char-category-filter" categories={categories} value={categoryFilter} onChange={setCategoryFilter} />
             <button
               type="button"
               onClick={() => setShowCategoryManage(true)}
@@ -2701,25 +2837,25 @@ function HomeView({ go }: { go: (v: View) => void }) {
               disabled={autoCreateGroup.isPending}
               className="rounded-2xl px-3 py-2.5 text-left disabled:opacity-50"
               style={{ background: "var(--surface-alt)", color: "var(--text)" }}
-              aria-label="今すぐランダム作成"
+              aria-label={T.home.randomCreateNow}
             >
-              <span className="block text-sm font-bold">{autoCreateGroup.isPending ? "作成中…" : "今すぐランダム作成"}</span>
-              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>押した瞬間に、ランダムな顔ぶれで作ります</span>
+              <span className="block text-sm font-bold">{autoCreateGroup.isPending ? T.home.randomCreating : T.home.randomCreateNow}</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.home.randomCreateNowDesc}</span>
             </button>
             <button
               type="button"
               onClick={() => scheduleSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
               className="rounded-2xl px-3 py-2.5 text-left"
               style={{ background: "var(--surface-alt)", color: "var(--text)" }}
-              aria-label="スケジュールで自動作成"
+              aria-label={T.home.randomCreateBySchedule}
             >
-              <span className="block text-sm font-bold">スケジュールで自動作成</span>
-              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>決めた時刻に、自動で作り続けます</span>
+              <span className="block text-sm font-bold">{T.home.randomCreateBySchedule}</span>
+              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.home.randomCreateByScheduleDesc}</span>
             </button>
           </div>
           {characters.length < 3 && (
             <p className="mt-2 text-sm leading-relaxed" role="status" style={{ color: "var(--danger)" }}>
-              グループを自動作成するにはキャラクターが3人以上必要です（現在{characters.length}人）。キャラを追加してください。
+              {T.home.randomCreateNeedChars(characters.length)}
             </p>
           )}
           {autoCreateError && characters.length >= 3 && (
@@ -2843,9 +2979,9 @@ function HomeView({ go }: { go: (v: View) => void }) {
         <label className="mt-3 flex items-start gap-3">
           <input
             type="checkbox"
-            checked={globalSettings.data?.notify_reply ?? false}
+            checked={settingsNotify}
             disabled={globalSettings.isPending || saveGlobalSettings.isPending}
-            onChange={(e) => saveGlobalSettings.mutate({ notify_reply: e.target.checked })}
+            onChange={(e) => saveSettings({ notify_reply: e.target.checked })}
             aria-label={T.home.notifyReply}
             className="mt-0.5 h-5 w-5 shrink-0"
             style={{ accentColor: "var(--accent)" }}
@@ -2857,6 +2993,53 @@ function HomeView({ go }: { go: (v: View) => void }) {
             </span>
           </span>
         </label>
+
+        {/* 返信を考えるAI（v3.5）: 通知設定の下に置く全体適用の選択。
+            Claude の時だけモデルのプルダウンを出し、選択中のAIの注意点を
+            その下に表示する。Muse の時はモデル欄自体を出さない
+            （実行側のモデルはアプリからは選べないため）。 */}
+        <div className="mt-5">
+          <label className="text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="reply-engine">{T.home.replyEngine}</label>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <select
+              id="reply-engine"
+              {...FIELDS.saveGlobalSettings.reply_engine}
+              value={settingsEngine}
+              disabled={globalSettings.isPending || saveGlobalSettings.isPending}
+              onChange={(e) => saveSettings({ reply_engine: e.target.value as "claude" | "muse" })}
+              className="rounded-full px-3 py-1.5 text-sm font-bold"
+              style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              <option value="claude">{T.home.engineClaude}</option>
+              <option value="muse">{T.home.engineMuse}</option>
+            </select>
+            {settingsEngine === "claude" && (
+              <>
+                <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="claude-model">{T.home.claudeModel}</label>
+                <select
+                  id="claude-model"
+                  {...FIELDS.saveGlobalSettings.claude_model}
+                  value={settingsModel}
+                  disabled={globalSettings.isPending || saveGlobalSettings.isPending}
+                  onChange={(e) => saveSettings({ claude_model: e.target.value as "sonnet" | "opus" | "haiku" | "auto" })}
+                  className="rounded-full px-3 py-1.5 text-sm font-bold"
+                  style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                >
+                  <option value="sonnet">Sonnet</option>
+                  <option value="opus">Opus</option>
+                  <option value="haiku">Haiku</option>
+                  <option value="auto">{T.home.claudeModelAuto}</option>
+                </select>
+              </>
+            )}
+          </div>
+          <p className="mt-2 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+            {T.home.replyEngineDesc}
+          </p>
+          <p className="mt-2 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+            {settingsEngine === "muse" ? T.home.engineMuseCaution : T.home.engineClaudeCaution}
+          </p>
+        </div>
         {saveGlobalSettings.isError && (
           <p className="mt-2 text-xs font-bold" style={{ color: "var(--danger)" }}>{T.home.globalSettingsSaveFailed}</p>
         )}
@@ -2905,7 +3088,7 @@ function HomeView({ go }: { go: (v: View) => void }) {
         <AutoTopicSheet
           targetKind="chat"
           targetId={autoTopicChar.id}
-          targetName={`${autoTopicChar.display_name}とのチャット`}
+          targetName={T.autoTopic.chatTargetName(autoTopicChar.display_name)}
           currentEnabled={autoTopicChar.auto_topic_enabled}
           onClose={() => setAutoTopicChar(null)}
         />
@@ -2987,11 +3170,10 @@ function extractProfileImageUrl(text: string): string | undefined {
 // ------------------------------------------------------------------ scheduling (v2.0 / B)
 
 // 曜日ラベルは display-texts.ts に集約（設計書 v3.3）。
-const WEEKDAY_LABELS = T.schedule.weekdayLabels;
 
 function scheduleSummary(s: ScheduleItem): string {
   const freq = s.frequency === "weekly"
-    ? T.schedule.freqWeekly(s.weekdays.map((d) => WEEKDAY_LABELS[d] ?? "").filter(Boolean).join("・"))
+    ? T.schedule.freqWeekly(s.weekdays.map((d) => T.schedule.weekdayLabels[d] ?? "").filter(Boolean).join("・"))
     : T.schedule.freqDaily;
   const target = s.target_type === "existing"
     ? (s.target_group_name ? T.schedule.targetExisting(s.target_group_name) : T.schedule.targetMissing)
@@ -3024,7 +3206,7 @@ function SchedulingSection({
       setError("");
       queryClient.invalidateQueries({ queryKey: ["schedules"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.schedule.toggleFailed),
+    onError: (e) => setError(errMsg(e, T.schedule.toggleFailed)),
   });
   const del = useMutation({
     mutationFn: async (id: number) => await api.deleteSchedule({ id }),
@@ -3033,7 +3215,7 @@ function SchedulingSection({
       setError("");
       queryClient.invalidateQueries({ queryKey: ["schedules"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.deleteFailed),
+    onError: (e) => setError(errMsg(e, T.common.deleteFailed)),
   });
   const schedules = data?.schedules ?? [];
   return (
@@ -3134,7 +3316,7 @@ function SchedulingSection({
   );
 }
 
-/** スケジュールの作成・編集シート。スケジュール側ではキャラを指定しない（対象チャットの設定を参照するため）。新規チャット型の時だけカテゴリ・人数・背景情報を指定する。 */
+/** スケジュールの作成・編集シート。スケジュール側ではキャラを指定しない（対象チャットの設定を参照するため）。新規チャット型の時だけカテゴリ・人数・フレーバーを指定する。 */
 function ScheduleEditSheet({
   initial,
   eligibleGroups,
@@ -3161,15 +3343,17 @@ function ScheduleEditSheet({
   const [allowGuests, setAllowGuests] = useState(initial?.allow_guests ?? false);
   const [allowMobs, setAllowMobs] = useState(initial?.allow_mobs ?? false);
   const [allowNarration, setAllowNarration] = useState(initial?.allow_narration ?? false);
-  const [backgroundText, setBackgroundText] = useState(initial?.background_text ?? "");
+  const [flavors, setFlavors] = useState<string[]>(initial?.flavors ?? []);
   const [error, setError] = useState("");
 
+  // 生成時刻は保存用・検証用で同じ整形（空白除去・空欄除去）を使うため1回だけ計算する。
+  const cleanedTimes = times.map((t) => t.trim()).filter(Boolean);
   const buildPayload = () => ({
     name: name.trim(),
     enabled,
     frequency,
     weekdays,
-    times: times.map((t) => t.trim()).filter(Boolean),
+    times: cleanedTimes,
     target_type: targetType,
     target_group_id: targetType === "existing" ? targetGroupId : null,
     category_ids: categoryIds,
@@ -3178,7 +3362,7 @@ function ScheduleEditSheet({
     allow_guests: allowGuests,
     allow_mobs: allowMobs,
     allow_narration: allowNarration,
-    background_text: backgroundText,
+    flavors,
   });
   const save = useMutation({
     mutationFn: async () => {
@@ -3189,11 +3373,11 @@ function ScheduleEditSheet({
       queryClient.invalidateQueries({ queryKey: ["schedules"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
   const submit = () => {
     if (!name.trim()) { setError(T.scheduleEdit.nameRequired); return; }
-    if (times.map((t) => t.trim()).filter(Boolean).length === 0) { setError(T.scheduleEdit.timeRequired); return; }
+    if (cleanedTimes.length === 0) { setError(T.scheduleEdit.timeRequired); return; }
     if (frequency === "weekly" && weekdays.length === 0) { setError(T.scheduleEdit.weekdayRequired); return; }
     if (targetType === "existing" && targetGroupId == null) { setError(T.scheduleEdit.targetGroupRequired); return; }
     // ローカル改善: 新規チャット型でカテゴリ未指定の場合は全キャラが対象になるため、未指定でも保存できる。
@@ -3261,7 +3445,7 @@ function ScheduleEditSheet({
         </div>
         {frequency === "weekly" && (
           <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label={T.scheduleEdit.weekdaysAria}>
-            {WEEKDAY_LABELS.map((label, d) => {
+            {T.schedule.weekdayLabels.map((label, d) => {
               const on = weekdays.includes(d);
               return (
                 <button
@@ -3435,35 +3619,20 @@ function ScheduleEditSheet({
               </select>
             </div>
             <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.guestMobNarrationHeading}</p>
-            <div className="mt-2 flex flex-col gap-1">
-              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
-                <input type="checkbox" checked={allowGuests} onChange={(e) => setAllowGuests(e.target.checked)} aria-label={T.guestMob.allowGuestsAria} className="h-5 w-5 shrink-0" />
-                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.guestsOn}</span>
-              </label>
-              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowMobs ? "var(--accent-soft)" : "transparent" }}>
-                <input type="checkbox" checked={allowMobs} onChange={(e) => setAllowMobs(e.target.checked)} aria-label={T.guestMob.allowMobsAria} className="h-5 w-5 shrink-0" />
-                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.mobsOn}</span>
-              </label>
-              <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
-                <input type="checkbox" checked={allowNarration} onChange={(e) => setAllowNarration(e.target.checked)} aria-label={T.guestMob.allowNarrationAria} className="h-5 w-5 shrink-0" />
-                <span className="font-bold" style={{ color: "var(--text)" }}>{T.schedule.narrationOn}</span>
-              </label>
-            </div>
-            <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }}>
-              {T.scheduleEdit.backgroundLabel}
-              <textarea
-                {...F.background_text}
-                value={backgroundText}
-                onChange={(e) => setBackgroundText(e.target.value)}
-                rows={4}
-                placeholder={T.scheduleEdit.backgroundPlaceholder}
-                className="mt-1 w-full rounded-2xl px-3 py-2.5 font-normal"
-                style={editInputStyle}
-              />
-            </label>
+            <GuestMobToggles
+              containerClassName="mt-2 flex flex-col gap-1"
+              variant="simple"
+              value={{ guests: allowGuests, mobs: allowMobs, narration: allowNarration }}
+              onChange={(v) => { setAllowGuests(v.guests); setAllowMobs(v.mobs); setAllowNarration(v.narration); }}
+              labels={{ guests: T.schedule.guestsOn, mobs: T.schedule.mobsOn, narration: T.schedule.narrationOn }}
+            />
+            <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.scheduleEdit.flavorsHeading}</p>
             <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-              {T.scheduleEdit.backgroundNote}
+              {T.scheduleEdit.flavorsNote}
             </p>
+            <div className="mt-2">
+              <FlavorListEditor value={flavors} onChange={setFlavors} />
+            </div>
           </div>
         )}
 
@@ -3490,7 +3659,6 @@ function ScheduleEditSheet({
 // ------------------------------------------------------------------ app logs (v2.0 / D)
 
 // 種別ラベルは display-texts.ts に集約（設計書 v3.3）。
-const LOG_KIND_LABELS: Record<string, string> = T.logs.kindLabels;
 
 function LogBody({ id }: { id: number }) {
   const q = useQuery({ queryKey: ["app-log", id], queryFn: () => api.getAppLogBody({ id }) });
@@ -3555,7 +3723,7 @@ function LogsView({ back }: { back: () => void }) {
                 className="flex w-full items-center gap-2 text-left"
               >
                 <span className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
-                  {LOG_KIND_LABELS[l.kind] ?? l.kind}
+                  {T.logs.kindLabels[l.kind] ?? l.kind}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-sm font-bold" style={{ color: "var(--text)" }}>{l.title}</span>
                 <span className="shrink-0 text-xs" style={{ color: "var(--dim)" }}>{formatDateTime(l.created_at)}</span>
@@ -3582,38 +3750,9 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
       setJson("");
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.importSheet.importFailed),
+    onError: (e) => setError(errMsg(e, T.importSheet.importFailed)),
   });
-  const importKick = useMutation({
-    mutationFn: async () => await api.requestImport({}),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-      queryClient.invalidateQueries({ queryKey: ["import-status"] });
-    },
-  });
-  // 一括取り込みのステータス（ローカル改善4の復元）: シートを開いている間も
-  // ポーリングし、閉じて開き直してもサーバ側の状態がそのまま分かる。
-  const importStatus = useQuery({
-    queryKey: ["import-status"],
-    queryFn: () => api.getImportStatus({}),
-    refetchInterval: (q) => (q.state.data?.state === "running" ? 5000 : 15000),
-  });
-  const prevSheetImportStateRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    const st = importStatus.data?.state;
-    if (!st) return;
-    const prev = prevSheetImportStateRef.current;
-    prevSheetImportStateRef.current = st;
-    if ((st === "done" || st === "failed") && prev === "running") {
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-    }
-  }, [importStatus.data?.state, queryClient]);
-  const [sheetNow, setSheetNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (importStatus.data?.state !== "running") return;
-    const t = setInterval(() => setSheetNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, [importStatus.data?.state]);
+  const { importKick, importStatus, now: sheetNow } = useImportStatus();
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.importSheet.title}>
       <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
@@ -3667,7 +3806,7 @@ function ImportSheet({ onClose }: { onClose: () => void }) {
             <p className="mt-2 text-xs" style={{ color: "var(--dim)" }} role="status">
               {T.importStatus.runningBanner(
                 importStatus.data.started_at
-                  ? formatElapsed(Math.max(0, Math.floor((sheetNow - new Date(importStatus.data.started_at).getTime()) / 1000)))
+                  ? formatElapsed(elapsedSecondsSince(importStatus.data.started_at, sheetNow))
                   : "",
               )} {T.importStatus.runningNote}
             </p>
@@ -3698,13 +3837,9 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
   // シート内のカテゴリ絞り込み（v1.23、階層対応 v1.26）: "all" = 未指定（全員）/
   // "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
   // 一覧側の絞り込み・並び替え設定とは独立に持ち、並びは設定に関わらず常に五十音順にする。
-  const [catFilter, setCatFilter] = useState<"all" | "none" | number>("all");
+  const [catFilter, setCatFilter] = useState<CategoryFilter>("all");
   const visibleCharacters = sortCharactersBy(
-    characters.filter((c) => {
-      if (catFilter === "all") return true;
-      if (catFilter === "none") return charCategoryIds(c).length === 0;
-      return charMatchesCategory(c, categories, catFilter);
-    }),
+    characters.filter((c) => charMatchesFilter(c, categories, catFilter)),
     "gojuon",
   );
   const create = useMutation({
@@ -3714,7 +3849,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
       onClose();
       go({ kind: "group", groupId: r.id, unreadFromSeq: null });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.createGroup.createFailed),
+    onError: (e) => setError(errMsg(e, T.createGroup.createFailed)),
   });
   const toggle = (id: number) => {
     setSelected((prev) => {
@@ -3742,23 +3877,7 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.createGroup.membersNote}</p>
         {categories.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-create-category-filter">{T.common.category}</label>
-            <select
-              id="group-create-category-filter"
-              value={catFilter === "all" ? "all" : catFilter === "none" ? "none" : String(catFilter)}
-              onChange={(e) => {
-                const v = e.target.value;
-                setCatFilter(v === "all" ? "all" : v === "none" ? "none" : Number(v));
-              }}
-              className="rounded-full px-3 py-1.5 text-sm font-bold"
-              style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
-            >
-              <option value="all">{T.common.all}</option>
-              {categoryTreeEntries(categories).map(({ cat, depth }) => (
-                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
-              ))}
-              <option value="none">{T.common.uncategorized}</option>
-            </select>
+            <CategoryFilterSelect id="group-create-category-filter" categories={categories} value={catFilter} onChange={setCatFilter} />
             <span className="text-xs" style={{ color: "var(--dim)" }}>{T.common.selectedCount(selected.length)}</span>
           </div>
         )}
@@ -3782,38 +3901,13 @@ function CreateGroupSheet({ characters, categories, onClose, go }: { characters:
         </div>
         <p className="mt-4 text-sm font-bold" style={{ color: "var(--text)" }}>{T.createGroup.guestMobNarrationHeading}</p>
         <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.createGroup.guestMobNarrationNote}</p>
-        <div className="mt-2 flex flex-col gap-1">
-          <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowGuests ? "var(--accent-soft)" : "transparent" }}>
-            <input
-              type="checkbox"
-              checked={allowGuests}
-              onChange={(e) => setAllowGuests(e.target.checked)}
-              aria-label={T.guestMob.allowGuestsAria}
-              className="h-5 w-5 shrink-0"
-            />
-            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.guestLabel}</span>
-          </label>
-          <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowMobs ? "var(--accent-soft)" : "transparent" }}>
-            <input
-              type="checkbox"
-              checked={allowMobs}
-              onChange={(e) => setAllowMobs(e.target.checked)}
-              aria-label={T.guestMob.allowMobsAria}
-              className="h-5 w-5 shrink-0"
-            />
-            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.mobLabel}</span>
-          </label>
-          <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5" style={{ background: allowNarration ? "var(--accent-soft)" : "transparent" }}>
-            <input
-              type="checkbox"
-              checked={allowNarration}
-              onChange={(e) => setAllowNarration(e.target.checked)}
-              aria-label={T.guestMob.allowNarrationAria}
-              className="h-5 w-5 shrink-0"
-            />
-            <span className="font-bold" style={{ color: "var(--text)" }}>{T.createGroup.narrationLabel}</span>
-          </label>
-        </div>
+        <GuestMobToggles
+          containerClassName="mt-2 flex flex-col gap-1"
+          variant="simple"
+          value={{ guests: allowGuests, mobs: allowMobs, narration: allowNarration }}
+          onChange={(v) => { setAllowGuests(v.guests); setAllowMobs(v.mobs); setAllowNarration(v.narration); }}
+          labels={{ guests: T.createGroup.guestLabel, mobs: T.createGroup.mobLabel, narration: T.createGroup.narrationLabel }}
+        />
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
@@ -3855,6 +3949,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
   const [confirmClear, setConfirmClear] = useState(false);
   const [showImageEdit, setShowImageEdit] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showFlavors, setShowFlavors] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
   const [selectedReviewId, setSelectedReviewId] = useState<number | null>(null);
   const [reviewError, setReviewError] = useState("");
@@ -3914,7 +4009,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.sendFailed)),
   });
   // 「自動」ボタン（ローカル改善）: 押すと議題の仲介が起動し、少し遅れて
   // 議題が投稿される。投稿されれば既存の経路で返信生成が始まる。
@@ -3924,7 +4019,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       setTopicError("");
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
     },
-    onError: (e) => setTopicError(e instanceof Error ? e.message : "議題の投下に失敗しました"),
+    onError: (e) => setTopicError(errMsg(e, T.autoTopic.postFailed)),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "chat", target_id: characterId }),
@@ -3941,7 +4036,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.cancelFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.cancelFailed)),
   });
   const clear = useMutation({
     mutationFn: async () => await api.clearChatHistory({ character_id: characterId }),
@@ -3958,7 +4053,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["chat", characterId] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.historyChangeFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.historyChangeFailed)),
   });
   const submitReview = useMutation({
     mutationFn: async (args: { message_id: number; feedback: string }) =>
@@ -3969,7 +4064,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
       setReviewNotice(T.review.registeredNotice);
       queryClient.invalidateQueries({ queryKey: ["reviewHistory", characterId] });
     },
-    onError: (e) => setReviewError(e instanceof Error ? e.message : T.review.submitFailed),
+    onError: (e) => setReviewError(errMsg(e, T.review.submitFailed)),
   });
 
   const data: ChatState | undefined = state.data;
@@ -4053,6 +4148,20 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
             >
               {data.use_history ? T.chat.historyOn : T.chat.historyOff}
             </button>
+            <button
+              type="button"
+              onClick={() => setShowFlavors(true)}
+              aria-label={T.flavors.buttonAria}
+              aria-pressed={data.flavors.length > 0}
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold whitespace-nowrap"
+              style={
+                data.flavors.length > 0
+                  ? { background: "var(--accent)", color: "#fff" }
+                  : { background: "var(--surface)", color: "var(--dim)" }
+              }
+            >
+              {data.flavors.length > 0 ? T.flavors.buttonWithCount(data.flavors.length) : T.flavors.button}
+            </button>
             <ReviewModeToggle
               active={reviewMode}
               onToggle={() => {
@@ -4085,7 +4194,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
 
       {data?.topic_pending && (
         <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
-          議題を準備中です…少し待つと議題が投稿されます。
+          {T.autoTopic.pendingBanner}
         </div>
       )}
 
@@ -4119,16 +4228,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                 <TopicCard body={m.body} source={m.topic_source} />
                 <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
                 {m.id === cancelTargetId && (
-                  <button
-                    type="button"
-                    onClick={() => cancelSend.mutate()}
-                    disabled={cancelSend.isPending}
-                    aria-label="この送信を取り消す"
-                    className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                    style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
-                  >
-                    送信を取り消す
-                  </button>
+                  <CancelSendButton onCancel={() => cancelSend.mutate()} pending={cancelSend.isPending} />
                 )}
               </div>
             ) : m.speaker === "user" ? (
@@ -4138,16 +4238,7 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
                 </div>
                 <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
                 {m.id === cancelTargetId && (
-                  <button
-                    type="button"
-                    onClick={() => cancelSend.mutate()}
-                    disabled={cancelSend.isPending}
-                    aria-label={T.chat.cancelSendAria}
-                    className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                    style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
-                  >
-                    {T.chat.cancelSend}
-                  </button>
+                  <CancelSendButton onCancel={() => cancelSend.mutate()} pending={cancelSend.isPending} />
                 )}
               </div>
             ) : (
@@ -4217,18 +4308,18 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
           </div>
         )}
         <p className="mb-1.5 px-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-          「自動」: {AUTO_TOPIC_HINT}
+          {T.autoTopic.buttonHint(T.autoTopic.hint)}
         </p>
         <div className="flex items-end gap-2 pb-2">
           <button
             type="button"
             disabled={waiting || !!data?.topic_pending || topic.isPending}
             onClick={() => topic.mutate()}
-            aria-label="自動で議題を投下する"
+            aria-label={T.autoTopic.buttonAria}
             className="shrink-0 rounded-full px-3 py-2.5 text-sm font-bold disabled:opacity-50"
             style={{ background: "var(--surface)", color: "var(--accent)", border: "1.5px solid var(--accent)" }}
           >
-            自動
+            {T.autoTopic.buttonLabel}
           </button>
           <label className="sr-only" htmlFor="chat-input">{T.chat.inputLabel}</label>
           <textarea
@@ -4279,6 +4370,15 @@ function ChatView({ characterId, unreadFromSeq, back }: { characterId: number; u
           queryKey={["export-chat", String(characterId)]}
           fetchText={() => api.exportChatText({ character_id: characterId })}
           onClose={() => setShowExport(false)}
+        />
+      )}
+
+      {showFlavors && data && (
+        <FlavorSheet
+          targetKind="chat"
+          targetId={characterId}
+          current={data.flavors}
+          onClose={() => setShowFlavors(false)}
         />
       )}
 
@@ -4334,7 +4434,7 @@ function RoleplaySheet({
       queryClient.invalidateQueries({ queryKey: ["home"] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
   // なりきりに選べるのは、キャラ本体が存在し、現在も参加しているキャラだけ
   // （元参加者は過去の発言の参照用に members へ含まれているだけ）。
@@ -4429,14 +4529,13 @@ function RoleplaySheet({
   );
 }
 
-/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「背景情報を編集する」「自動の設定」「グループを削除」の6つ。履歴の使用設定は設定一覧には無く、グループ画面上部のタブで切り替える。 */
+/** グループ設定メニュー（グループ画面の「設定」ボタンから開く）。項目は「名前を変える」「参加者を変える」「ゲスト・モブ・ナレーションの設定」「自動の設定」「グループを削除」の5つ。フレーバーは設定一覧には置かず、グループ画面上部のボタンから開くシートで選ぶ。履歴の使用設定も設定一覧には無く、グループ画面上部のタブで切り替える。 */
 function GroupMenuSheet({
   groupName,
   onClose,
   onRename,
   onEditMembers,
   onGuestMob,
-  onBackground,
   onAutoTopic,
   onDelete,
 }: {
@@ -4445,7 +4544,6 @@ function GroupMenuSheet({
   onRename: () => void;
   onEditMembers: () => void;
   onGuestMob: () => void;
-  onBackground: () => void;
   onAutoTopic: () => void;
   onDelete: () => void;
 }) {
@@ -4453,7 +4551,6 @@ function GroupMenuSheet({
     { label: T.groupMenu.rename, description: T.groupMenu.renameDesc, onSelect: onRename },
     { label: T.groupMenu.editMembers, description: T.groupMenu.editMembersDesc, onSelect: onEditMembers },
     { label: T.groupMenu.guestMob, description: T.groupMenu.guestMobDesc, onSelect: onGuestMob },
-    { label: T.groupMenu.background, description: T.groupMenu.backgroundDesc, onSelect: onBackground },
     { label: T.groupMenu.autoTopic, description: T.groupMenu.autoTopicDesc, onSelect: onAutoTopic },
     { label: T.groupMenu.deleteGroup, description: T.groupMenu.deleteGroupDesc, danger: true, onSelect: onDelete },
   ];
@@ -4516,7 +4613,7 @@ function GroupGuestMobSheet({
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       onClose();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.common.saveFailed)),
   });
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupGuestMob.title}>
@@ -4525,53 +4622,20 @@ function GroupGuestMobSheet({
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
           {T.groupGuestMob.intro}
         </p>
-        <div className="mt-4 flex flex-col gap-2">
-          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: guests ? "var(--accent-soft)" : "var(--surface-alt)" }}>
-            <input
-              type="checkbox"
-              checked={guests}
-              onChange={(e) => setGuests(e.target.checked)}
-              aria-label={T.guestMob.allowGuestsAria}
-              className="mt-0.5 h-5 w-5 shrink-0"
-            />
-            <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.guestLabel}</span>
-              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                {T.groupGuestMob.guestDesc}
-              </span>
-            </span>
-          </label>
-          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: mobs ? "var(--accent-soft)" : "var(--surface-alt)" }}>
-            <input
-              type="checkbox"
-              checked={mobs}
-              onChange={(e) => setMobs(e.target.checked)}
-              aria-label={T.guestMob.allowMobsAria}
-              className="mt-0.5 h-5 w-5 shrink-0"
-            />
-            <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.mobLabel}</span>
-              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                {T.groupGuestMob.mobDesc}
-              </span>
-            </span>
-          </label>
-          <label className="flex cursor-pointer items-start gap-3 rounded-2xl px-3 py-3" style={{ background: narration ? "var(--accent-soft)" : "var(--surface-alt)" }}>
-            <input
-              type="checkbox"
-              checked={narration}
-              onChange={(e) => setNarration(e.target.checked)}
-              aria-label={T.guestMob.allowNarrationAria}
-              className="mt-0.5 h-5 w-5 shrink-0"
-            />
-            <span>
-              <span className="block font-bold" style={{ color: "var(--text)" }}>{T.groupGuestMob.narrationLabel}</span>
-              <span className="mt-0.5 block text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-                {T.groupGuestMob.narrationDesc}
-              </span>
-            </span>
-          </label>
-        </div>
+        <GuestMobToggles
+          containerClassName="mt-4 flex flex-col gap-2"
+          variant="described"
+          value={{ guests, mobs, narration }}
+          onChange={(v) => { setGuests(v.guests); setMobs(v.mobs); setNarration(v.narration); }}
+          labels={{
+            guests: T.groupGuestMob.guestLabel,
+            mobs: T.groupGuestMob.mobLabel,
+            narration: T.groupGuestMob.narrationLabel,
+            guestsDesc: T.groupGuestMob.guestDesc,
+            mobsDesc: T.groupGuestMob.mobDesc,
+            narrationDesc: T.groupGuestMob.narrationDesc,
+          }}
+        />
         {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
         <div className="mt-4 flex gap-3">
           <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
@@ -4592,62 +4656,183 @@ function GroupGuestMobSheet({
   );
 }
 
-/** 背景情報の編集シート（設計書 v2.0 / C）。グループの生成（通常・自動の両方）のシステムプロンプトへ常時含まれる。 */
-function GroupBackgroundSheet({
-  groupId,
-  currentText,
+/** フレーバーの見出し: 貼られたテキストの先頭の非空行（サーバ側の見出しと同じ規則）。 */
+function flavorTitleOf(text: string): string {
+  const first = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return first.length > 60 ? `${first.slice(0, 60)}…` : first;
+}
+
+/**
+ * フレーバー一式の編集部品（指定中の一覧＋貼り付け追加＋履歴からの追加）。
+ * チャット用シート（変更のたびに即保存）とスケジュール編集シート（保存時に
+ * まとめて送る）の両方で使う。履歴はアプリ全体で共有され、新しく指定した
+ * フレーバーだけが最大10件まで残る（登録はサーバ側で行う）。
+ */
+function FlavorListEditor({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  disabled?: boolean;
+}) {
+  const [paste, setPaste] = useState("");
+  const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const history = useQuery({
+    queryKey: ["flavor-history"],
+    queryFn: () => api.getFlavorHistory({}),
+  });
+  const historyItems = history.data?.items ?? [];
+  const addFlavor = (raw: string) => {
+    const text = raw.trim();
+    if (!text) { setError(T.flavors.emptyPasteError); return; }
+    if (value.includes(text)) { setError(T.flavors.alreadyAddedError); return; }
+    setError("");
+    setPaste("");
+    onChange([...value, text]);
+  };
+  return (
+    <div>
+      <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{T.flavors.currentHeading}</p>
+      {value.length === 0 ? (
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.flavors.empty}</p>
+      ) : (
+        <div className="mt-2 flex flex-col gap-2">
+          {value.map((f, i) => (
+            <div key={`${i}-${f.slice(0, 24)}`} className="rounded-2xl px-3 py-2.5" style={{ background: "var(--surface-alt)" }}>
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-sm font-bold" style={{ color: "var(--text)" }}>{flavorTitleOf(f)}</span>
+                <button
+                  type="button"
+                  onClick={() => setExpanded(expanded === i ? null : i)}
+                  aria-expanded={expanded === i}
+                  className="shrink-0 rounded-full px-2.5 py-1 text-xs font-bold"
+                  style={{ background: "var(--surface)", color: "var(--dim)" }}
+                >
+                  {expanded === i ? T.flavors.hideText : T.flavors.showText}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onChange(value.filter((_, j) => j !== i))}
+                  disabled={disabled}
+                  aria-label={T.flavors.removeAria(flavorTitleOf(f))}
+                  className="shrink-0 rounded-full px-2.5 py-1 text-xs font-bold disabled:opacity-50"
+                  style={{ background: "var(--surface)", color: "var(--danger)" }}
+                >
+                  {T.flavors.remove}
+                </button>
+              </div>
+              {expanded === i && (
+                <p className="mt-2 text-xs leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text)" }}>{f}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>{T.flavors.addHeading}</p>
+      <label className="mt-2 block text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="flavor-paste-text">
+        {T.flavors.pasteLabel}
+      </label>
+      <textarea
+        id="flavor-paste-text"
+        value={paste}
+        onChange={(e) => setPaste(e.target.value)}
+        rows={6}
+        placeholder={T.flavors.pastePlaceholder}
+        className="mt-1 w-full rounded-2xl px-3 py-2.5 text-sm"
+        style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
+      />
+      <button
+        type="button"
+        onClick={() => addFlavor(paste)}
+        disabled={disabled}
+        className="mt-2 w-full rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
+        style={{ background: "var(--accent)" }}
+      >
+        {T.flavors.addButton}
+      </button>
+      {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+
+      <p className="mt-5 text-sm font-bold" style={{ color: "var(--text)" }}>{T.flavors.historyHeading}</p>
+      <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{T.flavors.historyNote}</p>
+      {historyItems.length === 0 ? (
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>{T.flavors.historyEmpty}</p>
+      ) : (
+        <div className="mt-2 flex flex-col gap-2">
+          {historyItems.map((item) => {
+            const already = value.includes(item.text);
+            return (
+              <button
+                key={item.text}
+                type="button"
+                onClick={() => addFlavor(item.text)}
+                disabled={disabled || already}
+                aria-label={T.flavors.historyAddAria(item.title)}
+                className="flex w-full items-center gap-2 rounded-2xl px-3 py-2.5 text-left disabled:opacity-50"
+                style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+              >
+                <span className="min-w-0 flex-1 truncate text-sm font-bold">{item.title}</span>
+                {already && <span className="shrink-0 text-xs font-bold" style={{ color: "var(--dim)" }}>{T.flavors.historyAdded}</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * フレーバーの選択シート（チャット上部の「フレーバー」ボタンから開く）。
+ * 1対1・グループ共通。追加・取り外しのたびに即保存し、新しく指定された
+ * フレーバーはサーバ側でフレーバー履歴へ登録される。
+ */
+function FlavorSheet({
+  targetKind,
+  targetId,
+  current,
   onClose,
 }: {
-  groupId: number;
-  currentText: string;
+  targetKind: "chat" | "group";
+  targetId: number;
+  current: string[];
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
-  const [text, setText] = useState(currentText);
+  const [list, setList] = useState(current);
   const [error, setError] = useState("");
   const save = useMutation({
-    mutationFn: async () => await api.updateGroupBackground({ group_id: groupId, background_text: text }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["group", groupId] });
-      onClose();
+    mutationFn: async (next: string[]) => await api.setFlavors({ target_kind: targetKind, target_id: targetId, flavors: next }),
+    onSuccess: (_res, next) => {
+      setList(next);
+      setError("");
+      queryClient.invalidateQueries({ queryKey: [targetKind, targetId] });
+      queryClient.invalidateQueries({ queryKey: ["flavor-history"] });
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.saveFailed),
+    onError: (e) => setError(errMsg(e, T.flavors.saveFailed)),
   });
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.groupBackground.title}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.flavors.title}>
       <div className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.groupBackground.title}</h2>
+        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.flavors.title}</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          {T.groupBackground.description}
+          {T.flavors.description}
         </p>
-        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="group-background-text">
-          {T.groupBackground.label}
-        </label>
-        <textarea
-          id="group-background-text"
-          {...FIELDS.updateGroupBackground.background_text}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={8}
-          placeholder={T.groupBackground.placeholder}
-          className="mt-1 w-full rounded-2xl px-3 py-2.5 text-sm"
-          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
-        />
-        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
-        <div className="mt-4 flex gap-3">
-          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            {T.common.cancel}
-          </button>
-          <button
-            type="button"
-            onClick={() => save.mutate()}
-            disabled={save.isPending}
-            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
-            style={{ background: "var(--accent)" }}
-          >
-            {save.isPending ? T.common.saving : T.common.save}
-          </button>
+        <div className="mt-4">
+          <FlavorListEditor value={list} onChange={(next) => save.mutate(next)} disabled={save.isPending} />
         </div>
+        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-5 w-full rounded-full px-4 py-2.5 font-bold"
+          style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+        >
+          {T.common.close}
+        </button>
       </div>
     </div>
   );
@@ -4655,66 +4840,16 @@ function GroupBackgroundSheet({
 
 /** グループ名の変更シート。参加者・会話履歴には影響しない。 */
 function RenameGroupSheet({ groupId, currentName, onClose }: { groupId: number; currentName: string; onClose: () => void }) {
-  const queryClient = useQueryClient();
-  const [name, setName] = useState(currentName);
-  const [error, setError] = useState("");
-  const rename = useMutation({
-    mutationFn: async (n: string) => await api.renameGroup({ group_id: groupId, name: n }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["group", groupId] });
-      queryClient.invalidateQueries({ queryKey: ["home"] });
-      onClose();
-    },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
-  });
-  const submit = () => {
-    const v = name.trim();
-    if (!v) {
-      setError(T.renameGroup.nameRequired);
-      return;
-    }
-    if (v === currentName) {
-      onClose();
-      return;
-    }
-    setError("");
-    rename.mutate(v);
-  };
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(10,6,20,0.55)" }} role="dialog" aria-modal="true" aria-label={T.renameGroup.title}>
-      <div className="w-full max-w-md rounded-t-3xl p-5 pb-safe" style={{ background: "var(--surface)" }}>
-        <h2 className="font-display text-lg font-bold" style={{ color: "var(--text)" }}>{T.renameGroup.title}</h2>
-        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          {T.renameGroup.description}
-        </p>
-        <label className="mt-4 block text-sm font-bold" style={{ color: "var(--text)" }} htmlFor="rename-group-name">
-          {T.renameGroup.label}
-        </label>
-        <input
-          id="rename-group-name"
-          {...FIELDS.renameGroup.name}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className="mt-1 w-full rounded-2xl px-3 py-2.5"
-          style={{ background: "var(--surface-alt)", color: "var(--text)", border: "1px solid var(--border)" }}
-        />
-        {error && <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>{error}</p>}
-        <div className="mt-4 flex gap-3">
-          <button type="button" onClick={onClose} className="flex-1 rounded-full px-4 py-2.5 font-bold" style={{ background: "var(--surface-alt)", color: "var(--text)" }}>
-            {T.common.cancel}
-          </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={rename.isPending}
-            className="flex-1 rounded-full px-4 py-2.5 font-bold text-white disabled:opacity-50"
-            style={{ background: "var(--accent)" }}
-          >
-            {rename.isPending ? T.common.saving : T.common.change}
-          </button>
-        </div>
-      </div>
-    </div>
+    <RenameSheet
+      texts={T.renameGroup}
+      inputId="rename-group-name"
+      fieldProps={FIELDS.renameGroup.name}
+      currentName={currentName}
+      onSave={async (v) => await api.renameGroup({ group_id: groupId, name: v })}
+      invalidateKeys={[["group", groupId], ["home"]]}
+      onClose={onClose}
+    />
   );
 }
 
@@ -4748,7 +4883,7 @@ function GroupMembersSheet({
         onClose();
       }
     },
-    onError: (e) => setError(e instanceof Error ? e.message : T.common.changeFailed),
+    onError: (e) => setError(errMsg(e, T.common.changeFailed)),
   });
   const toggle = (id: number) => {
     setSelected((prev) => {
@@ -4763,13 +4898,9 @@ function GroupMembersSheet({
   // シート内のカテゴリ絞り込み（v1.24、階層対応 v1.26）: グループ作成シートと機能を合わせる。
   // "all" = 未指定（全員）/ "none" = 未分類のみ / 数値 = そのカテゴリ（子孫カテゴリを含む）。
   // 並びは一覧側の設定に関わらず常に五十音順。絞り込みで隠れたキャラの選択は保持する。
-  const [catFilter, setCatFilter] = useState<"all" | "none" | number>("all");
+  const [catFilter, setCatFilter] = useState<CategoryFilter>("all");
   const visibleCharacters = sortCharactersBy(
-    characters.filter((c) => {
-      if (catFilter === "all") return true;
-      if (catFilter === "none") return charCategoryIds(c).length === 0;
-      return charMatchesCategory(c, categories, catFilter);
-    }),
+    characters.filter((c) => charMatchesFilter(c, categories, catFilter)),
     "gojuon",
   );
   const roleplayRemoved = roleplayMember != null && !selected.includes(roleplayMember.character_id);
@@ -4789,23 +4920,7 @@ function GroupMembersSheet({
         <p className="mt-3 text-sm font-bold" style={{ color: "var(--text)" }}>{T.groupMembers.membersHeading(selected.length)}</p>
         {categories.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <label className="text-xs font-bold" style={{ color: "var(--dim)" }} htmlFor="group-members-category-filter">{T.common.category}</label>
-            <select
-              id="group-members-category-filter"
-              value={catFilter === "all" ? "all" : catFilter === "none" ? "none" : String(catFilter)}
-              onChange={(e) => {
-                const v = e.target.value;
-                setCatFilter(v === "all" ? "all" : v === "none" ? "none" : Number(v));
-              }}
-              className="rounded-full px-3 py-1.5 text-sm font-bold"
-              style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
-            >
-              <option value="all">{T.common.all}</option>
-              {categoryTreeEntries(categories).map(({ cat, depth }) => (
-                <option key={cat.id} value={String(cat.id)}>{categoryOptionLabel(cat, depth)}</option>
-              ))}
-              <option value="none">{T.common.uncategorized}</option>
-            </select>
+            <CategoryFilterSelect id="group-members-category-filter" categories={categories} value={catFilter} onChange={setCatFilter} />
             <span className="text-xs" style={{ color: "var(--dim)" }}>{T.common.selectedCount(selected.length)}</span>
           </div>
         )}
@@ -4889,7 +5004,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
   const [showRenameGroup, setShowRenameGroup] = useState(false);
   const [showEditMembers, setShowEditMembers] = useState(false);
   const [showGuestMob, setShowGuestMob] = useState(false);
-  const [showBackground, setShowBackground] = useState(false);
+  const [showFlavors, setShowFlavors] = useState(false);
   const [showGroupAutoTopic, setShowGroupAutoTopic] = useState(false);
   const [reviewMode, setReviewMode] = useState(false);
   const [selectedReviewId, setSelectedReviewId] = useState<number | null>(null);
@@ -4948,7 +5063,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.sendFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.sendFailed)),
   });
   // 「自動」ボタン（ローカル改善）: 1対1と同じく、押すと議題の仲介が
   // 起動し、少し遅れて議題が投稿され、掛け合い生成が始まる。
@@ -4958,7 +5073,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       setTopicError("");
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
     },
-    onError: (e) => setTopicError(e instanceof Error ? e.message : "議題の投下に失敗しました"),
+    onError: (e) => setTopicError(errMsg(e, T.autoTopic.postFailed)),
   });
   const cancelSend = useMutation({
     mutationFn: async () => await api.cancelPendingSend({ target_kind: "group", target_id: groupId }),
@@ -4975,7 +5090,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
       queryClient.invalidateQueries({ queryKey: ["home"] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.cancelFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.cancelFailed)),
   });
   // 履歴の使用設定の切り替え（設計書 v3.2）。上部タブのタップで即時に切り替える。
   // 「使わない」へ切り替えた時点でサーバ側が境界と新しい区間を記録する。
@@ -4984,7 +5099,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["group", groupId] });
     },
-    onError: (e) => setSendError(e instanceof Error ? e.message : T.chat.historyChangeFailed),
+    onError: (e) => setSendError(errMsg(e, T.chat.historyChangeFailed)),
   });
   const del = useMutation({
     mutationFn: async () => await api.deleteGroup({ group_id: groupId }),
@@ -5002,7 +5117,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
       setReviewNotice(T.review.registeredNotice);
       queryClient.invalidateQueries({ queryKey: ["reviewHistory"] });
     },
-    onError: (e) => setReviewError(e instanceof Error ? e.message : T.review.submitFailed),
+    onError: (e) => setReviewError(errMsg(e, T.review.submitFailed)),
   });
 
   const data: GroupState | undefined = state.data;
@@ -5077,6 +5192,22 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
               }
             >
               {T.group.historyTab(data.use_history)}
+            </button>
+          )}
+          {data && data.group.status === "active" && (
+            <button
+              type="button"
+              onClick={() => setShowFlavors(true)}
+              aria-label={T.flavors.buttonAria}
+              aria-pressed={data.flavors.length > 0}
+              className="rounded-full px-3 py-1.5 text-xs font-bold"
+              style={
+                data.flavors.length > 0
+                  ? { background: "var(--accent)", color: "#fff" }
+                  : { background: "var(--surface)", color: "var(--dim)" }
+              }
+            >
+              {data.flavors.length > 0 ? T.flavors.buttonWithCount(data.flavors.length) : T.flavors.button}
             </button>
           )}
           <button type="button" onClick={() => setShowExport(true)} className="rounded-full px-3 py-1.5 text-xs font-bold" style={{ background: "var(--surface)", color: "var(--dim)" }}>
@@ -5156,7 +5287,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
 
       {data?.topic_pending && (
         <div className="mx-3 mt-2 rounded-xl px-3 py-2 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }} role="status">
-          議題を準備中です…少し待つと議題が投稿されます。
+          {T.autoTopic.pendingBanner}
         </div>
       )}
 
@@ -5191,29 +5322,16 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                     <TopicCard body={m.body} source={m.topic_source} />
                     <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
                     {m.id === cancelTargetId && (
-                      <button
-                        type="button"
-                        onClick={() => cancelSend.mutate()}
-                        disabled={cancelSend.isPending}
-                        aria-label="この送信を取り消す"
-                        className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                        style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
-                      >
-                        送信を取り消す
-                      </button>
+                      <CancelSendButton onCancel={() => cancelSend.mutate()} pending={cancelSend.isPending} />
                     )}
                   </div>
                 </Fragment>
               );
             }
-            // 区間の区切りはフレームの途切れと帯で示す（設計書 v3.3）。発言単位の
-            // 区切り線は出さないため、historyDivider は常に null（各分岐の置き場は
-            // 従来の構造を保つために残してある）。
-            const historyDivider = null;
+            // 区間の区切りはフレームの途切れと帯で示す（設計書 v3.3）。
             if (m.kind === "user") {
               return (
                 <Fragment key={m.id}>
-                  {historyDivider}
                   {divider}
                   <div className="flex flex-col items-end">
                     <div className="max-w-[82%] rounded-3xl rounded-br-md px-4 py-2.5 text-base whitespace-pre-wrap text-white" style={{ background: "var(--accent)" }}>
@@ -5221,16 +5339,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                     </div>
                     <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{T.group.topicTime(formatClock(m.created_at))}</span>
                     {m.id === cancelTargetId && (
-                      <button
-                        type="button"
-                        onClick={() => cancelSend.mutate()}
-                        disabled={cancelSend.isPending}
-                        aria-label={T.chat.cancelSendAria}
-                        className="mt-1 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                        style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
-                      >
-                        {T.chat.cancelSend}
-                      </button>
+                      <CancelSendButton onCancel={() => cancelSend.mutate()} pending={cancelSend.isPending} />
                     )}
                   </div>
                 </Fragment>
@@ -5241,7 +5350,6 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
               // 中央揃えのシステムメッセージ的に表示する。
               return (
                 <Fragment key={m.id}>
-                  {historyDivider}
                   {divider}
                   <div className="flex justify-center px-2 py-1">
                     <p className="max-w-[88%] text-center text-sm leading-relaxed whitespace-pre-wrap" style={{ color: "var(--dim)" }}>
@@ -5254,7 +5362,6 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             if (m.kind === "raw") {
               return (
                 <Fragment key={m.id}>
-                  {historyDivider}
                   {divider}
                   <div className="rounded-2xl px-4 py-3" style={{ border: "1.5px dashed var(--danger)", background: "var(--surface)" }}>
                     <p className="text-xs font-bold" style={{ color: "var(--danger)" }}>{T.group.rawHeading}</p>
@@ -5270,7 +5377,6 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             const isRoleplayLine = m.user_authored;
             return (
               <Fragment key={m.id}>
-                {historyDivider}
                 {divider}
                 <div className="flex items-start gap-2">
                 <Avatar imageUrl={member?.image_url ?? null} name={m.speaker_name} themeColor={member?.theme_color ?? ""} size={32} />
@@ -5303,16 +5409,7 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
                   )}
                   <span className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>{formatClock(m.created_at)}</span>
                   {m.id === cancelTargetId && (
-                    <button
-                      type="button"
-                      onClick={() => cancelSend.mutate()}
-                      disabled={cancelSend.isPending}
-                      aria-label={T.chat.cancelSendAria}
-                      className="mt-1 self-start rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                      style={{ background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--border)" }}
-                    >
-                      {T.chat.cancelSend}
-                    </button>
+                    <CancelSendButton onCancel={() => cancelSend.mutate()} pending={cancelSend.isPending} selfStart />
                   )}
                 </div>
                 </div>
@@ -5361,18 +5458,18 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             </div>
           )}
           <p className="mb-1.5 px-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
-            「自動」: {AUTO_TOPIC_HINT}
+            {T.autoTopic.buttonHint(T.autoTopic.hint)}
           </p>
           <div className="flex items-end gap-2 pb-2">
             <button
               type="button"
               disabled={waiting || !!data?.topic_pending || topic.isPending}
               onClick={() => topic.mutate()}
-              aria-label="自動で議題を投下する"
+              aria-label={T.autoTopic.buttonAria}
               className="shrink-0 rounded-full px-3 py-2.5 text-sm font-bold disabled:opacity-50"
               style={{ background: "var(--surface)", color: "var(--accent)", border: "1.5px solid var(--accent)" }}
             >
-              自動
+              {T.autoTopic.buttonLabel}
             </button>
             <label className="sr-only" htmlFor="group-input">{T.group.inputLabel}</label>
             <textarea
@@ -5449,10 +5546,6 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
             setShowGroupMenu(false);
             setShowGuestMob(true);
           }}
-          onBackground={() => {
-            setShowGroupMenu(false);
-            setShowBackground(true);
-          }}
           onAutoTopic={() => {
             setShowGroupMenu(false);
             setShowGroupAutoTopic(true);
@@ -5468,17 +5561,18 @@ function GroupView({ groupId, unreadFromSeq, back }: { groupId: number; unreadFr
         <AutoTopicSheet
           targetKind="group"
           targetId={groupId}
-          targetName={`グループ「${data.group.name}」`}
+          targetName={T.autoTopic.groupTargetName(data.group.name)}
           currentEnabled={data.auto_topic_enabled}
           onClose={() => setShowGroupAutoTopic(false)}
         />
       )}
 
-      {showBackground && data && (
-        <GroupBackgroundSheet
-          groupId={groupId}
-          currentText={data.group.background_text}
-          onClose={() => setShowBackground(false)}
+      {showFlavors && data && (
+        <FlavorSheet
+          targetKind="group"
+          targetId={groupId}
+          current={data.flavors}
+          onClose={() => setShowFlavors(false)}
         />
       )}
 

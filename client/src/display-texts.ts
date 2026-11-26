@@ -11,6 +11,14 @@
 // 構成は画面・部品ごとに名前空間を分けてある。同じ文言が複数箇所で使われる
 // 場合は common などへ寄せて一本化してある。
 
+// 複数の名前空間にまたがって使う同一文言は、表記のずれを防ぐため定数へ
+// 寄せて参照する。
+const GENERATION_FAILED = "生成に失敗しました";
+const IMPORT_DONE = "取り込みが完了しました。";
+const IMPORT_FAILED = "取り込みに失敗しました。";
+const GROUP_DELETE_DESC = "このグループと掛け合いログを全て削除します。元には戻せません";
+const SCHEDULE_CREATE = "スケジュールを作成";
+
 export const TEXTS = {
   // ------------------------------------------------------------ 共通
   common: {
@@ -51,10 +59,11 @@ export const TEXTS = {
   // ------------------------------------------------------------ 生成の失敗理由
   failReasons: {
     timeout: "タイムアウト（10分以内に生成が終わりませんでした）",
+    pendingTimeout: "返信の生成が始まらないまま時間切れになりました。時間をおいて再度お試しください",
     rateLimited: "Claudeの利用上限に達しました。時間をおいて再度お試しください",
     authError: "生成に使うClaudeのログインセッションが切れています。再ログインすると直ります",
-    generationError: "生成に失敗しました",
-    fallback: "生成に失敗しました",
+    generationError: GENERATION_FAILED,
+    fallback: GENERATION_FAILED,
     withDetail: (reason: string) => `生成に失敗しました（${reason}）`,
   },
 
@@ -269,13 +278,11 @@ export const TEXTS = {
     runningBanner: (elapsed: string) =>
       elapsed ? `アバター管理から一括取り込み中です…（${elapsed}経過）` : "アバター管理から一括取り込み中です…",
     runningNote: "取り込み中です。完了するまでしばらくお待ちください。このシートを閉じても取り込みは続きます。",
-    doneBanner: (note: string) => (note ? `取り込みが完了しました。${note}` : "取り込みが完了しました。"),
-    failedBanner: (note: string) => (note ? `取り込みに失敗しました。${note}` : "取り込みに失敗しました。"),
-    doneNote: (note: string) => (note ? note : "取り込みが完了しました。"),
-    failedNote: (note: string) => (note ? note : "取り込みに失敗しました。"),
-    dismiss: "閉じる",
+    doneBanner: (note: string) => (note ? `${IMPORT_DONE}${note}` : IMPORT_DONE),
+    failedBanner: (note: string) => (note ? `${IMPORT_FAILED}${note}` : IMPORT_FAILED),
+    doneNote: (note: string) => (note ? note : IMPORT_DONE),
+    failedNote: (note: string) => (note ? note : IMPORT_FAILED),
     dismissAria: "取り込み結果の表示を閉じる",
-    timeoutNote: "取り込みが20分以上終わらなかったため、時間切れとして終了しました。もう一度お試しください。",
   },
 
   // ------------------------------------------------------------ レビュー
@@ -387,6 +394,14 @@ export const TEXTS = {
     groupsSectionAria: "グループチャット",
     groupsHeading: "グループチャット",
     createGroup: "グループを作る",
+    randomCreateNow: "今すぐランダム作成",
+    randomCreating: "作成中…",
+    randomCreateNowDesc: "押した瞬間に、ランダムな顔ぶれで作ります",
+    randomCreateBySchedule: "スケジュールで自動作成",
+    randomCreateByScheduleDesc: "決めた時刻に、自動で作り続けます",
+    randomCreateNeedChars: (n: number) =>
+      `グループを自動作成するにはキャラクターが3人以上必要です（現在${n}人）。キャラを追加してください。`,
+    groupCreateFailed: "グループの作成に失敗しました",
     noGroups:
       "キャラ同士の掛け合いを楽しむグループは、まだありません。1人から作れて、なりきり機能で自分も参加できます。",
     openGroupAria: (name: string, unread: number) =>
@@ -394,7 +409,7 @@ export const TEXTS = {
     groupMenuAria: (name: string) => `グループ「${name}」のメニュー`,
     groupMenuTitle: (name: string) => `グループ「${name}」`,
     groupDelete: "削除",
-    groupDeleteDesc: "このグループと掛け合いログを全て削除します。元には戻せません",
+    groupDeleteDesc: GROUP_DELETE_DESC,
     groupDeleteFailed: "グループの削除に失敗しました",
     groupDissolved: "解散済み（ログの閲覧のみ）",
     prevPage: "前のページ",
@@ -402,12 +417,23 @@ export const TEXTS = {
     pageIndicator: (page: number, count: number, total: number) =>
       `${page} / ${count} ページ（全${total}件）`,
     footerNote:
-      "発言を送ると、連携済みのClaudeが分離した生成プロセスで自動で返信を書きます（数分かかることがあります）。返信に失敗した時は、送った文章が入力欄に戻るので、そのまま再送信できます。生成に渡される履歴は直近20発言までで、それより前の会話は参照されません。会話ログはこのアプリ内に保存されます。外部へのバックアップは無いため、アプリを削除するとログも消えます。",
+      "発言を送ると、全体設定で選んだAIが自動で返信を書きます（数分かかることがあります）。返信に失敗した時は、送った文章が入力欄に戻るので、そのまま再送信できます。生成に渡される履歴は直近20発言までで、それより前の会話は参照されません。会話ログはこのアプリ内に保存されます。外部へのバックアップは無いため、アプリを削除するとログも消えます。",
     globalSettingsAria: "全体設定",
     globalSettingsHeading: "全体設定",
-    notifyReply: "返信が届いたらClaudeに通知する",
+    notifyReply: "返信が届いたらMuseに通知する",
     notifyReplyDesc:
-      "ONにすると、キャラからの返信（スケジューリングの自動生成も含む）が届いた時に、Claude側へメッセージが送られます。なお、Claudeのログイン切れ（トークン切れ）で生成に失敗した場合は、この設定がOFFでも通知されます。",
+      "ONにすると、キャラからの返信（スケジューリングの自動生成も含む）が届いた時に、Muse側へメッセージが送られます。なお、Claudeのログイン切れ（トークン切れ）で生成に失敗した場合は、この設定がOFFでも通知されます。",
+    replyEngine: "返信を考えるAI",
+    replyEngineDesc:
+      "すべてのチャット・グループの返信生成に使うAIです。レビューの見直しと「自動」の議題作成には影響しません。使ったAIは履歴（全体ログ）の生成記録の見出しに残ります。",
+    engineClaude: "Claude",
+    engineMuse: "Muse",
+    claudeModel: "Claudeのモデル",
+    claudeModelAuto: "自動（auto）",
+    engineClaudeCaution:
+      "Claudeの注意点: 生成にはClaude（Claude Code）の契約とログインが必要です。ログインが切れると返信が作れなくなります（その場合は通知が届きます）。その代わり、生成はあなたの普段の会話とは完全に切り離されたヘッドレス実行で行われるため、普段の会話の記憶や人格がキャラの返信に混ざることはありません。キャラ設定と会話履歴だけを材料に、専用の生成プロセスが返信を作ります。",
+    engineMuseCaution:
+      "Museの注意点: 返信は、返信の見張りと受け渡しを担っている実行側のClaude（Muse）が、そのまま自分で考えて代入します。実行側は生成専用ではなく見張り・仲介の作業と兼務で、長い材料はエージェント側で要約・圧縮されて渡ることもあるため、専用の生成プロセスで作るClaudeより、キャラの口調や設定の再現精度が落ちることがあります。また、実行側のモデルは実行環境で固定されていて、このアプリからは選べません。",
     globalSettingsSaveFailed: "設定の保存に失敗しました。もう一度お試しください。",
     logsLink: "履歴（全体ログ）",
     deleteCharacterTitle: (name: string) => `${name}を削除しますか？`,
@@ -430,7 +456,7 @@ export const TEXTS = {
     narrationOn: "ナレーションあり",
     sectionAria: "スケジューリング",
     heading: "スケジューリング",
-    create: "スケジュールを作成",
+    create: SCHEDULE_CREATE,
     description:
       "決まった時刻になると、対象のグループチャットでキャラクター同士の会話を自動で生成します。スケジュールは複数作れます。",
     loadFailed: "スケジュールの読み込みに失敗しました。",
@@ -445,10 +471,8 @@ export const TEXTS = {
 
   // ------------------------------------------------------------ スケジュール作成・編集シート
   scheduleEdit: {
-    sheetAriaEdit: "スケジュールを編集",
-    sheetAriaCreate: "スケジュールを作成",
     titleEdit: "スケジュールを編集",
-    titleCreate: "スケジュールを作成",
+    titleCreate: SCHEDULE_CREATE,
     nameLabel: "スケジュール名（必須）",
     namePlaceholder: "例: 朝の雑談",
     enableLabel: "このスケジュールを有効にする",
@@ -466,13 +490,13 @@ export const TEXTS = {
     targetTypeAria: "対象の種類",
     targetExistingLabel: "既存のグループチャット",
     targetExistingDesc:
-      "選んだグループの設定（参加者・ゲスト/モブ・ナレーション・背景情報）を使って、その中で会話を生成します",
+      "選んだグループの設定（参加者・ゲスト/モブ・ナレーション・フレーバー）を使って、その中で会話を生成します",
     targetNewLabel: "毎回新規チャット",
     targetNewDesc: "実行のたびに新しいグループを作り、カテゴリから抽選したキャラで会話を生成します",
     targetGroupLabel: "対象のグループチャット",
     targetGroupPlaceholder: "選んでください",
     targetGroupNote:
-      "なりきり設定が有効なグループは対象にできません。背景情報はグループ側の設定を使います。",
+      "なりきり設定が有効なグループは対象にできません。フレーバーはグループ側の設定を使います。",
     targetGroupUnavailable: (name: string) => `${name}（現在は対象に選べません）`,
     unknownGroup: "（不明なグループ）",
     drawCategoriesHeading: "抽選するカテゴリ（複数選択可・任意）",
@@ -483,15 +507,13 @@ export const TEXTS = {
     minMembersAria: "人数の最小",
     maxMembersAria: "人数の最大",
     guestMobNarrationHeading: "ゲスト・モブ・ナレーション（作成されるグループに引き継がれます）",
-    backgroundLabel: "背景情報",
-    backgroundPlaceholder: "例: 放課後の教室で、文化祭の準備をしている",
-    backgroundNote:
-      "ここに書いた背景情報が正で、作成されるグループへ初期値としてコピーされます（グループ側で編集しても、こちらには戻りません）。",
+    flavorsHeading: "フレーバー（作成されるグループに引き継がれます）",
+    flavorsNote:
+      "ここで指定したフレーバー一式が正で、作成されるグループへそのまま引き継がれます（グループ側で変えても、こちらには戻りません）。",
     nameRequired: "スケジュール名を入力してください。",
     timeRequired: "生成時刻を1つ以上入れてください。",
     weekdayRequired: "曜日を1つ以上選んでください。",
     targetGroupRequired: "対象のグループチャットを選んでください。",
-    categoryRequired: "カテゴリを1つ以上選んでください。",
     membersRangeError: "人数の最小は最大以下にしてください。",
     create: "作成する",
   },
@@ -558,6 +580,41 @@ export const TEXTS = {
     allowNarrationAria: "ナレーションを許可する",
   },
 
+  // ------------------------------------------------------------ 「自動」（議題の自動投下・自動投稿）
+  autoTopic: {
+    sourceLabels: {
+      news: "時事ネタ",
+      interest: "キャラの興味",
+      profile: "プロフィール",
+      muse: "Museの出来事",
+      context: "会話の流れ",
+      season: "季節・今日は何の日",
+      hypothetical: "もしも・二択",
+      contrast: "キャラ対比",
+    } as Record<string, string>,
+    hint: "トークの前ならランダムな議題、トーク中なら会話にちなんだ議題を出します。たまに無関係な話も出ます。",
+    cardHeading: (label: string | undefined) => (label ? `自動（${label}）` : "自動"),
+    sheetAria: "自動の設定",
+    sheetTitle: "自動の設定",
+    sheetIntro: (hint: string) =>
+      `「自動」は、話題を自動で出してくれる機能です。${hint}出所は、時事ネタ（人気記事から）・キャラのプロフィールや興味・季節や今日は何の日・もしもや二択・キャラ同士の対比などです。`,
+    sheetAutoPostDesc:
+      "自動投稿をオンにすると、会話が一区切りして、あなたの入力待ちのまま30分動きがなかった時に、議題が1つ自動で投稿されてキャラクターが反応します。あなたの発言がないままの自動投稿は連続3回までで止まり、あなたが発言すると数え直します。生成中・返信待ちの間は投稿されません。",
+    autoPostToggleAria: "自動の自動投稿をオンにする",
+    autoPostLabel: "自動投稿",
+    autoPostDesc: "入力待ちが30分続いたら、議題を自動で投稿します（既定はオフ）。",
+    menuLabel: "自動の設定",
+    menuDescChat:
+      "トークの前ならランダム、トーク中なら会話にちなんだ議題を自動で出します。入力待ちが30分続いた時の自動投稿もここで設定します（このキャラとの会話だけの設定です）",
+    postFailed: "議題の投下に失敗しました",
+    pendingBanner: "議題を準備中です…少し待つと議題が投稿されます。",
+    buttonAria: "自動で議題を投下する",
+    buttonLabel: "自動",
+    buttonHint: (hint: string) => `「自動」: ${hint}`,
+    chatTargetName: (name: string) => `${name}とのチャット`,
+    groupTargetName: (name: string) => `グループ「${name}」`,
+  },
+
   // ------------------------------------------------------------ 1対1チャット
   chat: {
     imageChange: "画像変更",
@@ -618,14 +675,11 @@ export const TEXTS = {
     guestMob: "ゲスト・モブ・ナレーションの設定",
     guestMobDesc:
       "参加者以外のキャラクター（ゲスト）や名前のない人々（モブ）が会話に混じることがあるかと、背景説明・場面転換のナレーションを入れるかを選びます",
-    background: "背景情報を編集する",
-    backgroundDesc:
-      "このグループの生成（通常・自動の両方）に常に添える背景情報（場所や状況など）を書きます。一度書けば使われ続けます",
     autoTopic: "自動の設定",
     autoTopicDesc:
       "トークの前ならランダム、トーク中なら会話にちなんだ議題を自動で出します。入力待ちが30分続いた時の自動投稿もここで設定します（このグループだけの設定です）",
     deleteGroup: "グループを削除",
-    deleteGroupDesc: "このグループと掛け合いログを全て削除します。元には戻せません",
+    deleteGroupDesc: GROUP_DELETE_DESC,
   },
 
   // ------------------------------------------------------------ ゲスト・モブ・ナレーション設定シート
@@ -642,13 +696,33 @@ export const TEXTS = {
       "背景説明・場面転換・時間経過の説明が、誰の台詞でもない形で入ることがあります。吹き出しではなく、中央揃えで表示されます。",
   },
 
-  // ------------------------------------------------------------ 背景情報シート
-  groupBackground: {
-    title: "背景情報を編集する",
+  // ------------------------------------------------------------ フレーバー（旧「背景情報」）
+  flavors: {
+    button: "フレーバー",
+    buttonWithCount: (n: number) => `フレーバー（${n}）`,
+    buttonAria: "フレーバーを選ぶ",
+    title: "フレーバー",
     description:
-      "このグループの会話の前提になる情報を書きます。内容はこのグループの生成（通常・自動の両方）に毎回添えられ、空にすると添えられなくなります。",
-    label: "背景情報",
-    placeholder: "場所や状況など、会話の前提になる情報",
+      "フレーバーツールで出力されたテキストを貼ると、このチャットの生成に絶対のルールとして添えられます。複数指定できます。過去の会話が内容に沿っていなくても、今後は必ず内容が優先されます。キャラクター自身はこの内容を知っているわけではなく、台詞で直接口にすることはありません。",
+    currentHeading: "指定中のフレーバー",
+    empty: "まだフレーバーは指定されていません。",
+    remove: "外す",
+    removeAria: (title: string) => `フレーバー「${title}」を外す`,
+    showText: "本文を見る",
+    hideText: "本文を隠す",
+    addHeading: "フレーバーを追加",
+    pasteLabel: "フレーバーのテキスト",
+    pastePlaceholder: "フレーバーツールの出力テキストを貼り付け",
+    addButton: "追加する",
+    emptyPasteError: "フレーバーのテキストを貼ってください。",
+    alreadyAddedError: "そのフレーバーはすでに指定されています。",
+    saveFailed: "フレーバーの保存に失敗しました",
+    historyHeading: "フレーバー履歴",
+    historyNote:
+      "新しく指定したフレーバーが、アプリ全体で最大10件まで残ります。選ぶと、このチャットに追加されます。",
+    historyEmpty: "履歴はまだありません。",
+    historyAddAria: (title: string) => `履歴から「${title}」を追加`,
+    historyAdded: "指定中",
   },
 
   // ------------------------------------------------------------ グループ名変更シート

@@ -10,6 +10,39 @@
 
 import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
+// ------------------------------------------------------- 共通カラム定義
+//
+// 複数テーブルで完全に同一の定義を持つカラムは、定義のずれを防ぐため
+// ファクトリへ寄せる。カラムオブジェクト自体はテーブル間で共有できない
+// （drizzle のビルダーはテーブルごとに独立させる必要がある）ため、
+// 呼び出しごとに新しいビルダーを返す関数にする。生成されるスキーマは不変。
+
+const nextSeqCol = () => integer("next_seq").notNull().default(1);
+const lastReadSeqCol = () => integer("last_read_seq").notNull().default(0);
+const useHistoryCol = () => integer("use_history").notNull().default(1);
+// フレーバー（旧「背景情報」の置き換え）: フレーバーツールの出力テキストを
+// そのまま貼った文字列の配列を JSON 文字列で保持する。複数指定でき、生成時は
+// 全件が絶対のルールとしてプロンプトへ含まれる。characters / groups /
+// schedules（新規チャット型のみ意味を持つ）で共用する。
+const flavorsCol = () => text("flavors").notNull().default("[]");
+const historyBoundarySeqCol = () => integer("history_boundary_seq").notNull().default(0);
+const currentSegmentNoCol = () => integer("current_segment_no").notNull().default(1);
+const autoTopicEnabledCol = () => integer("auto_topic_enabled").notNull().default(0);
+const autoTopicCountCol = () => integer("auto_topic_count").notNull().default(0);
+const noHistoryCol = () => integer("no_history").notNull().default(0);
+const segmentNoCol = () => integer("segment_no").notNull().default(1);
+const failReasonCol = () => text("fail_reason").notNull().default("");
+const failDetailCol = () => text("fail_detail").notNull().default("");
+const kickCountCol = () => integer("kick_count").notNull().default(0);
+const lastKickAtCol = () => integer("last_kick_at", { mode: "timestamp_ms" });
+const startedAtCol = () => integer("started_at", { mode: "timestamp_ms" });
+const finishedAtCol = () => integer("finished_at", { mode: "timestamp_ms" });
+const createdAtCol = () =>
+  integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date());
+
+
 export const characters = sqliteTable("characters", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
@@ -25,35 +58,38 @@ export const characters = sqliteTable("characters", {
   sourceUpdatedAt: text("source_updated_at"),
   imageBlobKey: text("image_blob_key"),
   themeColor: text("theme_color").notNull().default(""),
-  nextSeq: integer("next_seq").notNull().default(1),
+  nextSeq: nextSeqCol(),
   // 未読管理（設計書 v1.5 / 4.5章）: 利用者がこの会話を最後に開いた時点で
   // 既読になった最大 seq。seq がこれより大きいキャラ発言が未読。
-  lastReadSeq: integer("last_read_seq").notNull().default(0),
+  lastReadSeq: lastReadSeqCol(),
   // 履歴の使用設定（設計書 v3.2）: 1 = 生成の文脈に過去の履歴を含める（従来通り）、
   // 0 = 一切含めない。グループにも同じ3カラムがある。
-  useHistory: integer("use_history").notNull().default(1),
+  useHistory: useHistoryCol(),
+  // フレーバー: このキャラとの1対1チャットで指定されたフレーバー一式
+  // （JSON配列文字列）。生成時は全件が絶対のルールとして含まれる。
+  flavors: flavorsCol(),
   // 履歴の境界（設計書 v3.2）: 「使わない」へ切り替えた時点の最大 seq。
   // 「使う」の時でも、参照できるのは seq がこれより大きい発言だけ。
   // 「使う」へ戻しても境界は動かず、再度「使わない」にした時だけ更新される。
-  historyBoundarySeq: integer("history_boundary_seq").notNull().default(0),
+  historyBoundarySeq: historyBoundarySeqCol(),
   // 区間（設計書 v3.2 追補）: 現在の区間番号。チャット作成時は 1 で、
   // 「使わない」へ切り替えるたびに +1 され新しい区間が始まる（「使う」へ
   // 戻しても区間は分かれない）。各発言は segment_no に所属区間を保持する。
-  currentSegmentNo: integer("current_segment_no").notNull().default(1),
+  currentSegmentNo: currentSegmentNoCol(),
   // 旧カテゴリ分類（v1.8）: 単一カテゴリ時代のカラム。v1.25 で多対多へ移行し、
   // 正は character_categories 側になった。読み側の旧カラムフォールバックと
   // 書き側の先頭カテゴリ同期は廃止済み（実データの一致を検証した上で停止）。
   // このカラムは移行元として値を保持するだけで、読み書きは一切されない。
+  // 旧カラムの扱いは schedules.use_history と統一し、どちらも「スキーマ定義に
+  // 残して保持のみ」とする（冗長性レビュー B-13）。
   categoryId: integer("category_id"),
   // 自動議題（ローカル改善: 上流リポジトリには無い）: 会話が一区切りして
   // 入力待ちのまま30分動きが無い時、ランダムな議題を自動投稿する設定
   // （既定オフ）と、利用者の発言が無いまま自動投稿した連続回数
   // （上限3回で停止し、利用者が発言すると0に戻る）。
-  autoTopicEnabled: integer("auto_topic_enabled").notNull().default(0),
-  autoTopicCount: integer("auto_topic_count").notNull().default(0),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  autoTopicEnabled: autoTopicEnabledCol(),
+  autoTopicCount: autoTopicCountCol(),
+  createdAt: createdAtCol(),
 });
 
 export const categories = sqliteTable("categories", {
@@ -62,9 +98,7 @@ export const categories = sqliteTable("categories", {
   // 階層化（v1.26）: 親カテゴリのID。null は最上位。深さは無制限。
   // 自分自身や自分の子孫を親にすることはできない（循環防止、サーバ側で検証）。
   parentId: integer("parent_id"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  createdAt: createdAtCol(),
 });
 
 // キャラとカテゴリの多対多（v1.25）: 1キャラが複数カテゴリに属せる。
@@ -98,15 +132,13 @@ export const messages = sqliteTable("messages", {
   // 区切り線（設計書 v3.2）: 履歴を使わずに生成された返信は 1。その発言の
   // 直前に区切り線（その区間で最初に生成された掛け合いの生成日つき）を表示する。
   // 生成バッチの先頭発言だけに付き、後から設定を変えても変わらない。
-  noHistory: integer("no_history").notNull().default(0),
+  noHistory: noHistoryCol(),
   // 区間（設計書 v3.2 追補）: この発言が属する区間番号（characters.current_segment_no
   // の発言時点の値）。将来の区間ごとの表示・非表示切り替えのために保持する。
   // 例外: 履歴なし生成のきっかけになった利用者発言は、生成の保存時に返信と
   // 同じ区間へ付け替える（区切りはその発言の前に置かれる）。
-  segmentNo: integer("segment_no").notNull().default(1),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  segmentNo: segmentNoCol(),
+  createdAt: createdAtCol(),
 });
 
 export const groups = sqliteTable("groups", {
@@ -115,9 +147,9 @@ export const groups = sqliteTable("groups", {
   status: text("status", { enum: ["active", "dissolved"] })
     .notNull()
     .default("active"),
-  nextSeq: integer("next_seq").notNull().default(1),
+  nextSeq: nextSeqCol(),
   // 未読管理（設計書 v1.5 / 4.5章）: characters.last_read_seq と同じ意味。
-  lastReadSeq: integer("last_read_seq").notNull().default(0),
+  lastReadSeq: lastReadSeqCol(),
   // なりきり（v1.19）: 利用者がなりきる参加キャラのID。未設定は null。
   roleplayCharacterId: integer("roleplay_character_id"),
   // 「なりきりキャラの台詞」設定（v1.19 で追加、v1.20 で意味を再定義）:
@@ -134,23 +166,24 @@ export const groups = sqliteTable("groups", {
   allowMobs: integer("allow_mobs").notNull().default(0),
   // 自動議題（ローカル改善）: characters 側と同じ意味。既定オフ、
   // 連続自動投稿は上限3回で停止し、利用者が発言すると0に戻る。
-  autoTopicEnabled: integer("auto_topic_enabled").notNull().default(0),
-  autoTopicCount: integer("auto_topic_count").notNull().default(0),
+  autoTopicEnabled: autoTopicEnabledCol(),
+  autoTopicCount: autoTopicCountCol(),
   // ナレーション（設計書 v3.1）: 1 の時、生成で会話の背景説明・場面転換・
   // 時間経過の説明（ナレーション）が入ることがある。誰かの台詞ではなく、
   // 次の会話までに起きた事をただ記載する。既定は 0（従来通り入れない）。
   allowNarration: integer("allow_narration").notNull().default(0),
-  // 背景情報（設計書 v2.0 / C）: グループの生成（通常・自動の両方）の
-  // システムプロンプトへ「背景情報」セクションとして常時含める自由文。
-  // 一度書けば使われ続ける。1対1には含めない。
+  // 旧「背景情報」（設計書 v2.0 / C）: フレーバー化に伴い、値は migration
+  // 0021 で flavors の1件目へ移行済み。このカラムは移行時点の値を保持する
+  // だけで、読み書きは一切されない（characters.category_id と同じ扱い）。
   backgroundText: text("background_text").notNull().default(""),
+  // フレーバー: このグループで指定されたフレーバー一式（JSON配列文字列）。
+  // 生成（通常・自動の両方）では全件が絶対のルールとして含まれる。
+  flavors: flavorsCol(),
   // 履歴の使用設定・境界・区間（設計書 v3.2）: characters と同じ意味。
-  useHistory: integer("use_history").notNull().default(1),
-  historyBoundarySeq: integer("history_boundary_seq").notNull().default(0),
-  currentSegmentNo: integer("current_segment_no").notNull().default(1),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  useHistory: useHistoryCol(),
+  historyBoundarySeq: historyBoundarySeqCol(),
+  currentSegmentNo: currentSegmentNoCol(),
+  createdAt: createdAtCol(),
 });
 
 export const groupMembers = sqliteTable("group_members", {
@@ -182,14 +215,12 @@ export const groupMessages = sqliteTable("group_messages", {
   // 区切り線と区間（設計書 v3.2）: messages と同じ意味（履歴なし生成の
   // きっかけになった利用者発言の区間付け替えを含む）。no_history は
   // 履歴を使わずに生成された掛け合いの先頭の発言だけ 1。
-  noHistory: integer("no_history").notNull().default(0),
-  segmentNo: integer("segment_no").notNull().default(1),
+  noHistory: noHistoryCol(),
+  segmentNo: segmentNoCol(),
   splitStatus: text("split_status", { enum: ["normal", "abnormal"] })
     .notNull()
     .default("normal"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  createdAt: createdAtCol(),
 });
 
 export const replyRequests = sqliteTable("reply_requests", {
@@ -207,28 +238,26 @@ export const replyRequests = sqliteTable("reply_requests", {
   // 履歴なし生成（設計書 v3.2）: getWorkItems が材料を組み立てた時点で、
   // その生成が過去の履歴を含まない場合は 1 を記録する。completeRequest は
   // これを見て、保存する発言群の先頭に区切り線の印（no_history）を付ける。
-  noHistory: integer("no_history").notNull().default(0),
+  noHistory: noHistoryCol(),
   status: text("status", {
     enum: ["pending", "processing", "done", "failed", "cancelled"],
   })
     .notNull()
     .default("pending"),
-  failReason: text("fail_reason").notNull().default(""),
+  failReason: failReasonCol(),
   // 失敗の詳細（ローカル改善: 上流リポジトリには無い）: 理由コードだけでは
   // 原因を追えないため、生成コマンドの終了コードやエラー出力の末尾などを
   // 仲介が failRequest の detail で渡し、ここへ原文のまま残す。サーバ側で
   // 確定した失敗（タイムアウト等）も、その経緯をここへ書く。
-  failDetail: text("fail_detail").notNull().default(""),
+  failDetail: failDetailCol(),
   // pending 放置の見張り（ローカル改善）: pending のまま開始されない
   // リクエストは、見張りが仲介を叩き直した回数と最終の叩き直し時刻を
   // ここに記録し、上限まで叩き直しても始まらなければ failed に確定する。
-  kickCount: integer("kick_count").notNull().default(0),
-  lastKickAt: integer("last_kick_at", { mode: "timestamp_ms" }),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
-  startedAt: integer("started_at", { mode: "timestamp_ms" }),
-  finishedAt: integer("finished_at", { mode: "timestamp_ms" }),
+  kickCount: kickCountCol(),
+  lastKickAt: lastKickAtCol(),
+  createdAt: createdAtCol(),
+  startedAt: startedAtCol(),
+  finishedAt: finishedAtCol(),
 });
 
 export const meta = sqliteTable("meta", {
@@ -252,16 +281,14 @@ export const reviews = sqliteTable("reviews", {
   })
     .notNull()
     .default("pending"),
-  failReason: text("fail_reason").notNull().default(""),
+  failReason: failReasonCol(),
   // 失敗の詳細と pending 放置の見張り（ローカル改善）: reply_requests 側と同じ意味。
-  failDetail: text("fail_detail").notNull().default(""),
-  kickCount: integer("kick_count").notNull().default(0),
-  lastKickAt: integer("last_kick_at", { mode: "timestamp_ms" }),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
-  startedAt: integer("started_at", { mode: "timestamp_ms" }),
-  finishedAt: integer("finished_at", { mode: "timestamp_ms" }),
+  failDetail: failDetailCol(),
+  kickCount: kickCountCol(),
+  lastKickAt: lastKickAtCol(),
+  createdAt: createdAtCol(),
+  startedAt: startedAtCol(),
+  finishedAt: finishedAtCol(),
 });
 
 // 設定改訂（設計書 v1.5）: レビュー見直しの自動適用の記録。変更前JSONを保持し、
@@ -274,9 +301,7 @@ export const settingRevisions = sqliteTable("setting_revisions", {
   beforeJson: text("before_json").notNull(),
   afterJson: text("after_json").notNull(),
   diff: text("diff").notNull().default("[]"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  createdAt: createdAtCol(),
   revertedAt: integer("reverted_at", { mode: "timestamp_ms" }),
 });
 
@@ -308,17 +333,21 @@ export const schedules = sqliteTable("schedules", {
   allowNarration: integer("allow_narration").notNull().default(0),
   // 旧「履歴を使う」設定（v2.0）: 設計書 v3.2 でスケジュール側の選択肢は廃止され、
   // 履歴の使用設定はチャット／グループ側へ移った（新規チャット型は毎回まっさら、
-  // 既存グループ型はグループ自身の設定に従う）。DB の use_history カラムは
-  // 移行時点の値を保持するだけで、読み書きは一切されない（characters.category_id
-  // と同じ扱い）。
-  // 新規チャット型でのみ意味を持つ背景情報（スケジュール側が正）。
-  // 作成グループへは初期値としてコピーする（逆流はしない）。
+  // 既存グループ型はグループ自身の設定に従う）。use_history カラムは DB
+  // （migration 0013 で作成）に存在し、移行時点の値を保持するだけで読み書きは
+  // 一切されない。旧カラムの扱いは characters.category_id と統一し、どちらも
+  // 「スキーマ定義に残して保持のみ」とする（冗長性レビュー B-13: 以前は
+  // use_history だけ定義が欠落し、DB と定義のどちらを信じるべきか曖昧だった）。
+  useHistory: integer("use_history").notNull().default(0),
+  // 旧「背景情報」: フレーバー化に伴い migration 0021 で flavors へ移行済み。
+  // groups.background_text と同じく、保持するだけで読み書きはされない。
   backgroundText: text("background_text").notNull().default(""),
+  // フレーバー一式（JSON配列文字列）: 新規チャット型でのみ意味を持ち、
+  // 作成されるグループへそのまま引き継ぐ（スケジュール側が正、逆流はしない）。
+  flavors: flavorsCol(),
   lastFiredSlot: text("last_fired_slot"),
   lastGroupId: integer("last_group_id"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  createdAt: createdAtCol(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -335,9 +364,7 @@ export const appLogs = sqliteTable("app_logs", {
   body: text("body").notNull().default(""),
   relatedType: text("related_type"),
   relatedId: integer("related_id"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
+  createdAt: createdAtCol(),
 });
 
 // 戻し下書き（設計書 v1.4）: リクエストが failed に確定した時、対象だった利用者発言を
@@ -349,10 +376,8 @@ export const drafts = sqliteTable(
     targetKind: text("target_kind", { enum: ["chat", "group"] }).notNull(),
     targetId: integer("target_id").notNull(),
     body: text("body").notNull().default(""),
-    failReason: text("fail_reason").notNull().default(""),
-    createdAt: integer("created_at", { mode: "timestamp_ms" })
-      .notNull()
-      .$defaultFn(() => new Date()),
+    failReason: failReasonCol(),
+    createdAt: createdAtCol(),
   },
   (t) => [primaryKey({ columns: [t.targetKind, t.targetId] })],
 );

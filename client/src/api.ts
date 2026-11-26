@@ -16,5 +16,5 @@ export const api = createActionClient<typeof Actions>();
 //     import { api, type ApiResponse } from "./api";
 //     type Article = ApiResponse<typeof api, "listArticles">["articles"][number];
 //
-// They are also available directly from "@hatch/space-sdk/client".
-export type { ApiRequest, ApiResponse } from "@hatch/space-sdk/client";
+// It is also available directly from "@hatch/space-sdk/client".
+export type { ApiResponse } from "@hatch/space-sdk/client";
