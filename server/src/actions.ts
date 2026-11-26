@@ -2704,6 +2704,18 @@ function flavorPromptSection(flavors: string[]): string[] {
 
 const okResponse = z.object({ ok: z.literal(true) });
 
+// アバター連携の自己紹介（getAvatarReceiverInfo）の応答スキーマ。
+// 連携の約束事として固定の値を返す（値はリテラルで固定する）。
+const avatarReceiverInfoResponse = z.object({
+  protocol: z.literal("avatar-profile-receiver"),
+  protocol_version: z.literal(1),
+  format: z.literal("avatar-profile"),
+  format_version: z.literal("1.0"),
+  push_action: z.literal("importCharactersBulk"),
+  states_action: z.literal("getImportStates"),
+  status_action: z.literal("getImportStatus"),
+});
+
 /**
  * プロファイル再取り込みの実体。requestImport が正で、kickInitialImport は
  * 互換用エイリアスとして同じ実体へ委譲する（公開アクション名は外部から
@@ -3638,6 +3650,27 @@ export const Actions = {
     },
   }),
 
+  // アバター連携の自己紹介（ローカル改善: 上流リポジトリには無い）。
+  // 連携先の発見を slug やアプリIDのような環境特有の値に依存させないため、
+  // 受け口の特徴（プロトコル名・形式・送信先アクション名）を固定の値で返す。
+  // importCharactersBulk / getImportStates / getImportStatus は外部アプリとの
+  // 連携の約束事として、名前と引数・応答の形を変えないこと。
+  getAvatarReceiverInfo: defineAction({
+    description: "アバター連携の自己紹介: このアプリが avatar-profile 形式のプロファイル受け口であることを、プロトコル名・形式・送信先アクション名で返します（読み取り専用、引数なし）。連携側はこの特徴で受け口を発見します。",
+    request: z.object({}),
+    response: avatarReceiverInfoResponse,
+    async handler(): Promise<z.infer<typeof avatarReceiverInfoResponse>> {
+      return {
+        protocol: "avatar-profile-receiver",
+        protocol_version: 1,
+        format: "avatar-profile",
+        format_version: "1.0",
+        push_action: "importCharactersBulk",
+        states_action: "getImportStates",
+        status_action: "getImportStatus",
+      };
+    },
+  }),
   getImportStates: defineAction({
     description: "差分取り込みの突き合わせ用に、取り込み済みキャラの取り込み元プロファイルID・名前・取り込み時点の元プロファイル更新日時だけを軽く返します。source_updated_at が null のキャラは未記録（旧取り込み分）で、変更ありとして扱います。",
     request: z.object({}),
