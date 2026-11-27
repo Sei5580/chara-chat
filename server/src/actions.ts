@@ -17,6 +17,7 @@
 // 確定した経緯）を残し、次回の失敗で原因を追えるようにする。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
+import { privileged } from "@space/privileged";
 import { and, asc, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
@@ -1602,22 +1603,229 @@ return imageBytesComplete(bytes, mime) ? mime : null;
 }
 
 /**
+ * 画像取得先の安全策（SSRF 対策、2026-11-27 改訂: 上流リポジトリには無い
+ * ローカル改善の改訂。次回 pull で競合したらマージ/破棄を利用者に聞くこと）。
+ * 従来は「取得してよいホスト」の許可リスト（完全一致）方式だったが、リストに
+ * 無い公開ホストの画像が黙って欠落する実害（本番で2件）が出たため撤廃し、
+ * 「内部アドレスへの取得を遮断する」方式へ切り替えた。公開ホストであれば
+ * どのホストでも取得対象にし、危険な宛先（内部アドレス）だけを止める。
+ * 判定は isBlockedImageTarget がホップごとに行う: ホストがIPアドレスそのもの
+ * ならその範囲を検査し、ホスト名なら名前解決して解決先の全アドレスを検査
+ * する（1件でも内部向けが含まれれば取得しない）。名前解決できない宛先も
+ * 取得しない（fail closed）。
+ */
+
+/** IPv4 アドレス文字列をオクテット列へ分解する（IP リテラルでなければ null）。 */
+function parseIpv4Octets(s: string): [number, number, number, number] | null {
+const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+if (!m) return null;
+const o: [number, number, number, number] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+return o.every((n) => n <= 255) ? o : null;
+}
+
+/**
+ * IPv4 オクテット列が内部向けの範囲か。判定は2段構え:
+ * - どちらの段でも遮断（内部サービスへ到達し得る範囲）: 未指定・プライベート・
+ *   ループバック・リンクローカル・CGNAT・192.0.0.0/24。
+ * - strict の時だけ追加で遮断（予約・文書用・マルチキャスト等）: URL に直接
+ *   書かれた IP リテラル向け。名前解決の結果には適用しない — この実行環境の
+ *   リゾルバはプロキシの fake-IP 方式で、全ホスト名が 198.18.0.0/15（ベンチ
+ *   マーク用範囲）の合成アドレスへ解決されるため、解決結果にまで予約範囲を
+ *   広げると公開ホストの画像が全て取得できなくなる。文書用・ベンチマーク用・
+ *   マルチキャストの各範囲は内部サービスを指さないため、解決結果では許容する。
+ */
+function isBlockedIpv4Octets(o: [number, number, number, number], strict: boolean): boolean {
+const [a, b, c] = o;
+if (a === 0) return true; // 0.0.0.0/8（このホスト・未指定）
+if (a === 10) return true; // 10.0.0.0/8 プライベート
+if (a === 127) return true; // 127.0.0.0/8 ループバック
+if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 プライベート
+if (a === 192 && b === 168) return true; // 192.168.0.0/16 プライベート
+if (a === 169 && b === 254) return true; // 169.254.0.0/16 リンクローカル（クラウドのメタデータ等）
+if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT（共有アドレス空間）
+if (a === 192 && b === 0 && c === 0) return true; // 192.0.0.0/24 IETF 特殊用途
+if (!strict) return false;
+if (a === 192 && b === 0 && c === 2) return true; // 192.0.2.0/24 TEST-NET-1（文書用）
+if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2（文書用）
+if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3（文書用）
+if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 ベンチマーク用（予約）
+if (a === 192 && b === 88 && c === 99) return true; // 192.88.99.0/24 旧6to4リレー（予約）
+if (a >= 224) return true; // 224.0.0.0/4 マルチキャスト＋240.0.0.0/4 予約（ブロードキャスト含む）
+return false;
+}
+
+/**
+ * IPv6 アドレス文字列を16ビットグループ列（8個）へ展開する。
+ * "::" の圧縮と末尾の埋め込み IPv4（::ffff:192.0.2.1 形式）の両方に対応する。
+ * IP リテラルとして解釈できなければ null。
+ */
+function parseIpv6Groups(s: string): number[] | null {
+let t = s.toLowerCase();
+const v4 = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(t);
+if (v4?.[1]) {
+const o = parseIpv4Octets(v4[1]);
+if (!o) return null;
+const idx = t.lastIndexOf(":");
+if (idx < 0) return null;
+const hi = ((o[0] << 8) | o[1]).toString(16);
+const lo = ((o[2] << 8) | o[3]).toString(16);
+t = `${t.slice(0, idx)}:${hi}:${lo}`;
+}
+const halves = t.split("::");
+if (halves.length > 2) return null;
+const parseSide = (side: string): number[] | null => {
+if (side === "") return [];
+const parts = side.split(":");
+const out: number[] = [];
+for (const p of parts) {
+if (!/^[0-9a-f]{1,4}$/.test(p)) return null;
+out.push(parseInt(p, 16));
+}
+return out;
+};
+const left = parseSide(halves[0] ?? "");
+if (!left) return null;
+if (halves.length === 1) return left.length === 8 ? left : null;
+const right = parseSide(halves[1] ?? "");
+if (!right) return null;
+if (left.length + right.length >= 8) return null;
+return [...left, ...new Array<number>(8 - left.length - right.length).fill(0), ...right];
+}
+
+/**
+ * IPv6 グループ列が内部向けの範囲か。IPv4 と同じ2段構え（strict の時だけ
+ * 予約・文書用・マルチキャストも遮断する）。IPv4 射影（::ffff:a.b.c.d）と
+ * NAT64 既知プレフィックス（64:ff9b::/96）は埋め込み IPv4 の範囲で判定する
+ * （内部向け v4 への到達を防ぐ）。
+ */
+function isBlockedIpv6Groups(g: number[], strict: boolean): boolean {
+const [g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0] = g;
+if (g.every((n) => n === 0)) return true; // :: 未指定
+if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1) return true; // ::1 ループバック
+if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
+return isBlockedIpv4Octets([g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff], strict);
+}
+if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+return isBlockedIpv4Octets([g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff], strict);
+}
+if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 リンクローカル
+if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 ユニークローカル（プライベート）
+if (!strict) return false;
+if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 マルチキャスト
+if (g0 === 0x100 && g1 === 0 && g2 === 0 && g3 === 0) return true; // 100::/64 破棄専用（予約）
+if (g0 === 0x2001 && g1 === 0xdb8) return true; // 2001:db8::/32 文書用（予約）
+return false;
+}
+
+/** 文字列が IP リテラル（v4 / v6）かどうか。 */
+function isIpLiteral(s: string): boolean {
+return parseIpv4Octets(s) !== null || parseIpv6Groups(s) !== null;
+}
+
+/**
+ * IP リテラル文字列が内部向けか（URL に直接書かれた宛先向けの厳格な判定。
+ * プライベート／ループバック／リンクローカル／予約済みの全範囲を遮断する）。
+ */
+function isBlockedIpAddress(ip: string): boolean {
+const v4 = parseIpv4Octets(ip);
+if (v4) return isBlockedIpv4Octets(v4, true);
+const g = parseIpv6Groups(ip);
+if (g) return isBlockedIpv6Groups(g, true);
+return false;
+}
+
+/**
+ * 名前解決で得たアドレスが内部向けか（内部サービスへ到達し得る範囲だけを
+ * 遮断する緩い段。理由は isBlockedIpv4Octets のコメント参照）。
+ */
+function isBlockedResolvedAddress(ip: string): boolean {
+const v4 = parseIpv4Octets(ip);
+if (v4) return isBlockedIpv4Octets(v4, false);
+const g = parseIpv6Groups(ip);
+if (g) return isBlockedIpv6Groups(g, false);
+return true; // IP として解釈できない解決結果は信用しない
+}
+
+/**
+ * 名前ベースとリテラルIPだけでの遮断判定（名前解決はしない）。
+ * localhost 系と .local（mDNS）は名前の時点で内部向けとみなす。
+ */
+function isBlockedImageHostname(hostname: string): boolean {
+const host = hostname.toLowerCase().replace(/\.$/, "");
+if (host === "localhost" || host.endsWith(".localhost")) return true;
+if (host.endsWith(".local")) return true;
+const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+return isBlockedIpAddress(bare);
+}
+
+/**
+ * 画像取得先として許可できない宛先かどうか（内部アドレス遮断方式）。
+ * ホストが IP リテラルならその範囲を検査する。ホスト名なら名前解決を行い
+ * （解決自体はホスト側の privileged 経由）、解決先に内部向けアドレスが
+ * 1件でも含まれれば遮断する。名前解決に失敗・超過した宛先も取得しない
+ * （fail closed）。リダイレクト先も fetchImageBytes がホップごとに同じ
+ * 判定を通す。
+ */
+async function isBlockedImageTarget(ctx: Ctx, hostname: string): Promise<boolean> {
+const host = hostname.toLowerCase().replace(/\.$/, "");
+if (isBlockedImageHostname(host)) return true;
+const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+if (isIpLiteral(bare)) return false; // 公開IPリテラル（内部向けは上で遮断済み）
+let resolved: { ok: boolean; addresses: string[] };
+try {
+resolved = await ctx.executePrivileged(privileged.resolveHostAddresses, { hostname: host });
+} catch {
+return true; // 解決の口自体が使えない場合も取得しない
+}
+if (!resolved.ok || !resolved.addresses.length) return true;
+return resolved.addresses.some((a) => isBlockedResolvedAddress(a));
+}
+
+/**
  * 画像URLからサーバ側で直接画像を取得する。仲介エージェントのテキスト
  * 経由（base64）だと大きな画像が途中で切れて壊れるため、バイト列は
  * この経路だけで運ぶ。取得できない・壊れている場合は null（画像なしで
  * 取り込み自体は続行し、次回の再取り込みで回復できるようにする）。
+ * 取得先は http/https のみ。ホストの許可リストは無く、公開ホストであれば
+ * 取得対象にするが、isBlockedImageTarget で内部アドレス（プライベート／
+ * ループバック／リンクローカル／予約済み、ホスト名は名前解決の結果を含む）
+ * への取得を遮断する。リダイレクトも最大5ホップまで手動で追って各ホップで
+ * 再判定する。
  */
-async function fetchImageBytes(url: string): Promise<{ bytes: Uint8Array; mime: string } | null> {
+async function fetchImageBytes(ctx: Ctx, url: string): Promise<{ bytes: Uint8Array; mime: string } | null> {
 try {
-if (!/^https?:\/\//.test(url)) return null;
-const res = await fetch(url, {
+let current: URL;
+try {
+current = new URL(url);
+} catch {
+return null;
+}
+let res: Response | null = null;
+for (let hop = 0; hop <= 5; hop++) {
+if (current.protocol !== "http:" && current.protocol !== "https:") return null;
+if (await isBlockedImageTarget(ctx, current.hostname)) return null;
+res = await fetch(current, {
 headers: {
 "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36",
 Accept: "image/*",
 },
 signal: AbortSignal.timeout(25_000),
-redirect: "follow",
+redirect: "manual",
 });
+if (res.status >= 300 && res.status < 400) {
+const location = res.headers.get("location");
+if (!location) return null;
+try {
+current = new URL(location, current);
+} catch {
+return null;
+}
+res = null;
+continue;
+}
+break;
+}
+if (!res) return null;
 if (!res.ok) return null;
 const declared = Number(res.headers.get("content-length") || "0");
 if (declared > IMAGE_FETCH_MAX_BYTES) return null;
@@ -2384,7 +2592,7 @@ async function importOneProfile(
   // どちらの経路でも完全性チェックを通った画像だけを保存する。壊れた
   // 画像は保存せず、既存の画像も消さない（次回の再取り込みで回復する）。
   if (opts.imageUrl) {
-    const got = await fetchImageBytes(opts.imageUrl);
+    const got = await fetchImageBytes(ctx, opts.imageUrl);
     if (got) {
       imageBlobKey = `char-image/${parts.sourceProfileId ?? "manual"}-${Date.now()}`;
       await ctx.blobs.put(imageBlobKey, got.bytes, { contentType: got.mime });
@@ -3573,6 +3781,8 @@ export const Actions = {
       batch_id: z.string().trim().min(1).max(100).optional(),
     }),
     response: z.object({ id: z.number(), name: z.string(), display_name: z.string(), is_new: z.boolean(), has_image: z.boolean() }),
+    // 画像取得の内部アドレス遮断で、取得先ホスト名の名前解決（privileged）を使う。
+    privileged: [privileged.resolveHostAddresses],
     async handler(ctx, args) {
       const db = getDb(ctx);
       // 実体は共通処理 importOneProfile（importCharactersBulk と共用）。
@@ -3624,6 +3834,8 @@ export const Actions = {
         }),
       ),
     }),
+    // 画像取得の内部アドレス遮断で、取得先ホスト名の名前解決（privileged）を使う。
+    privileged: [privileged.resolveHostAddresses],
     async handler(ctx, args) {
       const db = getDb(ctx);
       const batchId = args.batch_id ?? `import-${Date.now()}`;
