@@ -15,6 +15,14 @@
 // なければ failed(pending_timeout) に確定する。失敗時は理由コードに加えて
 // fail_detail（生成コマンドの終了コード・エラー出力の末尾や、サーバ側で
 // 確定した経緯）を残し、次回の失敗で原因を追えるようにする。
+// 議題の見張り（ローカル改善: 上流リポジトリには無い）: 「自動」の議題の
+// 「準備中」（meta の topic_pending）にも同じ見張りを拡張したもの
+// （sweepStaleTopics）。仲介は生成前に beginTopic で着手を原子的に主張し、
+// 主張の無い準備中が3分を超えたら仲介を蹴り直し（最大2回）、主張済みでも
+// 10分完了しないもの・蹴り直しの上限に達したものは失敗として確定し、
+// 全体ログへ理由付きで記録する。failTopic でも理由を全体ログへ残す。
+// 次回上流から更新分を pull する際、この見張り（返信／レビュー／議題）と
+// 差分/コンフリクトが発生したら、マージするか破棄するかを必ず利用者に聞くこと。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { privileged } from "@space/privileged";
@@ -1359,12 +1367,21 @@ const TOPIC_MAX_AUTO = 3;
 // 議題の仲介を起動してから投稿されるまでの猶予。これを過ぎた「準備中」は
 // 仲介が終わらなかったものとして扱い、再び投下できるようにする。
 const TOPIC_PENDING_MS = 10 * 60 * 1000;
+// 議題の見張り（ローカル改善: 上流リポジトリには無い）: 返信／レビューの
+// pending 見張り（PENDING_STALE_MS / PENDING_MAX_KICKS）と同じ考え方。
+// 主張（beginTopic）されていない準備中が3分を超えたら仲介を蹴り直し
+// （最大2回）、主張済みでも着手から10分を超えて完了しないもの、蹴り直しの
+// 上限に達しても進まないものは失敗として確定する。
+const TOPIC_STALE_MS = 3 * 60 * 1000;
+const TOPIC_MAX_KICKS = 2;
+const TOPIC_CLAIMED_TIMEOUT_MS = 10 * 60 * 1000;
 
 const TOPIC_MESSAGE = [
 "あなたは「キャラチャット」アプリ（スペース slug: kiyaratiyatuto）の「自動」仲介です。指定された会話に議題を1つ考えて投稿するのが仕事です。議題の文章を考えるのはあなたの役割ですが、キャラクターの返信文を書いてはいけません（返信は投稿後に別の生成が担当します）。",
 "",
 "手順:",
-"1. artifact.invoke_action で slug=kiyaratiyatuto の getTopicContext を、末尾に指定された target_kind と target_id で呼ぶ。ok=false なら、そのまま終了する。",
+"1. artifact.invoke_action で slug=kiyaratiyatuto の getTopicContext を、末尾に指定された target_kind と target_id で呼ぶ。ok=false なら、failTopic({target_kind, target_id, reason: getTopicContext が返した reason}) を呼んでから終了する（reason が \"not_pending\" の場合は failTopic を呼ばず、そのまま終了する）。",
+"1.5. getTopicContext が ok=true を返したら、生成を始める前に必ず beginTopic({target_kind, target_id}) を呼ぶ。ok=false なら、別の仲介が既にこの議題を処理中なので、生成も投稿もせず、そのまま終了する（failTopic も呼ばない）。",
 "2. 議題の出所を決める（シェルの乱数で選ぶ。自分で偏らせない）:",
 " - 会話の履歴がある場合（getTopicContext の history が空でない場合）: まず echo $((RANDOM % 5)) を実行する。0 が出たら「無関係な議題」の回として、下の『履歴が無い場合』の手順で文脈以外の出所から1つ選ぶ（会話の流れとは無関係な話題でよい）。1〜4 が出たら「会話の流れ」（source=\"context\"）とし、これまでの会話の流れ・内容・雰囲気を踏まえ、その続きや派生、関連する話題になる議題を作る。",
 " - 履歴が無い新規の会話の場合: echo $((RANDOM % 7)) を実行し、0=時事ネタ、1=参加キャラの興味、2=プロフィール由来、3=Muse上での出来事、4=季節・今日は何の日、5=もしも・二択、6=キャラ同士の対比 とする。",
@@ -1378,7 +1395,7 @@ const TOPIC_MESSAGE = [
 "   - キャラ同士の対比（contrast）: 参加キャラから2人を選び（シェルの乱数で選ぶ）、2人の profile_items や設定抜粋を読み比べて、出身地・好きなもの・価値観などの違いや意外な共通点を突く議題を作る（例:「○○と○○は出身地がまるで違うけど、どちらの暮らしが自分に合っていると思う？」）。参加キャラが1人しかいない場合（1対1）は成立しないので「プロフィール由来」に切り替える。設定に書かれていない違いは捏造しない。",
 "   - フレーバー（flavors）: getTopicContext の flavors が空でない場合、そのフレーバーが示す状況（場所・関係性・前提）を前提として議題を作ること。フレーバーと矛盾する議題にはしないこと。履歴ありで「無関係な議題」の回になった場合も、話題の題材自体は会話と無関係でよいが、議題文はフレーバーの状況の枠内で作ること。フレーバーの文面を議題文に直接引用しないこと（フレーバーは前提として静かに反映し、その文面そのものを話題にしない）。flavors が空の場合は、この条項は適用せず従来どおりに作ること。",
 "4. 議題ができたら postTopic({target_kind, target_id, body: 議題文, source}) を呼ぶ。source は \"context\"（会話の流れ）/ \"news\"（時事ネタ）/ \"interest\"（キャラの興味）/ \"profile\"（プロフィール由来）/ \"muse\"（Muse上での出来事）/ \"season\"（季節・今日は何の日）/ \"hypothetical\"（もしも・二択）/ \"contrast\"（キャラ同士の対比）のどれかで、実際に使った出所に合わせる（切り替えた場合は切り替え先）。議題文は見出しや「議題：」といった前置きを付けず、話題そのものだけを1〜2文で書く（表示側で「自動」の議題と分かる形になる）。参加キャラが話し返したくなる、開かれた問いかけや話題の提示にすること。",
-"5. postTopic がエラーになった場合や、手順の途中で続行できなくなった場合は、必ず failTopic({target_kind, target_id}) を呼んでから終了する（呼ばないと「議題を準備中」の表示が残り続ける）。",
+"5. postTopic がエラーになった場合や、手順の途中で続行できなくなった場合は、必ず failTopic({target_kind, target_id, reason, detail}) を呼んでから終了する（呼ばないと「議題を準備中」の表示が残り続ける）。reason は諦めた理由が分かる短い語（例: \"generation_error\" / \"no_source\" / \"post_error\"）、detail にはエラーの内容など経緯を原文で入れること（理由は全体ログに記録され、後から追えるようにするため）。",
 ].join("\n");
 
 /** プロフィール由来の議題の材料: キャラの設定本文と「関係・呼び方」から、
@@ -1421,23 +1438,169 @@ function todayJstLabel(): string {
   return `${get("year")}年${get("month")}月${get("day")}日（${get("weekday")}）`;
 }
 
+// 議題の状態は meta に保持する（キー一覧）:
+// - topic_pending:<kind>:<id> … 「準備中」の開始時刻（ms文字列）。空は準備中でない。
+// - topic_auto:<kind>:<id> … 自動投稿として起動されたか（"1" / "0"）。
+// - topic_claimed:<kind>:<id> … 仲介が beginTopic で着手を主張した時刻（ms文字列）。
+//   空は未主張。主張済みの準備中は生成中として見張りの蹴り直し対象にしない。
+// - topic_kicks:<kind>:<id> … 見張りが仲介を蹴り直した回数。
+// - topic_last_kick:<kind>:<id> … 最後に蹴り直した時刻（ms文字列）。
+// - topic_failed_at:<kind>:<id> … 直近で議題の生成が失敗として確定した時刻。
+//   自動投稿の走査が失敗直後に同じ会話へ即座に再投下して失敗を繰り返さない
+//   ためのクールダウンに使う。
+const topicPendingKey = (kind: "chat" | "group", id: number) => `topic_pending:${kind}:${id}`;
+const topicAutoKey = (kind: "chat" | "group", id: number) => `topic_auto:${kind}:${id}`;
+const topicClaimedKey = (kind: "chat" | "group", id: number) => `topic_claimed:${kind}:${id}`;
+const topicKicksKey = (kind: "chat" | "group", id: number) => `topic_kicks:${kind}:${id}`;
+const topicLastKickKey = (kind: "chat" | "group", id: number) => `topic_last_kick:${kind}:${id}`;
+const topicFailedAtKey = (kind: "chat" | "group", id: number) => `topic_failed_at:${kind}:${id}`;
+
+function metaMs(v: string | undefined): number {
+  const n = Number(v || "0");
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** 「準備中」の開始時刻（ms）。準備中でなければ 0。TOPIC_PENDING_MS の失効判定を
+ * 含まない生の値で、見張り（sweepStaleTopics）はこちらで走査する（失効判定を
+ * 通すと、止まった準備中が「存在しない」ことになり見張りが働けないため）。 */
+async function topicPendingStartedAt(db: Db, kind: "chat" | "group", targetId: number): Promise<number> {
+  return metaMs(await getMeta(db, topicPendingKey(kind, targetId)));
+}
+
 async function isTopicPending(db: Db, kind: "chat" | "group", targetId: number): Promise<boolean> {
-  const v = Number((await getMeta(db, `topic_pending:${kind}:${targetId}`)) || "0");
-  const t = Number.isFinite(v) ? v : 0;
+  const t = await topicPendingStartedAt(db, kind, targetId);
   return t > 0 && Date.now() - t < TOPIC_PENDING_MS;
+}
+
+/** 議題の状態（準備中・主張・蹴り直し回数）をすべて消す。 */
+async function clearTopicState(db: Db, kind: "chat" | "group", targetId: number) {
+  await setMeta(db, topicPendingKey(kind, targetId), "");
+  await setMeta(db, topicClaimedKey(kind, targetId), "");
+  await setMeta(db, topicKicksKey(kind, targetId), "");
+  await setMeta(db, topicLastKickKey(kind, targetId), "");
+}
+
+/** 議題の対象表示名（全体ログの見出し用）。対象が消えていれば汎用の名を返す。 */
+async function topicTargetName(db: Db, kind: "chat" | "group", targetId: number): Promise<string> {
+  if (kind === "chat") {
+    const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, targetId));
+    return rows[0] ? `${rows[0].displayName}（1対1）` : "（削除済みのキャラクター）";
+  }
+  const rows = await db.select().from(schema.groups).where(eq(schema.groups.id, targetId));
+  return rows[0] ? `${rows[0].name}（グループ）` : "（削除済みのグループ）";
+}
+
+/**
+ * 議題の生成失敗を確定させる共通処理（見張りの失敗確定と failTopic で共用）:
+ * 準備中の表示を消し、失敗時刻を記録し、全体ログへ理由付きで1件残す。
+ * 無言で消える状態を作らないことが目的（ローカル改善: 上流には無い）。
+ */
+async function failTopicPending(db: Db, kind: "chat" | "group", targetId: number, reasonText: string) {
+  await clearTopicState(db, kind, targetId);
+  await setMeta(db, topicFailedAtKey(kind, targetId), String(Date.now()));
+  const name = await topicTargetName(db, kind, targetId);
+  await addAppLog(db, "auto", `議題の生成に失敗: ${name}`, reasonText, kind === "chat" ? "character" : "group", targetId);
 }
 
 /** 議題の仲介を起動する。手動（auto=false）と自動投稿（auto=true）で共用。 */
 async function kickTopic(ctx: Ctx, db: Db, kind: "chat" | "group", targetId: number, auto: boolean) {
-  await setMeta(db, `topic_pending:${kind}:${targetId}`, String(Date.now()));
-  await setMeta(db, `topic_auto:${kind}:${targetId}`, auto ? "1" : "0");
+  await setMeta(db, topicPendingKey(kind, targetId), String(Date.now()));
+  await setMeta(db, topicAutoKey(kind, targetId), auto ? "1" : "0");
+  await setMeta(db, topicClaimedKey(kind, targetId), "");
+  await setMeta(db, topicKicksKey(kind, targetId), "0");
+  await setMeta(db, topicLastKickKey(kind, targetId), "");
   try {
     await ctx.agent.spawnTask(`${TOPIC_MESSAGE}\n\n（対象: target_kind="${kind}", target_id=${targetId}）`, {
       dedupeKey: `chara-topic-${kind}-${targetId}`,
     });
   } catch {
-    await setMeta(db, `topic_pending:${kind}:${targetId}`, "");
+    await setMeta(db, topicPendingKey(kind, targetId), "");
   }
+}
+
+/**
+ * 見張りの蹴り直し専用の議題キック。準備中の開始時刻・主張・自動フラグには
+ * 触れず（経過時間の判定を乱さないため）、dedupeKey を蹴り直し回ごとに変えて、
+ * 起動済みのまま動いていない仲介タスクの重複排除に潰されないようにする。
+ */
+async function rekickTopic(ctx: Ctx, kind: "chat" | "group", targetId: number, kickNo: number) {
+  try {
+    await ctx.agent.spawnTask(`${TOPIC_MESSAGE}\n\n（対象: target_kind="${kind}", target_id=${targetId}）`, {
+      dedupeKey: `chara-topic-watchdog-${kind}-${targetId}-${kickNo}`,
+    });
+  } catch {
+    /* 起動できなくても準備中は残る（次の見張りで失敗確定へ進む） */
+  }
+}
+
+/**
+ * 議題の見張り（ローカル改善: 上流リポジトリには無い）。返信／レビューの
+ * sweepStalePending と同じ考え方を、meta 保持の「準備中」へ拡張したもの。
+ * runSignalAll（2分間隔の定期実行と発言直後の共通経路）から呼ばれる。
+ * 入口（「自動」ボタン／「自動」ONの自動投下／スケジュールの冒頭議題）は
+ * すべて kickTopic 経由で同じ準備中を使うため、この見張りは共通で効く。
+ * - 主張されていない準備中: 開始（または前回の蹴り直し）から3分を超えたら
+ *   仲介を蹴り直す（最大 TOPIC_MAX_KICKS 回）。蹴り直しを使い切っても
+ *   進まなければ失敗として確定する。
+ * - 主張済みの準備中: 生成中として蹴り直しはしない。ただし着手から10分を
+ *   超えて完了しなければ失敗として確定する。
+ * 失敗確定はいずれも failTopicPending で全体ログへ理由を残す。
+ */
+async function sweepStaleTopics(ctx: Ctx, db: Db) {
+  const now = Date.now();
+  const rows = await db
+    .select()
+    .from(schema.meta)
+    .where(sql`${schema.meta.key} LIKE 'topic_pending:%' AND ${schema.meta.value} != ''`);
+  let kicked = false;
+  for (const row of rows) {
+    const m = /^topic_pending:(chat|group):(\d+)$/.exec(row.key);
+    if (!m) continue;
+    const kind = m[1] as "chat" | "group";
+    const targetId = Number(m[2]);
+    const startedAt = metaMs(row.value);
+    if (startedAt <= 0) continue;
+    const state = await getMetaMany(db, [
+      topicClaimedKey(kind, targetId),
+      topicKicksKey(kind, targetId),
+      topicLastKickKey(kind, targetId),
+    ]);
+    const claimedAt = metaMs(state.get(topicClaimedKey(kind, targetId)));
+    if (claimedAt > 0) {
+      // 主張済み = 生成中。蹴り直し・二重投稿の防止のため干渉しない。
+      // 10分を超えて完了しないものだけ失敗として確定する。
+      if (now - claimedAt > TOPIC_CLAIMED_TIMEOUT_MS) {
+        const ageMin = Math.max(1, Math.round((now - claimedAt) / 60000));
+        await failTopicPending(
+          db,
+          kind,
+          targetId,
+          `議題の生成に失敗しました（理由: 応答なし）。仲介が着手してから${ageMin}分間完了しなかったため、失敗として確定しました。`,
+        );
+      }
+      continue;
+    }
+    const kicks = Math.max(0, Math.floor(metaMs(state.get(topicKicksKey(kind, targetId)))));
+    const lastKickAt = metaMs(state.get(topicLastKickKey(kind, targetId)));
+    const base = Math.max(lastKickAt, startedAt);
+    if (now - base < TOPIC_STALE_MS) continue;
+    if (kicks < TOPIC_MAX_KICKS) {
+      // 蹴り直しの記録は主張より先に確定させる（次の見張りが同じ回を二重に蹴らない）。
+      await setMeta(db, topicKicksKey(kind, targetId), String(kicks + 1));
+      await setMeta(db, topicLastKickKey(kind, targetId), String(now));
+      await rekickTopic(ctx, kind, targetId, kicks + 1);
+      kicked = true;
+    } else {
+      const ageMin = Math.max(1, Math.round((now - startedAt) / 60000));
+      await failTopicPending(
+        db,
+        kind,
+        targetId,
+        `議題の生成に失敗しました（理由: 応答なし）。「議題を準備中」のまま${ageMin}分間開始されず、仲介の蹴り直しを${kicks}回試みても投稿されなかったため、失敗として確定しました。`,
+      );
+    }
+  }
+  if (kicked) ctx.invalidateQueries();
 }
 
 /**
@@ -1456,6 +1619,10 @@ async function scanAutoTopics(ctx: Ctx, db: Db) {
     const latest = await latestRequest(db, "chat", c.id);
     if (latest?.status === "failed") continue;
     if (await isTopicPending(db, "chat", c.id)) continue;
+    // 見張り等で議題の生成が失敗として確定した直後は、その失敗から30分
+    // （通常の無動作の条件と同じ長さ）経つまで再投下しない（失敗の即時
+    // 繰り返し防止。手動の「自動」ボタンには影響しない）。
+    if (now - metaMs(await getMeta(db, topicFailedAtKey("chat", c.id))) < TOPIC_IDLE_MS) continue;
     const msgs = await db
       .select()
       .from(schema.messages)
@@ -1477,6 +1644,7 @@ async function scanAutoTopics(ctx: Ctx, db: Db) {
     const latest = await latestRequest(db, "group", g.id);
     if (latest?.status === "failed") continue;
     if (await isTopicPending(db, "group", g.id)) continue;
+    if (now - metaMs(await getMeta(db, topicFailedAtKey("group", g.id))) < TOPIC_IDLE_MS) continue;
     const msgs = await db
       .select()
       .from(schema.groupMessages)
@@ -2433,6 +2601,10 @@ async function runSignalAll(
   // ここで失敗確定した対象はこの後の走査で新規リクエスト化しない
   // （latest が failed で未返信が増えていない対象は従来どおり対象外）。
   await sweepStalePending(ctx, db);
+  // 議題の「準備中」の見張り（ローカル改善）。走査・自動投下より前に行い、
+  // ここで失敗確定した準備中はこの後の scanAutoTopics で再投下しない
+  // （失敗時刻のクールダウンで抑える）。
+  await sweepStaleTopics(ctx, db);
   const targets: string[] = [];
   let firstRequestId = 0;
   const chars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
@@ -2962,6 +3134,8 @@ function flavorPromptSection(flavors: string[]): string[] {
 // ------------------------------------------------------- actions
 
 const okResponse = z.object({ ok: z.literal(true) });
+// beginTopic の応答: 主張できたかどうかで ok が true / false の両方を取り得る。
+const beginTopicResponse = z.object({ ok: z.boolean() });
 
 // アバター連携の自己紹介（getAvatarReceiverInfo）の応答スキーマ。
 // 連携の約束事として固定の値を返す（値はリテラルで固定する）。
@@ -4969,6 +5143,38 @@ export const Actions = {
     },
   }),
 
+  beginTopic: defineAction({
+    description: "「自動」の仲介用: 議題の生成に着手したことを原子的に主張します。準備中の対象について、最初に主張できた仲介だけが ok=true を受け取り生成に進めます。既に主張済み（別の仲介が生成中）・準備中でない場合は ok=false で、生成も投稿もせず終了してください（failTopic も呼ばないでください）。見張りが生成中の議題を「止まっている」と誤認して蹴り直したり二重投稿したりしないための仕組みです（返信の beginRequest と同じ考え方）。",
+    request: z.object({
+      target_kind: z.enum(["chat", "group"]),
+      target_id: z.number().int().positive(),
+    }),
+    response: beginTopicResponse,
+    async handler(ctx, args): Promise<z.infer<typeof beginTopicResponse>> {
+      const db = getDb(ctx);
+      const startedAt = await topicPendingStartedAt(db, args.target_kind, args.target_id);
+      if (startedAt <= 0) return { ok: false };
+      const key = topicClaimedKey(args.target_kind, args.target_id);
+      const now = String(Date.now());
+      // 原子的な主張: 未主張（空）の時だけ、状態を条件にした UPDATE で
+      // 自分の着手時刻へ書き換える。書き換えられた行があれば主張成功。
+      const res = await db
+        .update(schema.meta)
+        .set({ value: now })
+        .where(and(eq(schema.meta.key, key), eq(schema.meta.value, "")))
+        .returning({ key: schema.meta.key });
+      if (res.length) return { ok: true };
+      // 主張キーの行自体が無い（この仕組みより前に立てられた準備中など）場合は、
+      // 行の挿入そのものを主張とする（競合時は onConflictDoNothing で負ける）。
+      const ins = await db
+        .insert(schema.meta)
+        .values({ key, value: now })
+        .onConflictDoNothing({ target: schema.meta.key })
+        .returning({ key: schema.meta.key });
+      return { ok: ins.length > 0 };
+    },
+  }),
+
   getTopicContext: defineAction({
     description: "「自動」の仲介用: 議題を作るための材料（参加キャラの設定抜粋・プロフィール項目の抜き出し・関係の抜粋・直近の会話履歴・今日の日付・このアプリで最近起きた出来事・その会話のフレーバー）と投下可否を返します。議題の準備中でない対象や、返信待ち・生成中の対象には ok=false を返します。",
     request: z.object({
@@ -5142,22 +5348,36 @@ export const Actions = {
         ];
         await db.batch(stmts);
       }
-      await setMeta(db, `topic_pending:${args.target_kind}:${args.target_id}`, "");
+      await clearTopicState(db, args.target_kind, args.target_id);
       const requestId = await finishPost(ctx, db, args.target_kind, args.target_id);
       return { ok: true, seq, request_id: requestId };
     },
   }),
 
   failTopic: defineAction({
-    description: "「自動」の仲介用: 議題の投下を断念した時に呼び、「議題を準備中」の表示を消します。",
+    description: "「自動」の仲介用: 議題の投下を断念した時に呼び、「議題を準備中」の表示を消します。reason（諦めた理由の短い語）と detail（経緯）が渡され、準備中だった場合は全体ログへ「議題の生成に失敗」として理由付きで記録します（無言で消さないため）。",
     request: z.object({
       target_kind: z.enum(["chat", "group"]),
       target_id: z.number().int().positive(),
+      reason: z.string().trim().max(100).optional(),
+      detail: z.string().trim().max(2000).optional(),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = getDb(ctx);
-      await setMeta(db, `topic_pending:${args.target_kind}:${args.target_id}`, "");
+      const wasPending = (await topicPendingStartedAt(db, args.target_kind, args.target_id)) > 0;
+      if (wasPending) {
+        const reason = args.reason?.trim() || "aborted";
+        const detail = args.detail?.trim();
+        await failTopicPending(
+          db,
+          args.target_kind,
+          args.target_id,
+          `議題の生成に失敗しました（理由: ${reason}）。仲介が議題の生成を断念しました。${detail ? `\n詳細: ${detail}` : ""}`,
+        );
+      } else {
+        await clearTopicState(db, args.target_kind, args.target_id);
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
