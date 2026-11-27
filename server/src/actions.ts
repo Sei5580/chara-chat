@@ -1315,6 +1315,44 @@ async function kickImport(ctx: Ctx, db: Db): Promise<boolean> {
 // （autoTopic 系のカラム名・アクション名・meta キー）は互換のため不変。
 // 次回上流から更新分を pull する際、この変更と差分/コンフリクトが発生
 // したら、マージするか破棄するかを必ず利用者に聞くこと。
+//
+// フレーバー準拠（2026-11-27、ローカル改善#6の改訂）: フレーバーが指定
+// されている会話では、議題文もフレーバーに従う。getTopicContext が
+// その会話のフレーバー（1対1は characters.flavors、グループは
+// groups.flavors）を材料へ追加し、TOPIC_MESSAGE に「フレーバーの状況
+// （場所・関係性・前提）を前提として議題を作る／フレーバーと矛盾する
+// 議題にしない／フレーバーの文面を議題文に直接引用しない」条項を加えた。
+// フレーバー未指定の会話では材料（flavors は空配列）・指示とも従来と
+// 同一の扱いになる（条項は flavors が空でない場合だけ適用される）。
+// 履歴なし（会話の冒頭になる議題）と履歴ありの両方、手動投下（「自動」
+// ボタン）と自動投下（「自動」ON設定）の両方に効く（どちらも同じ
+// kickTopic → TOPIC_MESSAGE → getTopicContext の経路を使うため）。
+// 出所の乱数選択（履歴ありで約2割あえて無関係な出所を選ぶ仕様を含む）
+// と自動投下の安全弁（30分無動作・連続3回まで・利用者発言でリセット・
+// 返信待ち／生成中は投下しない等）は従来どおり維持する。無関係な出所が
+// 選ばれた場合も、話題の題材は無関係でよいが議題文はフレーバーの状況の
+// 枠内で作る。返信生成側のフレーバー扱い（絶対のルール等）は不変。
+// 次回上流から更新分を pull する際、この改訂と差分/コンフリクトが発生
+// したら、マージするか破棄するかを必ず利用者に聞くこと。
+//
+// 議題の見張り（2026-11-27、ローカル改善#6の改訂）: 従来、議題の「準備中」
+// には見張りが無く、仲介の起動がこぼれると準備中が長く続くか、投稿され
+// ずに無言で消えた（本番で約17分止まって消えた例と5分以上止まった例を
+// 観測）。返信／レビューの pending 見張りと同じ仕組みを議題にも持たせた:
+// 準備中の開始時刻は従来どおり topic_pending の値（ms）として記録され、
+// 仲介は生成前に beginTopic で着手を原子的に主張する（topic_claimed）。
+// runSignalAll の sweepStaleTopics が、未主張で3分を超えた準備中は仲介を
+// 蹴り直し（最大2回、topic_kicks で数える）、主張済みでも10分完了しない
+// ものと蹴り直しの上限に達したものは失敗として確定し、全体ログへ
+// 「議題の生成に失敗（理由: 応答なし）」と記録する。failTopic で仲介が
+// 諦めた場合も、理由を全体ログへ残す。入口3つ（「自動」ボタン／「自動」
+// ONの自動投下／スケジュールの「冒頭に議題を自動投稿」）はすべて
+// kickTopic 経由で同じ準備中を使うため、見張りは共通で効く。正常な
+// 議題の流れ（速く投稿される通常ケース）の挙動・表示は不変で、見張りは
+// 止まった時にだけ働く。失敗確定直後の自動投下は、失敗時刻
+// （topic_failed_at）から30分のクールダウンで繰り返しを抑える。
+// 次回上流から更新分を pull する際、この改訂と差分/コンフリクトが発生
+// したら、マージするか破棄するかを必ず利用者に聞くこと。
 
 const TOPIC_IDLE_MS = 30 * 60 * 1000;
 const TOPIC_MAX_AUTO = 3;
@@ -1338,6 +1376,7 @@ const TOPIC_MESSAGE = [
 "   - 季節・今日は何の日（season）: getTopicContext の today（今日の日付）を使う。その日が何の記念日・何の日か、季節の行事（祝日・年中行事・旬のもの等）があればウェブ検索で確認し、それにちなんだ議題を作る。確かな記念日が分からない場合は、季節（today の月）らしい話題（天気・旬の食べ物・行事の準備など）にする。実在しない記念日は捏造しない。",
 "   - もしも・二択（hypothetical）: 仮定の質問（「もし○○だったら？」）か究極の二択（「○○と○○、どちらを選ぶ？」）の形の議題を作る。参加キャラの性格や設定に軽く絡められるとなお良いが、無理に絡めなくてよい。答えが分かれてキャラ同士の違いが出るような問いにすること。",
 "   - キャラ同士の対比（contrast）: 参加キャラから2人を選び（シェルの乱数で選ぶ）、2人の profile_items や設定抜粋を読み比べて、出身地・好きなもの・価値観などの違いや意外な共通点を突く議題を作る（例:「○○と○○は出身地がまるで違うけど、どちらの暮らしが自分に合っていると思う？」）。参加キャラが1人しかいない場合（1対1）は成立しないので「プロフィール由来」に切り替える。設定に書かれていない違いは捏造しない。",
+"   - フレーバー（flavors）: getTopicContext の flavors が空でない場合、そのフレーバーが示す状況（場所・関係性・前提）を前提として議題を作ること。フレーバーと矛盾する議題にはしないこと。履歴ありで「無関係な議題」の回になった場合も、話題の題材自体は会話と無関係でよいが、議題文はフレーバーの状況の枠内で作ること。フレーバーの文面を議題文に直接引用しないこと（フレーバーは前提として静かに反映し、その文面そのものを話題にしない）。flavors が空の場合は、この条項は適用せず従来どおりに作ること。",
 "4. 議題ができたら postTopic({target_kind, target_id, body: 議題文, source}) を呼ぶ。source は \"context\"（会話の流れ）/ \"news\"（時事ネタ）/ \"interest\"（キャラの興味）/ \"profile\"（プロフィール由来）/ \"muse\"（Muse上での出来事）/ \"season\"（季節・今日は何の日）/ \"hypothetical\"（もしも・二択）/ \"contrast\"（キャラ同士の対比）のどれかで、実際に使った出所に合わせる（切り替えた場合は切り替え先）。議題文は見出しや「議題：」といった前置きを付けず、話題そのものだけを1〜2文で書く（表示側で「自動」の議題と分かる形になる）。参加キャラが話し返したくなる、開かれた問いかけや話題の提示にすること。",
 "5. postTopic がエラーになった場合や、手順の途中で続行できなくなった場合は、必ず failTopic({target_kind, target_id}) を呼んでから終了する（呼ばないと「議題を準備中」の表示が残り続ける）。",
 ].join("\n");
@@ -4931,7 +4970,7 @@ export const Actions = {
   }),
 
   getTopicContext: defineAction({
-    description: "「自動」の仲介用: 議題を作るための材料（参加キャラの設定抜粋・プロフィール項目の抜き出し・関係の抜粋・直近の会話履歴・今日の日付・このアプリで最近起きた出来事）と投下可否を返します。議題の準備中でない対象や、返信待ち・生成中の対象には ok=false を返します。",
+    description: "「自動」の仲介用: 議題を作るための材料（参加キャラの設定抜粋・プロフィール項目の抜き出し・関係の抜粋・直近の会話履歴・今日の日付・このアプリで最近起きた出来事・その会話のフレーバー）と投下可否を返します。議題の準備中でない対象や、返信待ち・生成中の対象には ok=false を返します。",
     request: z.object({
       target_kind: z.enum(["chat", "group"]),
       target_id: z.number().int().positive(),
@@ -4952,6 +4991,7 @@ export const Actions = {
       ),
       history: z.array(z.string()),
       events: z.array(z.string()),
+      flavors: z.array(z.string()),
     }),
     async handler(ctx, args) {
       const db = getDb(ctx);
@@ -4965,6 +5005,7 @@ export const Actions = {
         participants: [] as { name: string; settings_excerpt: string; relation_excerpt: string; profile_items: string[] }[],
         history: [] as string[],
         events: [] as string[],
+        flavors: [] as string[],
       });
       if (!(await isTopicPending(db, args.target_kind, args.target_id))) return ng("not_pending");
       const auto = (await getMeta(db, `topic_auto:${args.target_kind}:${args.target_id}`)) === "1";
@@ -4972,11 +5013,16 @@ export const Actions = {
       let targetName = "";
       const participants: { name: string; settings_excerpt: string; relation_excerpt: string; profile_items: string[] }[] = [];
       const history: string[] = [];
+      // フレーバー（ローカル改善#6の改訂、2026-11-27）: その会話に指定された
+      // フレーバーを議題の材料へ追加する。1対1は characters.flavors、
+      // グループは groups.flavors。未指定なら空配列のまま（従来の材料と同一）。
+      let flavors: string[] = [];
       if (args.target_kind === "chat") {
         const rows = await db.select().from(schema.characters).where(eq(schema.characters.id, args.target_id));
         const c = rows[0];
         if (!c) return ng("not_found");
         targetName = c.displayName;
+        flavors = parseFlavors(c.flavors);
         participants.push({
           name: c.displayName,
           settings_excerpt: c.settingsText.slice(0, 1200),
@@ -4996,6 +5042,7 @@ export const Actions = {
         const g = rows[0];
         if (!g || g.status !== "active") return ng("not_found");
         targetName = g.name;
+        flavors = parseFlavors(g.flavors);
         const memberRows = await groupMemberRows(db, g.id);
         for (const m of memberRows) {
           if (m.character) {
@@ -5036,7 +5083,7 @@ export const Actions = {
       if (impState === "done" && impFinished > 0 && now - impFinished < 14 * 24 * 3600 * 1000 && impNote) {
         events.push(`最近、アバター管理からの一括取り込みが行われた（${impNote.slice(0, 120)}）`);
       }
-      return { ok: true, reason: "", auto, target_name: targetName, today: todayJstLabel(), participants, history, events };
+      return { ok: true, reason: "", auto, target_name: targetName, today: todayJstLabel(), participants, history, events, flavors };
     },
   }),
 
