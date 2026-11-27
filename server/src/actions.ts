@@ -595,6 +595,21 @@ async function closeOutAutoRequest(db: Db, req: RequestRow, ok: boolean, reason 
 // 発火判定は runSignalAll の中で行う（1分間隔の定期実行が駆動する）。
 // 判定は Asia/Tokyo。JST は UTC+9 固定で夏時間がないため、UTC へ9時間を
 // 足した値の UTC 成分で JST の暦として計算する。
+//
+// 冒頭に議題を自動投稿（ローカル改善: 上流リポジトリには無い）:
+// schedules.auto_topic_start が 1 のスケジュールは、発火時に通常の冒頭生成
+// （origin=auto の返信リクエスト作成）の代わりに、「自動」ボタンと同じ
+// 議題の処理（kickTopic）を行う。議題が投稿されると postTopic 経由で
+// 返信生成が始まるため、通常の冒頭生成は重ねて行わない。既存グループ型・
+// 新規チャット型のどちらにも効き、新規チャット型はグループを作成して
+// （フレーバーの引き継ぎを含む）から議題の処理を行う。新規チャット型では
+// 作成したグループのIDを last_group_id へ記録する（議題経路の返信リクエストは
+// 通常扱いでスケジュールIDを持たず、生成完了時の記録が走らないため、作成
+// 時点で記録する）。発火時点で対象
+// グループに返信待ち・生成中がある場合や議題の準備中の場合は、既存の
+// 混雑時の扱いに揃えてその回をスキップする。チェックなし（0）の動作は
+// 従来と完全に同一。次回上流から更新分を pull する際、この変更と差分/
+// コンフリクトが発生したら、マージするか破棄するかを必ず利用者に聞くこと。
 
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const SLOT_FIRE_WINDOW_MS = 30 * 60 * 1000;
@@ -671,7 +686,7 @@ async function markSlotFired(db: Db, s: ScheduleRow, key: string) {
 }
 
 /** 既存グループ対象の発火。発火できたら対象表示名、スキップしたら null を返す（理由は自動生成ログへ残す）。 */
-async function fireExistingSchedule(db: Db, s: ScheduleRow, slotKey: string): Promise<string | null> {
+async function fireExistingSchedule(ctx: Ctx, db: Db, s: ScheduleRow, slotKey: string): Promise<string | null> {
   const skip = async (reason: string): Promise<null> => {
     await addAppLog(db, "auto", `自動生成をスキップ: ${s.name}`, reason, "schedule", s.id);
     return null;
@@ -700,6 +715,28 @@ async function fireExistingSchedule(db: Db, s: ScheduleRow, slotKey: string): Pr
   const active = await activeRequest(db, "group", g.id);
   if (active) {
     return skip(`グループ「${g.name}」に返信待ち・生成中のリクエストがあるため、この回は生成しませんでした。`);
+  }
+  if (s.autoTopicStart === 1) {
+    // 冒頭に議題を自動投稿（ローカル改善: 上流リポジトリには無い）: 通常の
+    // 冒頭生成の代わりに、「自動」ボタンが押されたときと同じ議題の処理
+    // （kickTopic → 仲介が議題を生成・投稿 → postTopic が返信生成を開始）
+    // を行う。通常の冒頭生成は重ねて行わない。議題の準備中は投下できない
+    // ため、この回はスキップする（既存の混雑時の扱いに揃え、割り込まない）。
+    // フレーバーはグループ側の設定を getTopicContext が読むため、議題文は
+    // グループのフレーバーにそのまま従う。
+    if (await isTopicPending(db, "group", g.id)) {
+      return skip(`グループ「${g.name}」で議題を準備中のため、この回は生成しませんでした。`);
+    }
+    await kickTopic(ctx, db, "group", g.id, false);
+    await addAppLog(
+      db,
+      "auto",
+      `議題の自動投稿を開始: ${s.name}`,
+      `スケジュール「${s.name}」（${slotKey} JST）が発火し、グループ「${g.name}」で冒頭に議題を自動投稿します。議題が投稿されると、そこから掛け合いが始まります。`,
+      "schedule",
+      s.id,
+    );
+    return null;
   }
   await db.insert(schema.replyRequests).values({
     targetKind: "group",
@@ -776,7 +813,7 @@ async function createRandomGroup(
  * ローカル改善（上流リポジトリには無い）: カテゴリ未指定（category_ids が空）の
  * 場合は全登録キャラを母集団とする。カテゴリが指定されている場合は従来どおり
  * 選択カテゴリ（子孫展開）の和集合に属するキャラだけが母集団（未分類は含まない）。 */
-async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: number): Promise<string | null> {
+async function fireNewSchedule(ctx: Ctx, db: Db, s: ScheduleRow, slotKey: string, nowMs: number): Promise<string | null> {
   const categoryIds = parseJsonIntArray(s.categoryIds);
   const allChars = await db.select().from(schema.characters).orderBy(asc(schema.characters.id));
   let population: typeof allChars;
@@ -819,6 +856,33 @@ async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: n
   });
   if (!created) return null;
   const { groupId: gid, name, picked } = created;
+  if (s.autoTopicStart === 1) {
+    // 冒頭に議題を自動投稿（ローカル改善: 上流リポジトリには無い）: 通常の
+    // 冒頭生成の代わりに、作成したグループへ「自動」ボタンと同じ議題の
+    // 処理（kickTopic）を行う。通常の冒頭生成は重ねて行わない。
+    // フレーバーは createRandomGroup がスケジュール側の指定をグループへ
+    // 引き継ぎ済みで、getTopicContext がグループ側を読むため、議題文は
+    // そのフレーバーに従う。作られたばかりのグループには返信待ち・生成中・
+    // 議題準備中はあり得ないため、混雑時のスキップ判定は不要。
+    // last_group_id の記録: 通常（オフ）発火では生成完了時に
+    // closeOutAutoRequest が記録するが、議題経路では投稿後の返信リクエストが
+    // 通常（manual）扱いでスケジュールIDを持たないため、その記録が走らない。
+    // そのため、グループを作成したこの時点でオフ発火と同じく記録する。
+    await db
+      .update(schema.schedules)
+      .set({ lastGroupId: gid, updatedAt: new Date() })
+      .where(eq(schema.schedules.id, s.id));
+    await kickTopic(ctx, db, "group", gid, false);
+    await addAppLog(
+      db,
+      "auto",
+      `議題の自動投稿を開始: ${s.name}`,
+      `スケジュール「${s.name}」（${slotKey} JST）が発火し、新しいグループ「${name}」を作成して冒頭に議題を自動投稿します。議題が投稿されると、そこから掛け合いが始まります。抽選結果: ${picked.map((c) => c.displayName).join("・")}`,
+      "schedule",
+      s.id,
+    );
+    return null;
+  }
   await db.insert(schema.replyRequests).values({
     targetKind: "group",
     targetId: gid,
@@ -844,7 +908,7 @@ async function fireNewSchedule(db: Db, s: ScheduleRow, slotKey: string, nowMs: n
  * スキップとして自動生成ログへ残す。理由を問わず、発火・スキップが確定した
  * 時点で last_fired_slot へ記録し、同一スロットの処理は1回だけにする。
  */
-async function evaluateSchedules(db: Db): Promise<string[]> {
+async function evaluateSchedules(ctx: Ctx, db: Db): Promise<string[]> {
   const nowMs = Date.now();
   const fired: string[] = [];
   const rows = await db
@@ -870,8 +934,8 @@ async function evaluateSchedules(db: Db): Promise<string[]> {
     }
     const name =
       s.targetType === "existing"
-        ? await fireExistingSchedule(db, s, slot.key)
-        : await fireNewSchedule(db, s, slot.key, nowMs);
+        ? await fireExistingSchedule(ctx, db, s, slot.key)
+        : await fireNewSchedule(ctx, db, s, slot.key, nowMs);
     if (name) fired.push(name);
   }
   return fired;
@@ -2693,7 +2757,7 @@ async function runSignalAll(
   // 未処理スロットを判定し、発火したら auto リクエストを作成する。発火した
   // 対象は targets に含めて仲介を起動する（生成の優先順位は getWorkItems 側で
   // 通常返信・レビューを先にし、自動生成を末尾にする）。
-  const autoFired = await evaluateSchedules(db);
+  const autoFired = await evaluateSchedules(ctx, db);
   targets.push(...autoFired);
   // 通知（notify_outbox）の配送は v2.3 から専用の配送cronが担い、仲介は
   // 通知に触れないため、未送信の通知だけが残っている場合は仲介を起動しない。
@@ -2894,6 +2958,7 @@ const scheduleOutSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
+  auto_topic_start: z.boolean(),
   flavors: z.array(z.string()),
   last_fired_slot: z.string().nullable(),
   last_group_id: z.number().nullable(),
@@ -2916,6 +2981,7 @@ function scheduleToOut(s: ScheduleRow, targetGroupName: string | null): z.infer<
     allow_guests: s.allowGuests === 1,
     allow_mobs: s.allowMobs === 1,
     allow_narration: s.allowNarration === 1,
+    auto_topic_start: s.autoTopicStart === 1,
     flavors: parseFlavors(s.flavors),
     last_fired_slot: s.lastFiredSlot,
     last_group_id: s.lastGroupId,
@@ -2939,6 +3005,7 @@ const scheduleInputSchema = z.object({
   allow_guests: z.boolean(),
   allow_mobs: z.boolean(),
   allow_narration: z.boolean(),
+  auto_topic_start: z.boolean(),
   flavors: z.array(z.string().trim().min(1).max(FLAVOR_TEXT_MAX)).max(FLAVOR_MAX_PER_TARGET),
 });
 
@@ -2986,6 +3053,7 @@ function scheduleInputToValues(input: ScheduleInput) {
     allowGuests: input.allow_guests ? 1 : 0,
     allowMobs: input.allow_mobs ? 1 : 0,
     allowNarration: input.allow_narration ? 1 : 0,
+    autoTopicStart: input.auto_topic_start ? 1 : 0,
     flavors: JSON.stringify(input.target_type === "new" ? input.flavors : []),
   };
 }
@@ -3006,6 +3074,7 @@ function scheduleRowToInput(s: ScheduleRow): ScheduleInput {
     allow_guests: s.allowGuests === 1,
     allow_mobs: s.allowMobs === 1,
     allow_narration: s.allowNarration === 1,
+    auto_topic_start: s.autoTopicStart === 1,
     flavors: parseFlavors(s.flavors),
   };
 }
@@ -6304,7 +6373,7 @@ export const Actions = {
   }),
 
   createSchedule: defineAction({
-    description: "自動生成のスケジュールを新規作成します。対象は既存グループ（なりきり設定が有効なグループは選べません）か、毎回新規チャット（カテゴリからランダム抽選。カテゴリ未指定の場合は全キャラから抽選）のどちらかです。",
+    description: "自動生成のスケジュールを新規作成します。対象は既存グループ（なりきり設定が有効なグループは選べません）か、毎回新規チャット（カテゴリからランダム抽選。カテゴリ未指定の場合は全キャラから抽選）のどちらかです。「冒頭に議題を自動投稿」がオンの場合は、発火時に通常の冒頭生成の代わりに、「自動」ボタンと同じ議題の生成・投稿を行い、そこから掛け合いを始めます。",
     request: scheduleInputSchema,
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
@@ -6323,7 +6392,7 @@ export const Actions = {
   }),
 
   updateSchedule: defineAction({
-    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・フレーバー）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
+    description: "自動生成のスケジュールの設定を保存します（名前・有効/無効・頻度・曜日・時刻・対象・カテゴリ・人数・ゲスト/モブ/ナレーション・冒頭に議題を自動投稿・フレーバー）。発火済みスロットの記録（last_fired_slot）と前回生成グループは保持されます。",
     request: scheduleInputSchema.extend({ id: z.number().int().positive() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
